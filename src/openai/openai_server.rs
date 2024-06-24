@@ -11,6 +11,7 @@ use actix_web::web::Bytes;
 use actix_web::{post, web, Either, HttpResponse};
 use tokenizers::Encoding;
 use uuid::Uuid;
+use std::time::{Duration, Instant};
 
 fn verify_model(data: &OpenAIServerData<'_>, model_name: &String) -> Result<(), APIError> {
     let current_name = {
@@ -199,7 +200,7 @@ async fn chat_completions(
                 .streaming(receiver),
         );
     }
-
+    let start_time = Instant::now();
     let result = {
         let mut model = data.model.lock().unwrap();
         let model_res = model.generate(
@@ -214,6 +215,7 @@ async fn chat_completions(
         }
         model_res.unwrap()
     };
+    let end_time = Instant::now();
 
     let choices = result
         .iter()
@@ -227,6 +229,10 @@ async fn chat_completions(
         prompt_tokens: result.iter().map(|(_, usage)| usage.prompt_tokens).sum(),
         total_tokens: result.iter().map(|(_, usage)| usage.total_tokens).sum(),
     };
+    let duration = end_time.duration_since(start_time);
+    println!("\r\n {} tokens processed in {} seconds ({} tokens/s)", 
+            usage.total_tokens - usage.prompt_tokens, duration.as_secs(), 
+            (usage.total_tokens - usage.prompt_tokens) * 1000 / duration.as_millis() as usize);
 
     Either::Left(Ok(web::Json(ChatCompletionResponse {
         id: request_id,

@@ -1,4 +1,6 @@
+#[cfg(not(feature = "gcu"))]
 mod cache;
+#[cfg(not(feature = "gcu"))]
 mod paged_attention;
 
 const COPY_BLOCKS_KERNEL_NAME: &str = "copy_blocks_kernel";
@@ -52,12 +54,15 @@ impl<'a, T, R> Conjoined<'a, T, R> {
 ///
 /// ## Safety
 /// - The returned pointer **must not** outlive the &self reference. Otherwise, a dangling pointer is created.
+
+#[cfg(not(feature = "gcu"))]
 unsafe impl<'a, T, R> DeviceRepr for Conjoined<'a, T, R> {
     fn as_kernel_param(&self) -> *mut std::ffi::c_void {
         addr_of!(self.raw) as *mut _
     }
 }
 
+#[cfg(not(feature = "gcu"))]
 fn dispatch_get_cuda_pointer(tensor: Tensor) -> u64 {
     match tensor.dtype() {
         DType::BF16 => get_cuda_pointer::<bf16>(tensor),
@@ -70,6 +75,7 @@ fn dispatch_get_cuda_pointer(tensor: Tensor) -> u64 {
     }
 }
 
+#[cfg(not(feature = "gcu"))]
 fn get_cuda_pointer<T: CudaDType>(tensor: Tensor) -> u64 {
     match &*tensor.storage_and_layout().0 {
         Storage::Cuda(cuda_storage) => *cuda_storage.as_cuda_slice::<T>().unwrap().device_ptr(),
@@ -77,7 +83,10 @@ fn get_cuda_pointer<T: CudaDType>(tensor: Tensor) -> u64 {
     }
 }
 
+#[cfg(not(feature = "gcu"))]
 pub use cache::*;
+
+#[cfg(not(feature = "gcu"))]
 use candle_core::{
     cuda_backend::{
         cudarc::driver::{CudaFunction, DevicePtr, DeviceRepr},
@@ -85,8 +94,24 @@ use candle_core::{
     },
     CudaDevice, DType, Storage, Tensor,
 };
+
+#[cfg(feature = "gcu")]
+use candle_core::{
+    gcu_backend::{
+        ubridge::prelude::{DevicePtr, GcuFunction as CudaFunction, DeviceCopy as DeviceRepr},
+        GcuDType as CudaDType, 
+    },
+    GcuDevice as CudaDevice, DType, Storage, Tensor,
+};
+
 use half::{bf16, f16};
+
+#[cfg(not(feature = "gcu"))]
 pub use paged_attention::*;
+
+#[cfg(feature = "gcu")]
+pub use candle_paged_attention::*;
+
 pub use std::ops::Deref;
 use std::{
     marker::PhantomData,

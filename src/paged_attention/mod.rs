@@ -5,11 +5,16 @@ use crate::{
     openai::responses::APIError,
     try_api,
 };
+#[cfg(feature = "gcu")]
+use candle_core::{
+    gcu_backend::ubridge::prelude::StreamTrait
+};
 
 use self::input_metadata::InputMetadata;
 mod attn_bias;
 pub(crate) mod input_metadata;
 pub(crate) mod utils;
+use std::ffi::c_void;
 
 const _PARTITION_SIZE: usize = 512;
 
@@ -22,6 +27,7 @@ pub struct PagedAttention {
     sliding_window: Option<usize>,
     num_queries_per_kv: usize,
     alibi_slopes: Option<Tensor>,
+    stream: *const c_void,
 }
 
 impl PagedAttention {
@@ -36,6 +42,18 @@ impl PagedAttention {
     ) -> Result<Self> {
         let num_key_value_heads = num_key_value_heads.unwrap_or(num_attention_heads);
         let num_queries_per_kv = num_attention_heads / num_key_value_heads;
+
+        let stream = match &device {
+            Device::Gcu(d) => {
+                if d.gcu_device().stream.is_some() {
+                    d.gcu_device().stream.unwrap().as_inner() as *const c_void
+                } else {
+                    std::ptr::null()
+                }
+            }
+            _ => { std::ptr::null() }
+        };
+
         let alibi_slopes = if let Some(alibi_slopes) = alibi_slopes {
             Some(Tensor::new(alibi_slopes, &device)?)
         } else {
@@ -49,6 +67,7 @@ impl PagedAttention {
             sliding_window,
             num_queries_per_kv,
             alibi_slopes,
+            stream: stream,
         })
     }
 
@@ -92,9 +111,9 @@ impl PagedAttention {
         };
 
         // // paged-attn expects (b_sz, seq_len, nheads, head_dim)
-        let query = query.transpose(1, 2)?.contiguous()?;
-        let key = key.transpose(1, 2)?.contiguous()?;
-        let value = value.transpose(1, 2)?.contiguous()?;
+        let query = query.transpose(1, 2)?;//.contiguous()?;
+        let key = key.transpose(1, 2)?;//.contiguous()?;
+        let value = value.transpose(1, 2)?;//.contiguous()?;
 
         //format [batch_size, num_tokens, num_heads, head_size]
         let (batch_size, seq_len, attention_heads, head_size) = query.shape().dims4()?;
@@ -115,6 +134,7 @@ impl PagedAttention {
                 &key_cache.as_mut().unwrap(),
                 &value_cache.as_mut().unwrap(),
                 &slot_mapping,
+                self.stream,
             )?;
         }
 
@@ -144,6 +164,7 @@ impl PagedAttention {
             &input_metadata.context_lens.as_ref().unwrap(),
             input_metadata.max_context_len.unwrap(),
             self.scale,
+            self.stream,
         )
     }
 }

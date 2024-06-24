@@ -6,10 +6,13 @@ use std::{
 use candle_core::{DType, Device, Tensor};
 
 use crate::{
-    backend::{copy_blocks, swap_blocks},
     openai::{models::ConfigLike, responses::APIError},
     try_api,
 };
+
+#[cfg(not(feature = "gcu"))]
+use crate::backend::{copy_blocks, swap_blocks};
+
 
 #[derive(Clone, Debug)]
 pub struct CacheConfig {
@@ -185,12 +188,14 @@ impl CacheEngine {
             let mut gpu_cache = self.get_kv_cache();
             let (dst_key_cache, dst_value_cache) = gpu_cache.get_mut(i).unwrap();
             // Swap (copy) key blocks
+            #[cfg(not(feature = "gcu"))]
             try_api!(swap_blocks(
                 src_key_cache.clone(),
                 dst_key_cache,
                 src_to_dst.clone()
             ));
             // Swap (copy) key blocks
+            #[cfg(not(feature = "gcu"))]
             try_api!(swap_blocks(
                 src_value_cache.clone(),
                 dst_value_cache,
@@ -208,12 +213,14 @@ impl CacheEngine {
 
             let (dst_key_cache, dst_value_cache) = self.cpu_cache.get_mut(i).unwrap();
             // Swap (copy) key blocks
+            #[cfg(not(feature = "gcu"))]
             try_api!(swap_blocks(
                 src_key_cache.clone(),
                 dst_key_cache,
                 src_to_dst.clone()
             ));
             // Swap (copy) key blocks
+            #[cfg(not(feature = "gcu"))]
             try_api!(swap_blocks(
                 src_value_cache.clone(),
                 dst_value_cache,
@@ -231,6 +238,7 @@ impl CacheEngine {
         let (key_caches, value_caches) = caches;
 
         // NOTE(EricLBuehler): This may synchronize the CPU and GPU
+        #[cfg(not(feature = "gcu"))]
         try_api!(unsafe { copy_blocks(key_caches, value_caches, src_to_dst) });
 
         Ok(())

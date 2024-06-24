@@ -320,7 +320,7 @@ impl<'a> LLMEngine<'a> {
             _PAD_SLOT_ID,
             &self.pipeline.device(),
         )?;
-
+        
         Ok(PreparedInputs {
             tokens: input_tokens,
             positions: input_positions,
@@ -371,8 +371,11 @@ impl<'a> LLMEngine<'a> {
                     .iter()
                     .map(|block| block.deref_mut().block_id)
                     .collect::<Vec<_>>();
-
-                let block_number = table.get(position / self.cache_config.block_size).unwrap();
+                let block_number = if position / self.cache_config.block_size >= table.len() {
+                    table.get(table.len() - 1).unwrap() //position exceed! use last position
+                } else {
+                    table.get(position / self.cache_config.block_size).unwrap()
+                };
                 let block_offset = position % self.cache_config.block_size;
                 let slot = block_number * self.cache_config.block_size + block_offset;
                 let slot = slot.try_into().unwrap();

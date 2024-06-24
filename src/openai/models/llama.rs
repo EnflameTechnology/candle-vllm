@@ -147,6 +147,7 @@ pub struct Cache {
     masks: HashMap<usize, Tensor>,
     cos: Tensor,
     sin: Tensor,
+    cos_sin: Tensor,
     device: Device,
 }
 
@@ -165,11 +166,13 @@ impl Cache {
             .matmul(&theta.reshape((1, theta.elem_count()))?)?;
         let cos = idx_theta.cos()?.to_dtype(dtype)?;
         let sin = idx_theta.sin()?.to_dtype(dtype)?;
+        let cos_sin = Tensor::cat(&[&cos, &sin], D::Minus1)?.contiguous()?; //must be contiguous tensor;
         Ok(Self {
             masks: HashMap::new(),
             device: device.clone(),
             cos,
             sin,
+            cos_sin,
         })
     }
 }
@@ -214,6 +217,11 @@ impl CausalSelfAttention {
         candle_nn::rotary_emb::rope(x, &cos, &sin)
     }
 
+    #[cfg(feature = "gcu")]
+    fn apply_rotary_emb_qkv(&self, q: &Tensor, k: &Tensor, index_pos: usize) -> Result<(Tensor, Tensor)> {
+        candle_nn::apply_rotary_emb_qkv(&q, &k, &self.cos_sin_cache.cos_sin, &self.cos_sin_cache.sin, index_pos, 0, true, true)
+    }
+
     fn forward(
         &mut self,
         x: &Tensor,
@@ -228,22 +236,35 @@ impl CausalSelfAttention {
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        let q = q
-            .reshape((b_sz, seq_len, self.num_attention_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let k = k
-            .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let v = v
-            .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
+        let (q, k, v) = if seq_len == 1 { //no need transpose for seq_len == 1, change reshape dim
+            let q = q
+                .reshape((b_sz, self.num_attention_heads, seq_len, self.head_dim))?;
+            let k = k
+                .reshape((b_sz, self.num_key_value_heads, seq_len, self.head_dim))?;
+            let v = v
+                .reshape((b_sz, self.num_key_value_heads, seq_len, self.head_dim))?;
+            (q, k, v)
+        } else {
+            let q = q
+                .reshape((b_sz, seq_len, self.num_attention_heads, self.head_dim))?
+                .transpose(1, 2)?;
+            let k = k
+                .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
+                .transpose(1, 2)?;
+            let v = v
+                .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
+                .transpose(1, 2)?;
+            (q, k, v.contiguous()?)
+        };
+        
+        #[cfg(not(feature = "gcu"))]
+        let q = self.apply_rotary_emb(&q, index_pos)?.contiguous()?;
+        #[cfg(not(feature = "gcu"))]
+        let k = self.apply_rotary_emb(&k, index_pos)?.contiguous()?;
 
-        let q = self.apply_rotary_emb(&q, index_pos)?;
-        let k = self.apply_rotary_emb(&k, index_pos)?;
-
+        #[cfg(feature = "gcu")]
+        let (q, k) = self.apply_rotary_emb_qkv(&q, &k, index_pos)?;
+        
         let k = self.repeat_kv(k)?;
         let v = self.repeat_kv(v)?;
 
@@ -284,6 +305,7 @@ impl CausalSelfAttention {
         let v_proj = linear(size_in, size_kv, vb.pp("v_proj"))?;
         let o_proj = linear(size_q, size_in, vb.pp("o_proj"))?;
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+
         Ok(Self {
             q_proj,
             k_proj,
