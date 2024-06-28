@@ -1,2 +1,7 @@
 [build]
 rustflags = ["-C", "target-cpu=native"]
+
+[env]
+ATOMIC_URL = "http://artifact.enflame.cn:80/artifactory/module_package/atomic_op"
+ATOMIC_VERSION = "3838a57"
+ATOMIC_TAG = "20240529"
