@@ -13,7 +13,6 @@ use crate::{
 #[cfg(not(feature = "gcu"))]
 use crate::backend::{copy_blocks, swap_blocks};
 
-
 #[derive(Clone, Debug)]
 pub struct CacheConfig {
     pub block_size: usize,

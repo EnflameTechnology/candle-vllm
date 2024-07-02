@@ -124,8 +124,22 @@ impl CausalSelfAttention {
     }
 
     #[cfg(feature = "gcu")]
-    fn apply_rotary_emb_qkv(&self, q: &Tensor, k: &Tensor, index_pos: usize) -> Result<(Tensor, Tensor)> {
-        candle_nn::apply_rotary_emb_qkv(&q, &k, &self.cos_sin_cache.cos_sin, &self.cos_sin_cache.sin, index_pos, 0, true, true)
+    fn apply_rotary_emb_qkv(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        index_pos: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        candle_nn::apply_rotary_emb_qkv(
+            &q,
+            &k,
+            &self.cos_sin_cache.cos_sin,
+            &self.cos_sin_cache.sin,
+            index_pos,
+            0,
+            true,
+            true,
+        )
     }
 
     fn forward(
@@ -142,13 +156,11 @@ impl CausalSelfAttention {
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        let (q, k, v) = if seq_len == 1 { //no need transpose for seq_len == 1, change reshape dim
-            let q = q
-                .reshape((b_sz, self.num_attention_heads, seq_len, self.head_dim))?;
-            let k = k
-                .reshape((b_sz, self.num_key_value_heads, seq_len, self.head_dim))?;
-            let v = v
-                .reshape((b_sz, self.num_key_value_heads, seq_len, self.head_dim))?;
+        let (q, k, v) = if seq_len == 1 {
+            //no need transpose for seq_len == 1, change reshape dim
+            let q = q.reshape((b_sz, self.num_attention_heads, seq_len, self.head_dim))?;
+            let k = k.reshape((b_sz, self.num_key_value_heads, seq_len, self.head_dim))?;
+            let v = v.reshape((b_sz, self.num_key_value_heads, seq_len, self.head_dim))?;
             (q, k, v)
         } else {
             let q = q
@@ -162,7 +174,7 @@ impl CausalSelfAttention {
                 .transpose(1, 2)?;
             (q, k, v.contiguous()?)
         };
-        
+
         #[cfg(not(feature = "gcu"))]
         let q = self.apply_rotary_emb(&q, index_pos)?.contiguous()?;
         #[cfg(not(feature = "gcu"))]
@@ -170,7 +182,7 @@ impl CausalSelfAttention {
 
         #[cfg(feature = "gcu")]
         let (q, k) = self.apply_rotary_emb_qkv(&q, &k, index_pos)?;
-        
+
         let k = self.repeat_kv(k)?;
         let v = self.repeat_kv(v)?;
 

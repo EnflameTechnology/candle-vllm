@@ -45,7 +45,7 @@ impl PhiConfig {
             bos_token_id: self.bos_token_id,
             eos_token_id: self.eos_token_id,
             max_seq_len: self.max_position_embeddings,
-            sliding_window: self.sliding_window,
+            sliding_window: None,
             hidden_act: Some(self.hidden_act),
         }
     }
@@ -54,8 +54,6 @@ impl PhiConfig {
 pub struct RmsNorm {
     //High-precision RmsNorm
     norm: LayerNorm,
-    weight: Tensor,
-    eps: f64,
 }
 
 impl RmsNorm {
@@ -63,22 +61,17 @@ impl RmsNorm {
         let weight = vb.get_with_hints(size, "weight", candle_nn::Init::Const(1.))?;
         let weight_f32 = weight.to_dtype(DType::F32)?;
         Ok(RmsNorm {
-            norm: LayerNorm::rms_norm(weight, eps),
-            weight: weight_f32,
-            eps,
+            norm: LayerNorm::rms_norm(weight_f32, eps),
         })
     }
 }
 
 impl Module for RmsNorm {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        if xs.is_contiguous() {
-            let dtype = xs.dtype();
-            candle_nn::ops::rms_norm(&xs.to_dtype(DType::F32)?, &self.weight, self.eps as f32)?
-                .to_dtype(dtype)
-        } else {
-            self.norm.forward(xs)
-        }
+        let dtype = xs.dtype();
+        self.norm
+            .forward(&xs.to_dtype(DType::F32)?)?
+            .to_dtype(dtype)
     }
 }
 
@@ -167,6 +160,38 @@ impl Attention {
         })
     }
 
+    #[cfg(feature = "gcu")]
+    fn apply_rotary_emb_qkv(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        index_pos: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let dtype = q.dtype();
+        let q = q.to_dtype(DType::F32)?;
+        let k = k.to_dtype(DType::F32)?;
+        // let q = candle_nn::rotary_emb::rope_slow(&q, &self.rotary_emb.cos, &self.rotary_emb.sin, index_pos)?;
+        // let k = candle_nn::rotary_emb::rope_slow(&k, &self.rotary_emb.cos, &self.rotary_emb.sin, index_pos)?;
+        #[cfg(not(feature = "gcu"))]
+        let (q, k) = self
+            .rotary_emb
+            .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?;
+
+        #[cfg(feature = "gcu")]
+        let (q, k) = candle_nn::apply_rotary_emb_qkv(
+            &q,
+            &k,
+            &self.rotary_emb.cos_sin,
+            &self.rotary_emb.sin,
+            index_pos,
+            0,
+            true,
+            true,
+        )?;
+
+        Ok((q.to_dtype(dtype)?, k.to_dtype(dtype)?))
+    }
+
     fn forward(
         &mut self,
         xs: &Tensor,
@@ -210,17 +235,10 @@ impl Attention {
             (q, k, v.contiguous()?)
         };
 
-        //preserve the precision with F32 type
-        let (q, k) = self.rotary_emb.apply_rotary_emb_qkv(
-            &q.to_dtype(DType::F32)?,
-            &k.to_dtype(DType::F32)?,
-            seqlen_offset,
-        )?;
-        let q = q.to_dtype(v.dtype())?;
-        let k = k.to_dtype(v.dtype())?;
+        let (q, k) = self.apply_rotary_emb_qkv(&q, &k, seqlen_offset)?;
 
-        let k = candle_transformers::utils::repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-        let v = candle_transformers::utils::repeat_kv(v, self.num_kv_groups)?.contiguous()?;
+        let k = candle_transformers::utils::repeat_kv(k, self.num_kv_groups)?;
+        let v = candle_transformers::utils::repeat_kv(v, self.num_kv_groups)?;
         let y = self.attn.forward(
             &q,
             &k,

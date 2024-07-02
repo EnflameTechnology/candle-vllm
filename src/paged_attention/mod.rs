@@ -6,9 +6,7 @@ use crate::{
     try_api,
 };
 #[cfg(feature = "gcu")]
-use candle_core::{
-    gcu_backend::ubridge::prelude::StreamTrait
-};
+use candle_core::gcu_backend::ubridge::prelude::StreamTrait;
 
 use self::input_metadata::InputMetadata;
 mod attn_bias;
@@ -51,7 +49,7 @@ impl PagedAttention {
                     std::ptr::null()
                 }
             }
-            _ => { std::ptr::null() }
+            _ => std::ptr::null(),
         };
 
         let alibi_slopes = if let Some(alibi_slopes) = alibi_slopes {

@@ -98,10 +98,10 @@ use candle_core::{
 #[cfg(feature = "gcu")]
 use candle_core::{
     gcu_backend::{
-        ubridge::prelude::{DevicePtr, GcuFunction as CudaFunction, DeviceCopy as DeviceRepr},
-        GcuDType as CudaDType, 
+        ubridge::prelude::{DeviceCopy as DeviceRepr, DevicePtr, GcuFunction as CudaFunction},
+        GcuDType as CudaDType,
     },
-    GcuDevice as CudaDevice, DType, Storage, Tensor,
+    DType, GcuDevice as CudaDevice, Storage, Tensor,
 };
 
 use half::{bf16, f16};
