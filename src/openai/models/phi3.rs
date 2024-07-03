@@ -160,37 +160,6 @@ impl Attention {
         })
     }
 
-    #[cfg(feature = "gcu")]
-    fn apply_rotary_emb_qkv(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        index_pos: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        let dtype = q.dtype();
-        let q = q.to_dtype(DType::F32)?;
-        let k = k.to_dtype(DType::F32)?;
-        // let q = candle_nn::rotary_emb::rope_slow(&q, &self.rotary_emb.cos, &self.rotary_emb.sin, index_pos)?;
-        // let k = candle_nn::rotary_emb::rope_slow(&k, &self.rotary_emb.cos, &self.rotary_emb.sin, index_pos)?;
-        #[cfg(not(feature = "gcu"))]
-        let (q, k) = self
-            .rotary_emb
-            .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?;
-
-        #[cfg(feature = "gcu")]
-        let (q, k) = candle_nn::apply_rotary_emb_qkv(
-            &q,
-            &k,
-            &self.rotary_emb.cos_sin,
-            &self.rotary_emb.sin,
-            index_pos,
-            0,
-            true,
-            true,
-        )?;
-
-        Ok((q.to_dtype(dtype)?, k.to_dtype(dtype)?))
-    }
 
     fn forward(
         &mut self,
@@ -204,10 +173,11 @@ impl Attention {
 
         let qkv = self.qkv_proj.forward(xs)?;
         let query_pos = self.num_heads * self.head_dim;
-        let query_states = qkv.narrow(D::Minus1, 0, query_pos)?.contiguous()?;
+        let dtype = qkv.dtype();
+        let query_states = qkv.narrow(D::Minus1, 0, query_pos)?.to_dtype(DType::F32)?;
         let key_states = qkv
             .narrow(D::Minus1, query_pos, self.num_kv_heads * self.head_dim)?
-            .contiguous()?;
+            .to_dtype(DType::F32)?;
         let value_states = qkv
             .narrow(
                 D::Minus1,
@@ -235,7 +205,25 @@ impl Attention {
             (q, k, v.contiguous()?)
         };
 
-        let (q, k) = self.apply_rotary_emb_qkv(&q, &k, seqlen_offset)?;
+        #[cfg(not(feature = "gcu"))]
+        let (q, k) = self
+            .rotary_emb
+            .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?;
+
+        #[cfg(feature = "gcu")]
+        let (q, k) = candle_nn::apply_rotary_emb_qkv(
+            &q,
+            &k,
+            &self.rotary_emb.cos_sin,
+            &self.rotary_emb.sin,
+            seqlen_offset,
+            0,
+            true,
+            true,
+        )?;
+
+        let q = q.to_dtype(v.dtype())?;
+        let k = k.to_dtype(v.dtype())?;
 
         let k = candle_transformers::utils::repeat_kv(k, self.num_kv_groups)?;
         let v = candle_transformers::utils::repeat_kv(v, self.num_kv_groups)?;

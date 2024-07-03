@@ -398,7 +398,7 @@ impl<'a> LLMEngine<'a> {
             _PAD_SLOT_ID,
             &self.pipeline.device(),
         )?;
-        
+
         Ok(PreparedInputs {
             tokens: input_tokens,
             positions: input_positions,
