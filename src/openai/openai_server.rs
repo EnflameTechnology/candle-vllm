@@ -1,5 +1,3 @@
-use std::thread;
-
 use super::requests::ChatCompletionRequest;
 use super::requests::Messages;
 use super::responses::{APIError, ChatCompletionResponse, ChatCompletionUsageResponse};
@@ -7,9 +5,7 @@ use super::sampling_params::{EarlyStoppingCondition, SamplingParams};
 use super::streaming::new_streaming_conn;
 use super::utils::get_created_time_secs;
 use super::OpenAIServerData;
-use actix_web::web::Bytes;
 use actix_web::{post, web, Either, HttpResponse};
-use std::time::{Duration, Instant};
 use tokenizers::Encoding;
 use uuid::Uuid;
 
@@ -107,7 +103,7 @@ async fn chat_completions(
     data: web::Data<OpenAIServerData<'static>>,
     request: web::Json<ChatCompletionRequest>,
 ) -> Either<Result<web::Json<ChatCompletionResponse>, APIError>, HttpResponse> {
-    let model_name = &request.model;
+    // let model_name = &request.model;
     // let res = verify_model(&data, model_name);
     // if res.is_err() {
     //     return Either::Left(Err(res.err().unwrap()));
@@ -151,7 +147,7 @@ async fn chat_completions(
         request.best_of,
         request.presence_penalty.unwrap_or(0.0),
         request.frequency_penalty.unwrap_or(0.0),
-        request.frequency_penalty.unwrap_or(1.1),
+        request.repetition_penalty.unwrap_or(1.1),
         request.temperature.unwrap_or(0.7),
         request.top_p.unwrap_or(1.0),
         request.top_k.unwrap_or(-1),
@@ -230,7 +226,6 @@ async fn chat_completions(
                 .streaming(receiver),
         );
     }
-    let start_time = Instant::now();
     let result = {
         let mut model = data.model.lock().await;
         let model_res = model
@@ -248,7 +243,6 @@ async fn chat_completions(
         }
         model_res.unwrap()
     };
-    let end_time = Instant::now();
 
     let choices = result
         .iter()
@@ -270,13 +264,6 @@ async fn chat_completions(
             .map(|(_, usage)| usage.completion_time_costs)
             .sum(),
     };
-    let duration = end_time.duration_since(start_time);
-    println!(
-        "\r\n {} tokens processed in {} seconds ({} tokens/s)",
-        usage.total_tokens - usage.prompt_tokens,
-        duration.as_secs(),
-        (usage.total_tokens - usage.prompt_tokens) * 1000 / duration.as_millis() as usize
-    );
 
     Either::Left(Ok(web::Json(ChatCompletionResponse {
         id: request_id,

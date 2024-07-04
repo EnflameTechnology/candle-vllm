@@ -5,7 +5,6 @@ use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
 use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_core as candle;
-use candle_nn::LayerNorm;
 use candle_nn::VarBuilder;
 use candle_transformers::models::with_tracing::{linear_no_bias as linear, Linear, RmsNorm};
 use std::iter::zip;
@@ -60,7 +59,7 @@ struct RotaryEmbedding {
 }
 
 impl RotaryEmbedding {
-    fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
+    fn new(_dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
         let dim = cfg.hidden_size / cfg.num_attention_heads;
         let max_seq_len = cfg.max_seq_len;
         let inv_freq: Vec<_> = (0..dim)

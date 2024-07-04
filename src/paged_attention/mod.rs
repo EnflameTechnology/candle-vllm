@@ -1,13 +1,8 @@
-use candle_core::{DType, Device, Result, Tensor, D};
+use candle_core::{Device, Result, Tensor};
 
-use crate::{
-    backend::{paged_attention, reshape_and_cache},
-    openai::responses::APIError,
-    try_api,
-};
+use crate::backend::{paged_attention, reshape_and_cache};
 #[cfg(feature = "gcu")]
 use candle_core::gcu_backend::ubridge::prelude::StreamTrait;
-
 use self::input_metadata::InputMetadata;
 mod attn_bias;
 pub(crate) mod input_metadata;
@@ -124,7 +119,7 @@ impl PagedAttention {
                 .reshape(((), attention_heads, head_size))?;
             (q, k, v)
         } else {
-            //avoid unneccesary transpose for decoding
+            //avoid unnecessary transpose for decoding
             let q = query.reshape(((), attention_heads, head_size))?;
             let k = key.reshape(((), key_value_heads, head_size))?;
             let v = value.reshape(((), key_value_heads, head_size))?;
