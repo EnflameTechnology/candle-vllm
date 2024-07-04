@@ -151,7 +151,7 @@ async fn chat_completions(
         request.best_of,
         request.presence_penalty.unwrap_or(0.0),
         request.frequency_penalty.unwrap_or(0.0),
-        request.frequency_penalty.unwrap_or(1.1),
+        request.repetition_penalty.unwrap_or(1.1),
         request.temperature.unwrap_or(0.7),
         request.top_p.unwrap_or(1.0),
         request.top_k.unwrap_or(-1),

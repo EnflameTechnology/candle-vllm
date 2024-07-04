@@ -27,7 +27,7 @@ Currently, candle-vllm supports chat serving for the following models.
 | #6 | StableLM |TBD|TBD|
 | #7 | BigCode/StarCode |TBD|TBD|
 | #8 | ChatGLM |TBD|TBD|
-| #9 | QWen2 (1.8B, 7B) |✅|148 tks/s (1.8B)|
+| #9 | **QWen2 (1.8B, 7B)** |✅|148 tks/s (1.8B)|
 | #10 | Google Gemma |TBD|TBD|
 | #11 | Blip-large (Multimodal) |TBD|TBD|
 | #12 | Moondream-2 (Multimodal LLM) |TBD|TBD|
@@ -129,9 +129,25 @@ After the `candle-vllm` service is running, run the Python script and enjoy effi
 ## Usage Help
 For general configuration help, run `cargo run -- --help`.
 
-For model-specific help, run `cargo run -- --port 1234 <MODEL TYPE> --help`
+For model-specific help, run `cargo run -- --port 2000 <MODEL_TYPE> --help`
 
 For local model weights, run `cargo run --release -- --port 2000 --weight-path /home/llama2_7b/ llama --repeat-last-n 64`, change the path when needed.
+
+`MODEL_TYPE` = ["llama", "phi3", "qwen2"]
+
+`WEIGHT_FILE_PATH` = Corresponding weight path for the given model type
+
+```
+cargo run --release --features gcu -- --port 2000 --weight-path <WEIGHT_FILE_PATH> <MODEL_TYPE> --repeat-last-n 64
+```
+
+or
+
+`MODEL_ID` = Huggingface model id
+
+```
+cargo run --release --features gcu -- --port 2000 --model-id <MODEL_ID> <MODEL_TYPE> --repeat-last-n 64
+```
 
 For kvcache configuration, set `kvcache_mem_cpu` and `kvcache_mem_gpu`, default 4GB CPU memory and 4GB GPU memory for kvcache. 
 
@@ -139,6 +155,7 @@ For chat history settings, set `record_conversation` to `true` to let candle-vll
 
 For chat streaming, the `stream` flag in chat request need to be set to `True`.
 
+You may revise `repetition_penalty` and `temperature` flag in chat request (http post).
 
 ## Report issue
 Installing `candle-vllm` is as simple as the following steps. If you have any problems, please create an
