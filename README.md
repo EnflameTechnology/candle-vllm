@@ -19,15 +19,15 @@ Currently, candle-vllm supports chat serving for the following models.
 
 | Model ID | Model Type | Supported | Speed (A100, BF16)
 |--|--|--|--|
-| #1 | **LLAMA/LLAMA2/LLaMa3** |✅|71 tks/s (7B)|
+| #1 | **LLAMA/LLAMA2/LLaMa3** |✅|73 tks/s (7B)|
 | #2 | Mistral |TBD|TBD|
 | #3 | Phi (v1, v1.5, v2) |TBD|TBD|
-| #4 | **Phi-3 （3.8B, 7B）** |✅|99 tks/s (3.8B)|
+| #4 | **Phi-3 （3.8B, 7B）** |✅|102 tks/s (3.8B)|
 | #5 | Yi |TBD|TBD|
 | #6 | StableLM |TBD|TBD|
 | #7 | BigCode/StarCode |TBD|TBD|
 | #8 | ChatGLM |TBD|TBD|
-| #9 | QWen |TBD|TBD|
+| #9 | QWen2 (1.8B, 7B) |✅|148 tks/s (1.8B)|
 | #10 | Google Gemma |TBD|TBD|
 | #11 | Blip-large (Multimodal) |TBD|TBD|
 | #12 | Moondream-2 (Multimodal LLM) |TBD|TBD|
@@ -47,7 +47,12 @@ sudo apt install libssl-dev
 sudo apt install pkg-config
 git clone git@github.com:EricLBuehler/candle-vllm.git
 cd candle-vllm
-cargo run --release -- --port 2000 --weight-path /home/llama2_7b/ llama7b --repeat-last-n 64
+cargo run --release -- --port 2000 --weight-path /home/llama2_7b/ llama --repeat-last-n 64
+```
+
+You may also run specific model using huggingface model-id, e.g.,
+```
+cargo run --release -- --port 2000 --model-id meta-llama/Llama-2-7b-chat-hf llama --repeat-last-n 64
 ```
 
 ### Step 2:
@@ -105,7 +110,7 @@ openai.api_key = "EMPTY"
 openai.base_url = "http://localhost:2000/v1/"
 
 completion = openai.chat.completions.create(
-    model="llama7b",
+    model="llama",
     messages=[
         {
             "role": "user",
@@ -124,9 +129,9 @@ After the `candle-vllm` service is running, run the Python script and enjoy effi
 ## Usage Help
 For general configuration help, run `cargo run -- --help`.
 
-For model-specific help, run `cargo run -- --port 1234 <MODEL NAME> --help`
+For model-specific help, run `cargo run -- --port 1234 <MODEL TYPE> --help`
 
-For local model weights, run `cargo run --release -- --port 2000 --weight-path /home/llama2_7b/ llama7b --repeat-last-n 64`, change the path when needed.
+For local model weights, run `cargo run --release -- --port 2000 --weight-path /home/llama2_7b/ llama --repeat-last-n 64`, change the path when needed.
 
 For kvcache configuration, set `kvcache_mem_cpu` and `kvcache_mem_gpu`, default 4GB CPU memory and 4GB GPU memory for kvcache. 
 
