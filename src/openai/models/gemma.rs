@@ -72,6 +72,7 @@ fn rms_norm(dim: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
 struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
+    cos_sin: Tensor,
 }
 
 impl RotaryEmbedding {
@@ -83,14 +84,18 @@ impl RotaryEmbedding {
             .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(DType::F32)?;
         let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(dtype)?
+            .to_dtype(DType::F32)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
+        let cos = freqs.cos()?;
+        let sin = freqs.sin()?;
+        let cos_sin = Tensor::cat(&[&cos, &sin], D::Minus1)?.contiguous()?; //must be contiguous tensor;
         Ok(Self {
-            sin: freqs.sin()?,
-            cos: freqs.cos()?,
+            sin,
+            cos,
+            cos_sin,
         })
     }
 
@@ -100,11 +105,28 @@ impl RotaryEmbedding {
         k: &Tensor,
         seqlen_offset: usize,
     ) -> Result<(Tensor, Tensor)> {
+        #[cfg(not(feature = "gcu"))]
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
+        #[cfg(not(feature = "gcu"))]
         let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
+        #[cfg(not(feature = "gcu"))]
         let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
-        let q_embed = candle_nn::rotary_emb::rope(&q, &cos, &sin)?;
-        let k_embed = candle_nn::rotary_emb::rope(&k, &cos, &sin)?;
+        #[cfg(not(feature = "gcu"))]
+        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+        #[cfg(not(feature = "gcu"))]
+        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+
+        #[cfg(feature = "gcu")]
+        let (q_embed, k_embed) = candle_nn::apply_rotary_emb_qkv(
+            &q,
+            &k,
+            &self.cos_sin,
+            &self.sin,
+            seqlen_offset,
+            0,
+            true,
+            true,
+        )?;
         Ok((q_embed, k_embed))
     }
 }
@@ -198,8 +220,8 @@ impl Attention {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = xs.dims3()?;
 
-        let query_states = self.q_proj.forward(xs)?;
-        let key_states = self.k_proj.forward(xs)?;
+        let query_states = self.q_proj.forward(xs)?.to_dtype(DType::F32)?;
+        let key_states = self.k_proj.forward(xs)?.to_dtype(DType::F32)?;
         let value_states = self.v_proj.forward(xs)?;
 
         let (q, k, v) = if seq_len == 1 {
@@ -218,13 +240,15 @@ impl Attention {
             let v = value_states
                 .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
                 .transpose(1, 2)?;
-            (q.contiguous()?, k.contiguous()?, v.contiguous()?)
+            (q, k, v.contiguous()?)
         };
 
         let (q, k) = self
             .rotary_emb
             .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?;
-
+        
+        let q = q.to_dtype(v.dtype())?;
+        let k = k.to_dtype(v.dtype())?;
         // No need repeat_kv since we performed broadcasted matmul in the prefiling stage
         // while, the decoding stage used paged-attention which also does not need kv stacking (to match query dim)
         // let k = candle_transformers::utils::repeat_kv(k, self.num_kv_groups)?.contiguous()?;
@@ -322,7 +346,7 @@ impl Gemma {
             layers.push(layer)
         }
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
-        let lm_head = Linear::new(embed_tokens.embeddings().clone(), None);
+        let lm_head = Linear::new(embed_tokens.embeddings().clone(), None, true);
         Ok(Self {
             embed_tokens,
             layers,

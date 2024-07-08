@@ -105,7 +105,7 @@ impl PagedAttention {
                         attention_heads,
                         head_size,
                         seq_len,
-                    ))?)?
+                    ))?.contiguous()?)?
                         * self.scale as f64)?
                 } else {
                     (query.matmul(&key.t()?)? * self.scale as f64)?
@@ -118,7 +118,7 @@ impl PagedAttention {
                         attention_heads,
                         seq_len,
                         head_size,
-                    ))?)?)
+                    ))?.contiguous()?)?)
                 } else {
                     Some(att.matmul(&value)?)
                 }
