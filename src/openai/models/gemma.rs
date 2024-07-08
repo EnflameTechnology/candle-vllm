@@ -76,7 +76,7 @@ struct RotaryEmbedding {
 }
 
 impl RotaryEmbedding {
-    fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
+    fn new(_dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
         let dim = cfg.hidden_size / cfg.num_attention_heads;
         let max_seq_len = cfg.max_seq_len;
         let inv_freq: Vec<_> = (0..dim)
@@ -92,11 +92,7 @@ impl RotaryEmbedding {
         let cos = freqs.cos()?;
         let sin = freqs.sin()?;
         let cos_sin = Tensor::cat(&[&cos, &sin], D::Minus1)?.contiguous()?; //must be contiguous tensor;
-        Ok(Self {
-            sin,
-            cos,
-            cos_sin,
-        })
+        Ok(Self { sin, cos, cos_sin })
     }
 
     fn apply_rotary_emb_qkv(
@@ -246,7 +242,7 @@ impl Attention {
         let (q, k) = self
             .rotary_emb
             .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?;
-        
+
         let q = q.to_dtype(v.dtype())?;
         let k = k.to_dtype(v.dtype())?;
         // No need repeat_kv since we performed broadcasted matmul in the prefiling stage
