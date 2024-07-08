@@ -220,11 +220,11 @@ impl RotaryEmbedding {
             &q,
             &k,
             if is_long {
-                &self.rotary_emb.long_cos_sin.unwrap()
+                &self.long_cos_sin.as_ref().unwrap()
             } else {
-                &self.rotary_emb.cos_sin
+                &self.cos_sin
             },
-            &self.rotary_emb.sin,
+            &self.sin,
             seqlen_offset,
             0,
             true,
