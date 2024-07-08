@@ -46,6 +46,7 @@ impl LlamaConfig {
             tie_word_embeddings: false,
             rope_scaling: None,
             original_max_position_embeddings: None,
+            attention_bias: false,
         }
     }
 }
@@ -159,9 +160,6 @@ impl CausalSelfAttention {
 
         #[cfg(feature = "gcu")]
         let (q, k) = self.apply_rotary_emb_qkv(&q, &k, index_pos)?;
-
-        let k = self.repeat_kv(k)?;
-        let v = self.repeat_kv(v)?;
 
         let y = self.attn.forward(
             &q,
