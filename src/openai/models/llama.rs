@@ -44,6 +44,8 @@ impl LlamaConfig {
             sliding_window: None,
             hidden_act: None,
             tie_word_embeddings: false,
+            rope_scaling: None,
+            original_max_position_embeddings: None,
         }
     }
 }
@@ -71,11 +73,7 @@ impl Cache {
         let cos = idx_theta.cos()?.to_dtype(dtype)?;
         let sin = idx_theta.sin()?.to_dtype(dtype)?;
         let cos_sin = Tensor::cat(&[&cos, &sin], D::Minus1)?.contiguous()?; //must be contiguous tensor;
-        Ok(Self {
-            cos,
-            sin,
-            cos_sin,
-        })
+        Ok(Self { cos, sin, cos_sin })
     }
 }
 

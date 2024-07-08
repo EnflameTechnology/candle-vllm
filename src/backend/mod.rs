@@ -72,10 +72,8 @@ use candle_core::{
 
 #[cfg(feature = "gcu")]
 use candle_core::{
-    gcu_backend::ubridge::prelude::GcuFunction as CudaFunction,
-    DType, GcuDevice as CudaDevice,
+    gcu_backend::ubridge::prelude::GcuFunction as CudaFunction, DType, GcuDevice as CudaDevice,
 };
-
 
 #[cfg(not(feature = "gcu"))]
 pub use paged_attention::*;
