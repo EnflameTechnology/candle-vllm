@@ -32,7 +32,7 @@ pub struct PhiConfig {
 }
 
 impl PhiConfig {
-    pub fn into_config(self, use_flash_attn: bool) -> Config {
+    pub fn into_config(self, use_flash_attn: bool, kv_cache_dtype: DType) -> Config {
         Config {
             hidden_size: self.hidden_size,
             intermediate_size: self.intermediate_size,
@@ -52,6 +52,11 @@ impl PhiConfig {
             rope_scaling: self.rope_scaling,
             original_max_position_embeddings: self.original_max_position_embeddings,
             attention_bias: false,
+            partial_rotary_factor: None,
+            qk_layer_rms_norm: None,
+            kv_cache_dtype,
+            use_qkv_bias: None,
+            custom_stop_tokens: None,
         }
     }
 }

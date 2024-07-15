@@ -11,8 +11,12 @@ use crate::{
         models::{
             gemma::{Gemma, GemmaConfig},
             llama::{Llama, LlamaConfig},
+            mistral::{Mistral, MistralConfig},
+            phi2::{Phi2, Phi2Config},
             phi3::{Phi, PhiConfig},
             qwen2::{Qwen2, QwenConfig},
+            stable_lm::{StableLM, StableLMConfig},
+            yi::{Yi, YiConfig},
             Config,
         },
         responses::APIError,
@@ -26,7 +30,7 @@ use crate::{
 use candle_core::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
 use candle_nn::VarBuilder;
-use candle_transformers::generation::LogitsProcessor;
+use candle_transformers::generation::{LogitsProcessor, Sampling};
 use either::Either::{Left, Right};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use std::{iter::zip, path::PathBuf, sync::Arc};
@@ -38,20 +42,43 @@ const MAX_GEN_TOKENS: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct SpecificConfig {
-    repeat_last_n: usize,
+    repeat_last_n: Option<usize>,
+    temperature: Option<f32>,
+    top_k: Option<usize>,
+    top_p: Option<f64>,
+    penalty: Option<f32>,
+    max_gen_tokens: Option<usize>,
 }
 
 impl SpecificConfig {
-    pub fn new(repeat_last_n: usize) -> Self {
-        Self { repeat_last_n }
+    pub fn new(
+        repeat_last_n: Option<usize>,
+        temperature: Option<f32>,
+        top_k: Option<usize>,
+        top_p: Option<f64>,
+        penalty: Option<f32>,
+        max_gen_tokens: Option<usize>,
+    ) -> Self {
+        Self {
+            repeat_last_n,
+            temperature,
+            top_k,
+            top_p,
+            penalty,
+            max_gen_tokens,
+        }
     }
 }
 
 enum LLMModel {
     LLAMA(Llama),
+    Phi2(Phi2),
     Phi3(Phi),
     Qwen2(Qwen2),
     Gemma(Gemma),
+    Mistral(Mistral),
+    Yi(Yi),
+    StableLM(StableLM),
 }
 /// top-p, multinomial, and argmax sampling are implemented. Beam search is not implemented.
 pub struct DefaultPipeline {
@@ -64,8 +91,8 @@ pub struct DefaultPipeline {
     dtype: DType,
     device: Device,
     cur_idx: usize,
-    config: Config,
-    stop_token_id: u32,
+    _config: Config,
+    stop_token_ids: Vec<u32>,
 }
 
 pub struct DefaultLoader {
@@ -140,34 +167,59 @@ impl<'a> ModelLoader<'a> for DefaultLoader {
         dtype: DType,
         device: Device,
     ) -> Result<(Box<dyn ModulePipeline<'a>>, PipelineConfig), APIError> {
-        let args = self.config.clone();
+        let specific_args = self.config.clone();
 
         let config = match self.name.as_str() {
             "llama" => {
                 let config: LlamaConfig = try_api!(serde_json::from_slice(&try_api!(
                     std::fs::read(paths.get_config_filename())
                 ),));
-                config.into_config(false)
+                config.into_config(false, dtype)
+            }
+            "phi2" => {
+                let config: Phi2Config = try_api!(serde_json::from_slice(&try_api!(
+                    std::fs::read(paths.get_config_filename())
+                ),));
+                //Phi2 use F32 type for kvcache
+                config.into_config(false, DType::F32)
             }
             "phi3" => {
                 let config: PhiConfig = try_api!(serde_json::from_slice(&try_api!(std::fs::read(
                     paths.get_config_filename()
                 )),));
-                config.into_config(false)
+                config.into_config(false, dtype)
             }
             "qwen2" => {
                 let config: QwenConfig = try_api!(serde_json::from_slice(&try_api!(
                     std::fs::read(paths.get_config_filename())
                 ),));
-                config.into_config(false)
+                config.into_config(false, dtype)
             }
             "gemma" => {
                 let config: GemmaConfig = try_api!(serde_json::from_slice(&try_api!(
                     std::fs::read(paths.get_config_filename())
                 ),));
-                config.into_config(false)
+                config.into_config(false, dtype)
             }
-            _ => panic!(""),
+            "mistral" => {
+                let config: MistralConfig = try_api!(serde_json::from_slice(&try_api!(
+                    std::fs::read(paths.get_config_filename())
+                ),));
+                config.into_config(false, dtype)
+            }
+            "yi" => {
+                let config: YiConfig = try_api!(serde_json::from_slice(&try_api!(std::fs::read(
+                    paths.get_config_filename()
+                )),));
+                config.into_config(false, dtype)
+            }
+            "stablelm" => {
+                let config: StableLMConfig = try_api!(serde_json::from_slice(&try_api!(
+                    std::fs::read(paths.get_config_filename())
+                ),));
+                config.into_config(false, dtype)
+            }
+            _ => panic!("Model not supported!"),
         };
 
         println!("Model {:?}", config);
@@ -186,6 +238,10 @@ impl<'a> ModelLoader<'a> for DefaultLoader {
                 LLMModel::LLAMA(try_api!(Llama::load(vb, &config, dtype, &device))),
                 SeparatorStyle::Llama,
             ),
+            "phi2" => (
+                LLMModel::Phi2(try_api!(Phi2::new(vb, &config, dtype, &device))),
+                SeparatorStyle::Phi,
+            ),
             "phi3" => (
                 LLMModel::Phi3(try_api!(Phi::new(vb, &config, dtype, &device))),
                 SeparatorStyle::Phi,
@@ -198,7 +254,19 @@ impl<'a> ModelLoader<'a> for DefaultLoader {
                 LLMModel::Gemma(try_api!(Gemma::new(vb, &config, dtype, &device))),
                 SeparatorStyle::Gemma,
             ),
-            _ => panic!(""),
+            "mistral" => (
+                LLMModel::Mistral(try_api!(Mistral::new(vb, &config, dtype, &device))),
+                SeparatorStyle::Mistral,
+            ),
+            "yi" => (
+                LLMModel::Yi(try_api!(Yi::new(vb, &config, dtype, &device))),
+                SeparatorStyle::Yi,
+            ),
+            "stablelm" => (
+                LLMModel::StableLM(try_api!(StableLM::new(vb, &config, dtype, &device))),
+                SeparatorStyle::StableLM,
+            ),
+            _ => panic!("Model not supported!"),
         };
 
         let tokenizer_ = Tokenizer::from_file(paths.get_tokenizer_filename())
@@ -209,7 +277,9 @@ impl<'a> ModelLoader<'a> for DefaultLoader {
         println!("Done loading.");
 
         //max and min number of tokens generated per request
-        let mut default_max_tokens = config.max_seq_len / 10;
+        let mut default_max_tokens = specific_args
+            .max_gen_tokens
+            .unwrap_or(config.max_seq_len / 5);
         if default_max_tokens < MIN_GEN_TOKENS {
             default_max_tokens = MIN_GEN_TOKENS;
         } else if default_max_tokens > MAX_GEN_TOKENS {
@@ -219,6 +289,9 @@ impl<'a> ModelLoader<'a> for DefaultLoader {
         let pipeline_config = PipelineConfig {
             max_model_len: config.max_seq_len,
             default_max_tokens,
+            penalty: specific_args.penalty.unwrap_or(1.1),
+            repeat_last_n: specific_args.repeat_last_n.unwrap_or(32),
+            temperature: specific_args.temperature.unwrap_or(0.),
         };
 
         println!("{:?}", pipeline_config);
@@ -227,15 +300,41 @@ impl<'a> ModelLoader<'a> for DefaultLoader {
             Some(token) => token,
             None => tokenizer.tokenizer().token_to_id(EOS_TOKEN).unwrap(),
         };
+        let mut stop_token_ids = Vec::<u32>::new();
+        stop_token_ids.push(eos_token);
 
-        //reference: https://huggingface.co/blog/codellama#conversational-instructions,
-        //reference: https://github.com/facebookresearch/llama/blob/1a240688810f8036049e8da36b073f63d2ac552c/llama/generation.py#L212
+        if let Some(custom_stop) = &config.custom_stop_tokens {
+            for stop in custom_stop {
+                match tokenizer.get_token(&stop) {
+                    Some(token) => stop_token_ids.push(token),
+                    None => {}
+                };
+            }
+        }
+
+        println!("{:?}", specific_args);
+
+        let logits_processor = {
+            let temperature = specific_args.temperature.unwrap_or(0.) as f64;
+            let sampling = if temperature <= 0. {
+                Sampling::ArgMax
+            } else {
+                match (specific_args.top_k, specific_args.top_p) {
+                    (None, None) => Sampling::All { temperature },
+                    (Some(k), None) => Sampling::TopK { k, temperature },
+                    (None, Some(p)) => Sampling::TopP { p, temperature },
+                    (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature },
+                }
+            };
+            LogitsProcessor::from_sampling(SAMPLING_SEED, sampling)
+        };
+
         Ok((
             Box::new(DefaultPipeline {
                 model,
-                args,
+                args: specific_args,
                 tokenizer,
-                logits_processor: LogitsProcessor::new(SAMPLING_SEED, None, None),
+                logits_processor: logits_processor,
                 conversation: DefaultConversation::new(
                     self.name.to_string(),
                     "[INST] <<SYS>>\n{}\n<</SYS>>\n\n [/INST]".to_string(),
@@ -243,7 +342,7 @@ impl<'a> ModelLoader<'a> for DefaultLoader {
                     0,
                     sep_style,
                     "".to_string(),
-                    vec![eos_token as usize],
+                    stop_token_ids.clone(),
                     ("user".to_string(), "assistant".to_string()),
                     DefaultConversationSeparators {
                         sep: " ".to_string(),
@@ -254,8 +353,8 @@ impl<'a> ModelLoader<'a> for DefaultLoader {
                 dtype,
                 device: device.clone(),
                 cur_idx: 0,
-                config: config,
-                stop_token_id: eos_token,
+                config: config.clone(),
+                stop_token_ids,
             }),
             pipeline_config,
         ))
@@ -276,6 +375,16 @@ impl<'s> ModulePipeline<'s> for DefaultPipeline {
         }
         let ret = match &mut self.model {
             LLMModel::LLAMA(llama) => llama
+                .forward(
+                    &input_tokens
+                        .reshape((1, input_tokens.shape().dims()[0]))
+                        .unwrap(),
+                    self.cur_idx,
+                    kv_cache,
+                    &mut input_metadata,
+                )
+                .map_err(APIError::from),
+            LLMModel::Phi2(phi) => phi
                 .forward(
                     &input_tokens
                         .reshape((1, input_tokens.shape().dims()[0]))
@@ -315,6 +424,36 @@ impl<'s> ModulePipeline<'s> for DefaultPipeline {
                     &mut input_metadata,
                 )
                 .map_err(APIError::from),
+            LLMModel::Mistral(mistral) => mistral
+                .forward(
+                    &input_tokens
+                        .reshape((1, input_tokens.shape().dims()[0]))
+                        .unwrap(),
+                    self.cur_idx,
+                    kv_cache,
+                    &mut input_metadata,
+                )
+                .map_err(APIError::from),
+            LLMModel::Yi(yi) => yi
+                .forward(
+                    &input_tokens
+                        .reshape((1, input_tokens.shape().dims()[0]))
+                        .unwrap(),
+                    self.cur_idx,
+                    kv_cache,
+                    &mut input_metadata,
+                )
+                .map_err(APIError::from),
+            LLMModel::StableLM(stablelm) => stablelm
+                .forward(
+                    &input_tokens
+                        .reshape((1, input_tokens.shape().dims()[0]))
+                        .unwrap(),
+                    self.cur_idx,
+                    kv_cache,
+                    &mut input_metadata,
+                )
+                .map_err(APIError::from),
         };
 
         self.cur_idx += length;
@@ -327,11 +466,6 @@ impl<'s> ModulePipeline<'s> for DefaultPipeline {
         sampling_params: &SamplingParams,
         seqs: &[(&usize, &Arc<Sequence>)],
     ) -> Result<Vec<TokenOrFinishReason>, APIError> {
-        let eos_token_id = self
-            .config
-            .eos_token_id
-            .or_else(|| Some(self.stop_token_id));
-
         let n_seqs = logits.dims()[0];
 
         let mut result = Vec::new();
@@ -350,10 +484,14 @@ impl<'s> ModulePipeline<'s> for DefaultPipeline {
                 break;
             }
 
-            let logits = if sampling_params.repetition_penalty == 1. {
+            let logits = if sampling_params.repetition_penalty == 1.
+                || self.args.repeat_last_n.unwrap_or(16) >= tokens.len()
+            {
                 logits
             } else {
-                let start_at = tokens.len().saturating_sub(self.args.repeat_last_n);
+                let start_at = tokens
+                    .len()
+                    .saturating_sub(self.args.repeat_last_n.unwrap_or(16));
                 try_api!(candle_transformers::utils::apply_repeat_penalty(
                     &logits,
                     sampling_params.repetition_penalty,
@@ -362,17 +500,15 @@ impl<'s> ModulePipeline<'s> for DefaultPipeline {
             };
 
             let next_token = try_api!(self.logits_processor.sample(&logits));
-            //the first token (after prompt may be eos token)
-            if Some(next_token) == eos_token_id && tokens_generated > 1 {
+            let text = self
+                .tokenizer
+                .next_token(next_token)
+                .unwrap()
+                .unwrap_or("".to_string());
+            if self.stop_token_ids.contains(&next_token) && tokens_generated > 1 {
                 result.push(Right("stop".to_string()));
                 break;
             }
-            let text = self.tokenizer.next_token(next_token).unwrap();
-            let text = match text {
-                Some(t) => t,
-                _ => "".to_string(),
-            };
-
             let logprob = Logprobs {
                 token: next_token as usize,
                 logprob: 0.0,
@@ -403,9 +539,13 @@ impl<'s> ModulePipeline<'s> for DefaultPipeline {
     fn get_model_config(&self) -> Config {
         match &self.model {
             LLMModel::LLAMA(llama) => llama.get_config().clone(),
+            LLMModel::Phi2(phi) => phi.get_config().clone(),
             LLMModel::Phi3(phi) => phi.get_config().clone(),
             LLMModel::Qwen2(qwen2) => qwen2.get_config().clone(),
             LLMModel::Gemma(gemma) => gemma.get_config().clone(),
+            LLMModel::Mistral(mistral) => mistral.get_config().clone(),
+            LLMModel::Yi(yi) => yi.get_config().clone(),
+            LLMModel::StableLM(stablelm) => stablelm.get_config().clone(),
         }
     }
 
@@ -415,6 +555,12 @@ impl<'s> ModulePipeline<'s> for DefaultPipeline {
 
     fn device(&self) -> &Device {
         &self.device
+    }
+
+    fn reset_decoder(&mut self) -> Option<String> {
+        let ret = self.tokenizer.decode_rest().unwrap_or(None);
+        self.tokenizer.clear();
+        ret
     }
 }
 
