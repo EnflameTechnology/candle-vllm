@@ -20,11 +20,11 @@ Currently, candle-vllm supports chat serving for the following models.
 | Model ID | Model Type | Supported | Speed (A100, BF16)
 |--|--|--|--|
 | #1 | **LLAMA/LLAMA2/LLaMa3** |✅|74 tks/s (7B)|
-| #2 | Mistral |TBD|TBD|
-| #3 | Phi (v1, v1.5, v2) |TBD|TBD|
+| #2 | **Mistral** |✅|70 tks/s (7B)|
+| #3 | **Phi (v1, v1.5, v2)** |✅|97 tks/s (2.7B, F32+BF16)|
 | #4 | **Phi-3 （3.8B, 7B）** |✅|107 tks/s (3.8B)|
-| #5 | Yi |TBD|TBD|
-| #6 | StableLM |TBD|TBD|
+| #5 | **Yi** |✅|TBD|
+| #6 | **StableLM** |✅|TBD|
 | #7 | BigCode/StarCode |TBD|TBD|
 | #8 | ChatGLM |TBD|TBD|
 | #9 | **QWen2 (1.8B, 7B)** |✅|148 tks/s (1.8B)|
@@ -133,12 +133,12 @@ For model-specific help, run `cargo run -- --port 2000 <MODEL_TYPE> --help`
 
 For local model weights, run `cargo run --release -- --port 2000 --weight-path /home/llama2_7b/ llama --repeat-last-n 64`, change the path when needed.
 
-`MODEL_TYPE` = ["llama", "phi3", "qwen2", "gemma"]
+`MODEL_TYPE` = ["llama", "mistral", "phi2", "phi3", "qwen2", "gemma", "yi", "stable-lm"]
 
 `WEIGHT_FILE_PATH` = Corresponding weight path for the given model type
 
 ```
-cargo run --release --features gcu -- --port 2000 --weight-path <WEIGHT_FILE_PATH> <MODEL_TYPE> --repeat-last-n 64
+cargo run --release -- --port 2000 --weight-path <WEIGHT_FILE_PATH> <MODEL_TYPE> --repeat-last-n 64
 ```
 
 or
@@ -146,7 +146,7 @@ or
 `MODEL_ID` = Huggingface model id
 
 ```
-cargo run --release --features gcu -- --port 2000 --model-id <MODEL_ID> <MODEL_TYPE> --repeat-last-n 64
+cargo run --release -- --port 2000 --model-id <MODEL_ID> <MODEL_TYPE> --repeat-last-n 64
 ```
 
 For kvcache configuration, set `kvcache_mem_cpu` and `kvcache_mem_gpu`, default 4GB CPU memory and 4GB GPU memory for kvcache. 
@@ -155,7 +155,13 @@ For chat history settings, set `record_conversation` to `true` to let candle-vll
 
 For chat streaming, the `stream` flag in chat request need to be set to `True`.
 
-You may revise `repetition_penalty` and `temperature` flag in chat request (http post).
+You may supply `penalty` and `temperature` to the model to **prevent potential repetitions**, for example:
+
+```
+cargo run --release -- --port 2000 --weight-path /home/mistral_7b/ mistral --repeat-last-n 32 --penalty 1.1 --temperature 0.8
+```
+
+`--max-gen-tokens` parameter is used to control the maximum output tokens per chat response. The value will be set to 1/5 of max_sequence_len by default.
 
 ## Report issue
 Installing `candle-vllm` is as simple as the following steps. If you have any problems, please create an

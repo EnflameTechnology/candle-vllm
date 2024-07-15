@@ -15,7 +15,11 @@ use std::{collections::HashMap, sync::Arc};
 #[actix_web::test]
 async fn test_llama() -> Result<(), APIError> {
     let (loader, model_id) = get_model_loader(
-        ModelSelected::Llama { repeat_last_n: 64 },
+        ModelSelected::Llama {
+            repeat_last_n: Some(64),
+            penalty: Some(1.1),
+            temperature: None,
+        },
         Some("meta-llama/Llama-2-7b-chat-hf".to_string()),
     );
     let paths = loader.download_model(
@@ -33,6 +37,7 @@ async fn test_llama() -> Result<(), APIError> {
             num_gpu_blocks: None,
             num_cpu_blocks: None,
             fully_init: false,
+            dtype: DType::F16,
         },
     )?;
 
