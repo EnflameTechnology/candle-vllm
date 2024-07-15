@@ -106,9 +106,9 @@ impl PagedAttention {
                         key.broadcast_as((batch_size, attention_heads, seq_len, head_size))?
                     } else {
                         Tensor::cat(&vec![&key; attention_heads / key_value_heads], 2)?
-                            .reshape((batch_size, attention_heads, seq_len, head_size))?
+                            .reshape((batch_size, attention_heads, seq_len, head_size))?.contiguous()?
                     };
-                    (query.matmul(&key_repeat.t()?.contiguous()?)? * self.scale as f64)?
+                    (query.matmul(&key_repeat.t()?)? * self.scale as f64)?
                 } else {
                     (query.matmul(&key.t()?)? * self.scale as f64)?
                 };
@@ -120,9 +120,9 @@ impl PagedAttention {
                         value.broadcast_as((batch_size, attention_heads, seq_len, head_size))?
                     } else {
                         Tensor::cat(&vec![&value; attention_heads / key_value_heads], 2)?
-                            .reshape((batch_size, attention_heads, seq_len, head_size))?
+                            .reshape((batch_size, attention_heads, seq_len, head_size))?.contiguous()?
                     };
-                    Some(att.matmul(&value_repeat.contiguous()?)?)
+                    Some(att.matmul(&value_repeat)?)
                 } else {
                     Some(att.matmul(&value)?)
                 }
