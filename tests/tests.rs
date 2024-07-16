@@ -19,6 +19,7 @@ async fn test_llama() -> Result<(), APIError> {
             repeat_last_n: Some(64),
             penalty: Some(1.1),
             temperature: None,
+            max_gen_tokens: None,
         },
         Some("meta-llama/Llama-2-7b-chat-hf".to_string()),
     );

@@ -59,6 +59,7 @@ impl YiConfig {
 struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
+    cos_sin: Tensor,
 }
 
 impl RotaryEmbedding {
@@ -76,12 +77,15 @@ impl RotaryEmbedding {
             .to_dtype(DType::F32)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
+        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?.contiguous()?; //must be contiguous tensor;
         Ok(Self {
             sin: freqs.sin()?,
             cos: freqs.cos()?,
+            cos_sin,
         })
     }
 
+    #[cfg(not(feature = "gcu"))]
     fn apply_rotary_emb_qkv(
         &self,
         q: &Tensor,
@@ -185,8 +189,8 @@ impl Attention {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = xs.dims3()?;
 
-        let query_states = self.q_proj.forward(xs)?;
-        let key_states = self.k_proj.forward(xs)?;
+        let query_states = self.q_proj.forward(xs)?.to_dtype(DType::F32)?;
+        let key_states = self.k_proj.forward(xs)?.to_dtype(DType::F32)?;
         let value_states = self.v_proj.forward(xs)?;
 
         let (q, k, v) = if seq_len == 1 {
@@ -208,6 +212,19 @@ impl Attention {
             (q, k, v.contiguous()?)
         };
 
+        #[cfg(feature = "gcu")]
+        let (q, k) = candle_nn::apply_rotary_emb_qkv(
+            &q,
+            &k,
+            &self.rotary_emb.cos_sin,
+            &self.rotary_emb.sin,
+            seqlen_offset,
+            0,
+            true,
+            true,
+        )?;
+
+        #[cfg(not(feature = "gcu"))]
         let (q, k) = self.rotary_emb.apply_rotary_emb_qkv(
             &q.to_dtype(DType::F32)?,
             &k.to_dtype(DType::F32)?,

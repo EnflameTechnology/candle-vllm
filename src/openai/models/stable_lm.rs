@@ -66,11 +66,13 @@ impl StableLMConfig {
 pub(crate) struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
+    cos_sin: Tensor,
     dim: usize,
 }
 
 impl RotaryEmbedding {
     pub(crate) fn new(_dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
+        let dtype = if dev.is_cpu() { _dtype } else { DType::F32 };
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
         let dim = (cfg.partial_rotary_factor.unwrap() * head_dim as f32) as usize;
         let max_seq_len = cfg.max_seq_len;
@@ -79,18 +81,21 @@ impl RotaryEmbedding {
             .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(DType::F32)?;
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
         let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(DType::F32)?
+            .to_dtype(dtype)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
+        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?.contiguous()?; //must be contiguous tensor;
         Ok(Self {
             sin: freqs.sin()?,
             cos: freqs.cos()?,
+            cos_sin,
             dim,
         })
     }
 
+    #[cfg(not(feature = "gcu"))]
     fn apply_rotary_emb(&self, xs: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (_b_size, _num_heads, seq_len, _headdim) = xs.dims4()?;
         let xs_rot = xs.narrow(3, 0, self.dim)?.contiguous()?;
@@ -200,8 +205,8 @@ impl Attention {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = xs.dims3()?;
 
-        let query_states = self.q_proj.forward(xs)?;
-        let key_states = self.k_proj.forward(xs)?;
+        let query_states = self.q_proj.forward(xs)?.to_dtype(DType::F32)?;
+        let key_states = self.k_proj.forward(xs)?.to_dtype(DType::F32)?;
         let value_states = self.v_proj.forward(xs)?;
 
         let (q, k, v) = if seq_len == 1 {
@@ -223,10 +228,24 @@ impl Attention {
             (q, k, v.contiguous()?)
         };
 
+        #[cfg(feature = "gcu")]
+        let (q, k) = candle_nn::apply_rotary_emb_qkv(
+            &q,
+            &k,
+            &self.rotary_emb.cos_sin,
+            &self.rotary_emb.sin,
+            seqlen_offset,
+            self.rotary_emb.dim,
+            true,
+            true,
+        )?;
+
+        #[cfg(not(feature = "gcu"))]
         let q = self
             .rotary_emb
             .apply_rotary_emb(&q.to_dtype(DType::F32)?, seqlen_offset)?;
 
+        #[cfg(not(feature = "gcu"))]
         let k = self
             .rotary_emb
             .apply_rotary_emb(&k.to_dtype(DType::F32)?, seqlen_offset)?;
