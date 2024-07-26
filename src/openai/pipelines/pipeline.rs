@@ -172,7 +172,7 @@ impl ModelLoader for DefaultLoader {
         let specific_args = self.config.clone();
 
         let config = match self.name.as_str() {
-            "llama" => {
+            "llama" | "llama3" => {
                 let config: LlamaConfig = try_api!(serde_json::from_slice(&try_api!(
                     std::fs::read(paths.get_config_filename())
                 ),));
@@ -239,6 +239,10 @@ impl ModelLoader for DefaultLoader {
             "llama" => (
                 LLMModel::LLAMA(try_api!(Llama::load(vb, &config, dtype, &device))),
                 SeparatorStyle::Llama,
+            ),
+            "llama3" => (
+                LLMModel::LLAMA(try_api!(Llama::load(vb, &config, dtype, &device))),
+                SeparatorStyle::Llama3,
             ),
             "phi2" => (
                 LLMModel::Phi2(try_api!(Phi2::new(vb, &config, dtype, &device))),
@@ -323,7 +327,7 @@ impl ModelLoader for DefaultLoader {
             stop_token_ids.push(eos_token);
         }
 
-        //custome stop tokens
+        //custom stop tokens
         if let Some(custom_stop) = &config.custom_stop_tokens {
             for stop in custom_stop {
                 match tokenizer.get_token(&stop) {
