@@ -445,7 +445,6 @@ dependencies = [
  "candle-nn",
  "candle-paged-attention",
  "candle-transformers",
- "chrono",
  "clap",
  "cudarc 0.9.15",
  "derive_more",

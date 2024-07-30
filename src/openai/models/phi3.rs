@@ -1,12 +1,13 @@
 // This implementation is based on:
 // https://huggingface.co/microsoft/Phi-3-mini-4k-instruct/blob/main/modeling_phi3.py
 use super::{Config, RopeScaling};
+use crate::openai::models::linear::{linear_no_bias as linear, Linear};
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
 use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_core as candle;
 use candle_nn::VarBuilder;
-use candle_transformers::models::with_tracing::{linear_no_bias as linear, Linear, RmsNorm};
+use candle_transformers::models::with_tracing::RmsNorm;
 use either::Either;
 use std::collections::HashMap;
 use std::iter::zip;
@@ -185,7 +186,7 @@ impl RotaryEmbedding {
         &self,
         q: &Tensor,
         k: &Tensor,
-        seqlen_offset: usize,
+        input_positions: &Vec<Vec<usize>>,
     ) -> Result<(Tensor, Tensor)> {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
         let is_long = if self.sin_long.as_ref().is_some()
@@ -283,7 +284,7 @@ impl Attention {
         &mut self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
-        seqlen_offset: usize,
+        input_positions: &Vec<Vec<usize>>,
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &mut InputMetadata,
     ) -> Result<Tensor> {
@@ -414,7 +415,7 @@ impl DecoderLayer {
         &mut self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
-        seqlen_offset: usize,
+        input_positions: &Vec<Vec<usize>>,
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &mut InputMetadata,
     ) -> Result<Tensor> {
@@ -422,7 +423,7 @@ impl DecoderLayer {
         let xs = self.input_layernorm.forward(xs)?;
         let xs =
             self.self_attn
-                .forward(&xs, attention_mask, seqlen_offset, cache, input_metadata)?;
+                .forward(&xs, attention_mask, input_positions, cache, input_metadata)?;
         let xs = (xs + residual)?;
         let residual = &xs;
         let xs = xs.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
@@ -465,12 +466,8 @@ impl Phi {
         })
     }
 
-    fn prepare_decoder_attention_mask(
-        &self,
-        b_size: usize,
-        tgt_len: usize,
-        seqlen_offset: usize,
-    ) -> Result<Tensor> {
+    fn prepare_decoder_attention_mask(&self, b_size: usize, tgt_len: usize) -> Result<Tensor> {
+        let seqlen_offset = 0;
         let mask: Vec<_> = (0..tgt_len)
             .flat_map(|i| (0..tgt_len).map(move |j| if i < j { f32::NEG_INFINITY } else { 0. }))
             .collect();
@@ -488,7 +485,7 @@ impl Phi {
     pub fn forward(
         &mut self,
         input_ids: &Tensor,
-        seqlen_offset: usize,
+        input_positions: &Vec<Vec<usize>>,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &mut InputMetadata,
     ) -> Result<Tensor> {
@@ -496,7 +493,7 @@ impl Phi {
         let attention_mask = if seq_len <= 1 {
             None
         } else {
-            let mask = self.prepare_decoder_attention_mask(b_size, seq_len, seqlen_offset)?;
+            let mask = self.prepare_decoder_attention_mask(b_size, seq_len)?;
             Some(mask)
         };
         let mut xs = self.embed_tokens.forward(input_ids)?;
@@ -506,7 +503,7 @@ impl Phi {
                 xs = layer.forward(
                     &xs,
                     attention_mask.as_ref(),
-                    seqlen_offset,
+                    input_positions,
                     Some((k_cache, v_cache)),
                     input_metadata,
                 )?
@@ -516,17 +513,15 @@ impl Phi {
                 xs = layer.forward(
                     &xs,
                     attention_mask.as_ref(),
-                    seqlen_offset,
+                    input_positions,
                     None,
                     input_metadata,
                 )?
             }
         }
-        xs.narrow(1, seq_len - 1, 1)?
+        xs.i((.., seq_len - 1, ..))?
             .apply(&self.norm)?
             .apply(&self.lm_head)?
-            .i((.., 0, ..))?
-            .squeeze(0)?
             .to_dtype(DType::F32)
     }
 
