@@ -39,15 +39,15 @@ impl LogitsProcessor {
     }
 
     fn sample_argmax(&self, logits: Tensor) -> Result<u32> {
-        // let logits_v: Vec<f32> = logits.to_vec1()?;
+        let logits_v: Vec<f32> = logits.to_vec1()?;
         // Use gpu kernel
-        let next_token = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
-        // let next_token = logits_v
-        //     .iter()
-        //     .enumerate()
-        //     .max_by(|(_, u), (_, v)| u.total_cmp(v))
-        //     .map(|(i, _)| i as u32)
-        //     .unwrap();
+        // let next_token = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
+        let next_token = logits_v
+            .iter()
+            .enumerate()
+            .max_by(|(_, u), (_, v)| u.total_cmp(v))
+            .map(|(i, _)| i as u32)
+            .unwrap();
         Ok(next_token)
     }
 
