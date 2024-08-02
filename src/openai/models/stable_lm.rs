@@ -1,9 +1,8 @@
 use super::Config;
-use crate::openai::models::linear::{linear, linear_no_bias, Linear};
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use candle_nn::{Activation, LayerNorm, VarBuilder};
+use candle_nn::{linear, linear_no_bias, Activation, LayerNorm, Linear, VarBuilder};
 use either::Either;
 use std::iter::zip;
 use std::sync::Arc;
@@ -97,14 +96,42 @@ impl RotaryEmbedding {
     }
 
     #[cfg(not(feature = "gcu"))]
-    fn apply_rotary_emb(&self, xs: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
-        let (_b_size, _num_heads, seq_len, _headdim) = xs.dims4()?;
-        let xs_rot = xs.narrow(3, 0, self.dim)?.contiguous()?;
-        let xs_pass = xs.narrow(3, self.dim, _headdim - self.dim)?;
-        let c = self.cos.narrow(0, seqlen_offset, seq_len)?;
-        let s = self.sin.narrow(0, seqlen_offset, seq_len)?;
-        let xs_rot = candle_nn::rotary_emb::rope(&xs_rot, &c, &s)?;
-        Tensor::cat(&[&xs_rot, &xs_pass], D::Minus1)
+    fn apply_rotary_emb(&self, xs: &Tensor, input_positions: &Vec<Vec<usize>>) -> Result<Tensor> {
+        let (b_size, _num_heads, seq_len, _headdim) = xs.dims4()?;
+        let mut embeds = Vec::new();
+        for (b, seqlen_offset) in zip(0..b_size, input_positions) {
+            let xs_rot = xs.narrow(3, 0, self.dim)?.contiguous()?;
+            let xs_pass = xs.narrow(3, self.dim, _headdim - self.dim)?;
+            let c = self.cos.narrow(0, seqlen_offset[0], seq_len)?;
+            let s = self.sin.narrow(0, seqlen_offset[0], seq_len)?;
+            let xs_rot = xs_rot.narrow(0, b, 1)?;
+            let xs_pass = xs_pass.narrow(0, b, 1)?;
+
+            let xs_rot = candle_nn::rotary_emb::rope(&xs_rot, &c, &s)?;
+            let embed = Tensor::cat(&[&xs_rot, &xs_pass], D::Minus1)?.contiguous()?;
+            embeds.push(embed);
+        }
+        Tensor::cat(&embeds, 0)
+    }
+
+    #[cfg(feature = "gcu")]
+    fn apply_rotary_emb_qkv(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        input_positions: &Vec<Vec<usize>>,
+    ) -> Result<(Tensor, Tensor)> {
+        let (b_sz, _h, seq_len, _n_embd) = q.dims4()?;
+        candle_nn::apply_rotary_emb_qkv(
+            &q,
+            &k,
+            &self.cos_sin,
+            &self.sin,
+            input_positions[0][0],
+            self.dim,
+            true,
+            true,
+        )
     }
 }
 
@@ -230,16 +257,9 @@ impl Attention {
         };
 
         #[cfg(feature = "gcu")]
-        let (q, k) = candle_nn::apply_rotary_emb_qkv(
-            &q,
-            &k,
-            &self.rotary_emb.cos_sin,
-            &self.rotary_emb.sin,
-            seqlen_offset,
-            self.rotary_emb.dim,
-            true,
-            true,
-        )?;
+        let (q, k) = self
+            .rotary_emb
+            .apply_rotary_emb_qkv(&q, &k, input_positions)?;
 
         #[cfg(not(feature = "gcu"))]
         let q = self

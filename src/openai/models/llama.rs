@@ -1,10 +1,9 @@
 use super::Config;
-use crate::openai::models::linear::{linear_no_bias as linear, Linear};
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
 use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_core as candle;
-use candle_nn::{embedding, Embedding, Module, VarBuilder};
+use candle_nn::{embedding, linear_no_bias as linear, Embedding, Linear, Module, VarBuilder};
 use candle_transformers::models::with_tracing::RmsNorm;
 
 pub const MAX_SEQ_LEN: usize = 4096;
@@ -82,7 +81,7 @@ impl Cache {
             .matmul(&theta.reshape((1, theta.elem_count()))?)?;
         let cos = idx_theta.cos()?.to_dtype(dtype)?;
         let sin = idx_theta.sin()?.to_dtype(dtype)?;
-        let cos_sin = Tensor::cat(&[&cos, &sin], D::Minus1)?.contiguous()?; //must be contiguous tensor;
+        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
         Ok(Self { cos, sin, cos_sin })
     }
 }
@@ -102,43 +101,45 @@ struct CausalSelfAttention {
 }
 
 impl CausalSelfAttention {
-    fn apply_rotary_emb(&self, x: &Tensor, input_positions: &Vec<Vec<usize>>) -> Result<Tensor> {
-        let _enter = self.span_rot.enter();
-        let (b_sz, _, seq_len, _hidden_size) = x.dims4()?;
-        let mut embeds = Vec::new();
-        for (b, seqlen_offset) in zip(0..b_sz, input_positions) {
-            let cos = self
-                .cos_sin_cache
-                .cos
-                .narrow(0, seqlen_offset[0], seq_len)?;
-            let sin = self
-                .cos_sin_cache
-                .sin
-                .narrow(0, seqlen_offset[0], seq_len)?;
-            let x_b = x.narrow(0, b, 1)?;
-            let embed = candle_nn::rotary_emb::rope(&x_b, &cos, &sin).unwrap();
-            embeds.push(embed);
-        }
-        Tensor::cat(&embeds, 0)
-    }
-
-    #[cfg(feature = "gcu")]
     fn apply_rotary_emb_qkv(
         &self,
         q: &Tensor,
         k: &Tensor,
-        index_pos: usize,
+        input_positions: &Vec<Vec<usize>>,
     ) -> Result<(Tensor, Tensor)> {
-        candle_nn::apply_rotary_emb_qkv(
-            &q,
-            &k,
-            &self.cos_sin_cache.cos_sin,
-            &self.cos_sin_cache.sin,
-            index_pos,
-            0,
-            true,
-            true,
-        )
+        let (b_sz, _h, seq_len, _n_embd) = q.dims4()?;
+        if q.device().is_gcu() {
+            candle_nn::apply_rotary_emb_qkv(
+                &q,
+                &k,
+                &self.cos_sin_cache.cos_sin,
+                &self.cos_sin_cache.sin,
+                input_positions[0][0],
+                0,
+                true,
+                true,
+            )
+        } else {
+            let mut q_embeds = Vec::new();
+            let mut k_embeds = Vec::new();
+            for (b, seqlen_offset) in zip(0..b_sz, input_positions) {
+                let cos = self
+                    .cos_sin_cache
+                    .cos
+                    .narrow(0, seqlen_offset[0], seq_len)?;
+                let sin = self
+                    .cos_sin_cache
+                    .sin
+                    .narrow(0, seqlen_offset[0], seq_len)?;
+                let x_q = q.narrow(0, b, 1)?;
+                let x_k = k.narrow(0, b, 1)?;
+                let q_embed = candle_nn::rotary_emb::rope(&x_q, &cos, &sin).unwrap();
+                let k_embed = candle_nn::rotary_emb::rope(&x_k, &cos, &sin).unwrap();
+                q_embeds.push(q_embed);
+                k_embeds.push(k_embed);
+            }
+            Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
+        }
     }
 
     fn forward(
@@ -174,13 +175,7 @@ impl CausalSelfAttention {
             (q, k, v.contiguous()?)
         };
 
-        #[cfg(not(feature = "gcu"))]
-        let q = self.apply_rotary_emb(&q, index_pos)?.contiguous()?;
-        #[cfg(not(feature = "gcu"))]
-        let k = self.apply_rotary_emb(&k, index_pos)?.contiguous()?;
-
-        #[cfg(feature = "gcu")]
-        let (q, k) = self.apply_rotary_emb_qkv(&q, &k, index_pos)?;
+        let (q, k) = self.apply_rotary_emb_qkv(&q, &k, input_positions)?;
 
         let y = self.attn.forward(
             &q,

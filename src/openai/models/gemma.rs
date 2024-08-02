@@ -1,11 +1,10 @@
 use super::Config;
-use crate::openai::models::linear::{linear_b, linear_no_bias as linear, Linear};
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
 use candle::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_core as candle;
 use candle_nn::Activation;
-use candle_nn::{RmsNorm, VarBuilder};
+use candle_nn::{linear_b, linear_no_bias as linear, Linear, RmsNorm, VarBuilder};
 
 use either::Either;
 use std::iter::zip;
@@ -93,7 +92,7 @@ impl RotaryEmbedding {
         let freqs = t.matmul(&inv_freq)?;
         let cos = freqs.cos()?;
         let sin = freqs.sin()?;
-        let cos_sin = Tensor::cat(&[&cos, &sin], D::Minus1)?.contiguous()?; //must be contiguous tensor;
+        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
         Ok(Self { sin, cos, cos_sin })
     }
 
@@ -103,29 +102,33 @@ impl RotaryEmbedding {
         k: &Tensor,
         input_positions: &Vec<Vec<usize>>,
     ) -> Result<(Tensor, Tensor)> {
-        #[cfg(not(feature = "gcu"))]
-        let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-        #[cfg(not(feature = "gcu"))]
-        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
-        #[cfg(not(feature = "gcu"))]
-        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
-        #[cfg(not(feature = "gcu"))]
-        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        #[cfg(not(feature = "gcu"))]
-        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
-
-        #[cfg(feature = "gcu")]
-        let (q_embed, k_embed) = candle_nn::apply_rotary_emb_qkv(
-            &q,
-            &k,
-            &self.cos_sin,
-            &self.sin,
-            seqlen_offset,
-            0,
-            true,
-            true,
-        )?;
-        Ok((q_embed, k_embed))
+        let (b_sz, _h, seq_len, _n_embd) = q.dims4()?;
+        if q.device().is_gcu() {
+            candle_nn::apply_rotary_emb_qkv(
+                &q,
+                &k,
+                &self.cos_sin,
+                &self.sin,
+                input_positions[0][0],
+                0,
+                true,
+                true,
+            )
+        } else {
+            let mut q_embeds = Vec::new();
+            let mut k_embeds = Vec::new();
+            for (b, seqlen_offset) in zip(0..b_sz, input_positions) {
+                let cos = self.cos.narrow(0, seqlen_offset[0], seq_len)?;
+                let sin = self.sin.narrow(0, seqlen_offset[0], seq_len)?;
+                let x_q = q.narrow(0, b, 1)?;
+                let x_k = k.narrow(0, b, 1)?;
+                let q_embed = candle_nn::rotary_emb::rope(&x_q, &cos, &sin).unwrap();
+                let k_embed = candle_nn::rotary_emb::rope(&x_k, &cos, &sin).unwrap();
+                q_embeds.push(q_embed);
+                k_embeds.push(k_embed);
+            }
+            Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
+        }
     }
 }
 
@@ -243,7 +246,7 @@ impl Attention {
 
         let (q, k) = self
             .rotary_emb
-            .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?;
+            .apply_rotary_emb_qkv(&q, &k, input_positions)?;
 
         let q = q.to_dtype(v.dtype())?;
         let k = k.to_dtype(v.dtype())?;
