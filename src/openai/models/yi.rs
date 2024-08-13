@@ -1,9 +1,10 @@
 use super::Config;
+use crate::openai::models::linear::{linear_no_bias_x as linear_no_bias, LinearX as Linear};
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
-use candle::{DType, Device, IndexOp, Module, Result, Tensor};
-use candle_core as candle;
-use candle_nn::{linear_no_bias, Activation, Linear, VarBuilder};
+use crate::SpecificConfig;
+use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
+use candle_nn::{Activation, VarBuilder};
 use candle_transformers::models::with_tracing::RmsNorm;
 use either::Either;
 use std::iter::zip;
@@ -28,7 +29,12 @@ pub struct YiConfig {
 }
 
 impl YiConfig {
-    pub fn into_config(self, use_flash_attn: bool, kv_cache_dtype: DType) -> Config {
+    pub fn into_config(
+        self,
+        use_flash_attn: bool,
+        kv_cache_dtype: DType,
+        scfg: &SpecificConfig,
+    ) -> Config {
         Config {
             hidden_size: self.hidden_size,
             intermediate_size: self.intermediate_size,
@@ -53,6 +59,7 @@ impl YiConfig {
             kv_cache_dtype,
             use_qkv_bias: None,
             custom_stop_tokens: Some(vec!["<|im_end|>".to_string()]),
+            specific_config: scfg.clone(),
         }
     }
 }
@@ -137,9 +144,24 @@ impl MLP {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let hidden_sz = cfg.hidden_size;
         let intermediate_sz = cfg.intermediate_size;
-        let gate_proj = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("gate_proj"))?;
-        let up_proj = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("up_proj"))?;
-        let down_proj = linear_no_bias(intermediate_sz, hidden_sz, vb.pp("down_proj"))?;
+        let gate_proj = linear_no_bias(
+            hidden_sz,
+            intermediate_sz,
+            vb.pp("gate_proj"),
+            &cfg.specific_config.quant,
+        )?;
+        let up_proj = linear_no_bias(
+            hidden_sz,
+            intermediate_sz,
+            vb.pp("up_proj"),
+            &cfg.specific_config.quant,
+        )?;
+        let down_proj = linear_no_bias(
+            intermediate_sz,
+            hidden_sz,
+            vb.pp("down_proj"),
+            &cfg.specific_config.quant,
+        )?;
         Ok(Self {
             gate_proj,
             up_proj,
@@ -176,10 +198,30 @@ impl Attention {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = hidden_sz / num_heads;
-        let q_proj = linear_no_bias(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?;
-        let o_proj = linear_no_bias(num_heads * head_dim, hidden_sz, vb.pp("o_proj"))?;
+        let q_proj = linear_no_bias(
+            hidden_sz,
+            num_heads * head_dim,
+            vb.pp("q_proj"),
+            &cfg.specific_config.quant,
+        )?;
+        let k_proj = linear_no_bias(
+            hidden_sz,
+            num_kv_heads * head_dim,
+            vb.pp("k_proj"),
+            &cfg.specific_config.quant,
+        )?;
+        let v_proj = linear_no_bias(
+            hidden_sz,
+            num_kv_heads * head_dim,
+            vb.pp("v_proj"),
+            &cfg.specific_config.quant,
+        )?;
+        let o_proj = linear_no_bias(
+            num_heads * head_dim,
+            hidden_sz,
+            vb.pp("o_proj"),
+            &cfg.specific_config.quant,
+        )?;
         Ok(Self {
             q_proj,
             k_proj,
@@ -331,7 +373,12 @@ impl Yi {
             layers.push(layer)
         }
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
-        let lm_head = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
+        let lm_head = linear_no_bias(
+            cfg.hidden_size,
+            cfg.vocab_size,
+            vb.pp("lm_head"),
+            &cfg.specific_config.quant,
+        )?;
         Ok(Self {
             embed_tokens,
             layers,
