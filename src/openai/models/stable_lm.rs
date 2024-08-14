@@ -131,7 +131,6 @@ impl RotaryEmbedding {
         k: &Tensor,
         input_positions: &Vec<Vec<usize>>,
     ) -> Result<(Tensor, Tensor)> {
-        let (b_sz, _h, seq_len, _n_embd) = q.dims4()?;
         candle_nn::apply_rotary_emb_qkv(
             &q,
             &k,

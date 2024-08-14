@@ -87,7 +87,7 @@ impl RotaryEmbedding {
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
         let cos_sin =
-            Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
+            Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], candle_core::D::Minus1)?.contiguous()?; //must be contiguous tensor;
         Ok(Self {
             sin: freqs.sin()?,
             cos: freqs.cos()?,

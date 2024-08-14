@@ -320,6 +320,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
+name = "byteorder-lite"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
+
+[[package]]
 name = "bytes"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -327,12 +333,12 @@ checksum = "514de17de45fdb8dc022b1a7975556c53c86f9f0aa5f534b98977b171857c2c9"
 
 [[package]]
 name = "candle-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "accelerate-src",
  "byteorder",
  "candle-kernels",
- "cudarc 0.10.0",
+ "cudarc 0.11.8",
  "cust_core",
  "float_eq 0.7.0",
  "gemm",
@@ -355,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "candle-examples"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -376,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "candle-flash-attn"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bindgen_cuda",
@@ -386,14 +392,14 @@ dependencies = [
 
 [[package]]
 name = "candle-kernels"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bindgen_cuda",
 ]
 
 [[package]]
 name = "candle-nn"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "accelerate-src",
  "candle-core",
@@ -420,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "candle-transformers"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "accelerate-src",
  "byteorder",
@@ -675,11 +681,12 @@ dependencies = [
 
 [[package]]
 name = "cudarc"
-version = "0.10.0"
+version = "0.11.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9395df0cab995685664e79cc35ad6302bf08fb9c5d82301875a183affe1278b1"
+checksum = "a56028291ec3b0f6711e2e1b2d597484d359833dcb68331ce89e538012f835c4"
 dependencies = [
  "half",
+ "libloading",
 ]
 
 [[package]]
@@ -1633,12 +1640,12 @@ dependencies = [
 
 [[package]]
 name = "image"
-version = "0.25.1"
+version = "0.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd54d660e773627692c524beaad361aca785a4f9f5730ce91f42aabe5bce3d11"
+checksum = "99314c8a2152b8ddb211f924cdae532d8c5e4c8bb54728e12fff1b0cd5963a10"
 dependencies = [
  "bytemuck",
- "byteorder",
+ "byteorder-lite",
  "num-traits",
  "png",
  "zune-core",
@@ -1767,6 +1774,16 @@ name = "libc"
 version = "0.2.155"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97b3888a4aecf77e811145cadf6eef5901f4782c53886191b2f693f24761847c"
+
+[[package]]
+name = "libloading"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4979f22fdb869068da03c9f7528f8297c6fd2606bc3a4affe42e6a823fdb8da4"
+dependencies = [
+ "cfg-if",
+ "windows-targets 0.52.5",
+]
 
 [[package]]
 name = "libm"

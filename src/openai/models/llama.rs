@@ -5,7 +5,7 @@ use crate::paged_attention::PagedAttention;
 use crate::SpecificConfig;
 use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_core as candle;
-use candle_nn::{embedding, linear_no_bias as linear, Embedding, Linear, Module, VarBuilder};
+use candle_nn::{embedding, Embedding, Module, VarBuilder};
 use candle_transformers::models::with_tracing::RmsNorm;
 pub const MAX_SEQ_LEN: usize = 4096;
 use crate::openai::models::TokenID;
