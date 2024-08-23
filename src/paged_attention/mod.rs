@@ -83,6 +83,7 @@ impl PagedAttention {
         mut key_cache: Option<Tensor>,
         mut value_cache: Option<Tensor>,
         input_metadata: &mut InputMetadata,
+        softcapping: Option<f64>,
     ) -> Result<Tensor> {
         let dims = input_metadata.slot_mapping.dims();
         let slot_mapping = if dims.len() > 1 {
@@ -109,7 +110,11 @@ impl PagedAttention {
                     };
                     (query.matmul(&key_repeat.t()?)? * self.scale as f64)?
                 } else {
-                    (query.matmul(&key.t()?)? * self.scale as f64)?
+                    (query.matmul(&key.t()?)? * f64::from(self.scale))?
+                };
+                let att = match softcapping {
+                    None => att,
+                    Some(sc) => ((att / sc)?.tanh()? * sc)?,
                 };
 
                 let att = att.broadcast_add(mask)?;
@@ -125,7 +130,7 @@ impl PagedAttention {
                     };
                     Some(att.matmul(&value_repeat)?)
                 } else {
-                    Some(att.matmul(&value)?)
+                    Some(att.matmul(value)?)
                 }
             }
         };
@@ -156,19 +161,19 @@ impl PagedAttention {
         // value_cache: &mut Tensor, // [num_blocks, num_heads, head_size, block_size] 48,32,128,16
         // slot_mapping: Tensor,     // [num_tokens]
         if key_cache.as_ref().is_some_and(|_| value_cache.is_some()) {
-            let _ = reshape_and_cache(
+            reshape_and_cache(
                 &key,
                 &value,
-                &key_cache.as_mut().unwrap(),
-                &value_cache.as_mut().unwrap(),
+                key_cache.as_mut().unwrap(),
+                value_cache.as_mut().unwrap(),
                 &slot_mapping,
                 self.stream,
             )?;
         }
 
-        if att.is_some() {
+        if let Some(att) = att {
             //prefill result
-            return Ok(att.unwrap());
+            return Ok(att);
         }
         //  Args:
         //  output: shape = [num_generation_tokens, num_heads, head_size]
@@ -186,10 +191,10 @@ impl PagedAttention {
         //  alibi_slopes: shape = [num_heads]
         paged_attention(
             &query,
-            &key_cache.as_ref().unwrap(),
-            &value_cache.as_ref().unwrap(),
-            &input_metadata.block_tables.as_ref().unwrap(),
-            &input_metadata.context_lens.as_ref().unwrap(),
+            key_cache.as_ref().unwrap(),
+            value_cache.as_ref().unwrap(),
+            input_metadata.block_tables.as_ref().unwrap(),
+            input_metadata.context_lens.as_ref().unwrap(),
             input_metadata.max_context_len.unwrap(),
             self.scale,
             self.stream,

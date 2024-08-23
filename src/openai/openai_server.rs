@@ -183,6 +183,7 @@ pub async fn chat_completions(
     let request_id_clone = request_id.clone();
     let stream_request = request.stream.is_some_and(|x| x);
     let model_name = request.model.clone();
+
     let _ = tokio::task::spawn_blocking(move || {
         tokio::runtime::Handle::current().block_on(async move {
             {

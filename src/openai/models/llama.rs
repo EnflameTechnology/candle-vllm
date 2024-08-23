@@ -40,13 +40,14 @@ impl LlamaConfig {
     ) -> Config {
         Config {
             hidden_size: self.hidden_size,
+            head_dim: Some(self.hidden_size / self.num_attention_heads),
             intermediate_size: self.intermediate_size,
             vocab_size: self.vocab_size,
             num_hidden_layers: self.num_hidden_layers,
             num_attention_heads: self.num_attention_heads,
             num_key_value_heads: self.num_key_value_heads.unwrap_or(self.num_attention_heads),
             rms_norm_eps: self.rms_norm_eps,
-            rope_theta: self.rope_theta as f64,
+            rope_theta: f64::from(self.rope_theta),
             use_flash_attn,
             bos_token_id: self.bos_token_id,
             eos_token_id: self.eos_token_id,
@@ -63,6 +64,8 @@ impl LlamaConfig {
             use_qkv_bias: None,
             custom_stop_tokens: None,
             specific_config: scfg.clone(),
+            attn_logit_softcapping: None,
+            final_logit_softcapping: None,
         }
     }
 }
@@ -154,7 +157,7 @@ impl CausalSelfAttention {
         &mut self,
         x: &Tensor,
         attention_mask: Option<&Tensor>,
-        input_positions: &Vec<Vec<usize>>,
+        input_positions: &[Vec<usize>],
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &mut InputMetadata,
     ) -> Result<Tensor> {
@@ -193,6 +196,7 @@ impl CausalSelfAttention {
             cache.map(|(k_, _)| k_.clone()),
             cache.map(|(_, v_)| v_.clone()),
             input_metadata,
+            None,
         )?;
 
         let y = if attention_mask.is_some() {
@@ -233,7 +237,7 @@ impl CausalSelfAttention {
             o_proj,
             num_attention_heads: cfg.num_attention_heads,
             num_key_value_heads: cfg.num_key_value_heads,
-            head_dim: head_dim,
+            head_dim,
             span,
             span_rot,
             attn: PagedAttention::new(
@@ -245,7 +249,7 @@ impl CausalSelfAttention {
                 vb.device().clone(),
                 None,
             )?,
-            cos_sin_cache: Cache::new(dtype, &cfg, device)?,
+            cos_sin_cache: Cache::new(dtype, cfg, device)?,
         })
     }
 }
@@ -304,7 +308,7 @@ impl Block {
         &mut self,
         x: &Tensor,
         attention_mask: Option<&Tensor>,
-        input_positions: &Vec<Vec<usize>>,
+        input_positions: &[Vec<usize>],
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &mut InputMetadata,
     ) -> Result<Tensor> {
@@ -364,7 +368,7 @@ impl Llama {
     pub fn forward(
         &mut self,
         x: &Tensor,
-        input_positions: &Vec<Vec<usize>>,
+        input_positions: &[Vec<usize>],
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &mut InputMetadata,
     ) -> Result<Tensor> {
@@ -422,7 +426,7 @@ impl Llama {
             ln_f,
             lm_head,
             cfg: cfg.clone(),
-            dtype: dtype,
+            dtype,
             device: device.clone(),
         })
     }

@@ -65,7 +65,7 @@ impl LLMEngine {
             pipeline.get_model_config(),
             cache_config.clone(),
             cache_config.dtype,
-            &pipeline.device(),
+            pipeline.device(),
         )?;
         let sliding_window = pipeline.get_model_config().sliding_window;
 
@@ -164,17 +164,17 @@ impl LLMEngine {
         let choice = Choice {
             delta: ChoiceData {
                 role: self.pipeline.get_conversation(true).get_roles().0.clone(),
-                content: content,
+                content,
             },
-            finish_reason: finish_reason,
+            finish_reason,
             index: 0,
         };
         choices.push(choice);
 
         ChatCompletionChunk {
             id: request_id,
-            choices: choices,
-            created: created,
+            choices,
+            created,
             model: self.pipeline.name().to_string(),
             object: "chat.completion.chunk",
             system_fingerprint: None,
@@ -196,7 +196,7 @@ impl LLMEngine {
 
             self.execute_scheduler_ops(&scheduler_outputs).unwrap();
 
-            let scheduled: &VecDeque<Arc<SequenceGroup>> = &*scheduler_outputs.scheduled;
+            let scheduled: &VecDeque<Arc<SequenceGroup>> = &scheduler_outputs.scheduled;
             // for group in scheduled.iter() {
             let seqs = scheduled[0].get_seqs();
 
@@ -334,8 +334,8 @@ impl LLMEngine {
                     let usage = ChatCompletionUsageResponse {
                         request_id: group.request_id.clone(),
                         created: group.arrival_time,
-                        completion_tokens: completion_tokens,
-                        prompt_tokens: prompt_tokens,
+                        completion_tokens,
+                        prompt_tokens,
                         total_tokens: completion_tokens + prompt_tokens,
                         prompt_time_costs: prompt_time_costs as usize,
                         completion_time_costs: completion_time_costs as usize,
@@ -359,17 +359,17 @@ impl LLMEngine {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> Result<(), APIError> {
-        if scheduler_output.blocks_to_swap_in.len() > 0 {
+        if !scheduler_output.blocks_to_swap_in.is_empty() {
             try_api!(self
                 .cache_engine
                 .swap_in(scheduler_output.blocks_to_swap_in.clone()));
         }
-        if scheduler_output.blocks_to_swap_out.len() > 0 {
+        if !scheduler_output.blocks_to_swap_out.is_empty() {
             try_api!(self
                 .cache_engine
                 .swap_out(scheduler_output.blocks_to_swap_out.clone()));
         }
-        if scheduler_output.blocks_to_copy.len() > 0 {
+        if !scheduler_output.blocks_to_copy.is_empty() {
             try_api!(self
                 .cache_engine
                 .copy(scheduler_output.blocks_to_copy.clone()));
@@ -453,13 +453,13 @@ impl LLMEngine {
                 .collect::<Vec<_>>(),
             *max_prompt_len,
             0,
-            &self.pipeline.device(),
+            self.pipeline.device(),
         )?;
         let slot_mapping = _make_tensor_with_pad(
             slot_mappings,
             *max_prompt_len,
             _PAD_SLOT_ID,
-            &self.pipeline.device(),
+            self.pipeline.device(),
         )?;
 
         Ok(PreparedInputs {
@@ -544,16 +544,16 @@ impl LLMEngine {
                 .collect::<Vec<_>>(),
             1,
             0,
-            &self.pipeline.device(),
+            self.pipeline.device(),
         )?;
         let slot_mapping =
-            _make_tensor_with_pad(slot_mappings, 1, _PAD_SLOT_ID, &self.pipeline.device())?;
+            _make_tensor_with_pad(slot_mappings, 1, _PAD_SLOT_ID, self.pipeline.device())?;
 
         let max_context_len = context_lens.iter().max().unwrap();
         let context_lens = try_api!(Tensor::from_vec(
             context_lens.iter().map(|x| *x as u32).collect::<Vec<_>>(),
             (context_lens.len(),),
-            &self.pipeline.device(),
+            self.pipeline.device(),
         ));
 
         let max_block_table_len = block_tables.iter().map(|x| x.len()).max().unwrap();
@@ -564,7 +564,7 @@ impl LLMEngine {
                 .collect::<Vec<_>>(),
             max_block_table_len,
             0,
-            &self.pipeline.device(),
+            self.pipeline.device(),
         )?;
         let block_tables = try_api!(block_tables.reshape(((), max_block_table_len)));
         Ok(PreparedInputs {

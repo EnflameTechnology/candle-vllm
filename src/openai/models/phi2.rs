@@ -41,6 +41,7 @@ impl Phi2Config {
     ) -> Config {
         Config {
             hidden_size: self.hidden_size,
+            head_dim: Some(self.hidden_size / self.num_attention_heads),
             intermediate_size: self.intermediate_size,
             vocab_size: self.vocab_size,
             num_hidden_layers: self.num_hidden_layers,
@@ -64,6 +65,8 @@ impl Phi2Config {
             use_qkv_bias: None,
             custom_stop_tokens: None,
             specific_config: scfg.clone(),
+            attn_logit_softcapping: None,
+            final_logit_softcapping: None,
         }
     }
 }
@@ -96,7 +99,7 @@ impl RotaryEmbedding {
         })
     }
 
-    fn apply_rotary_emb(&self, xs: &Tensor, input_positions: &Vec<Vec<usize>>) -> Result<Tensor> {
+    fn apply_rotary_emb(&self, xs: &Tensor, input_positions: &[Vec<usize>]) -> Result<Tensor> {
         let (b_size, _num_heads, seq_len, _headdim) = xs.dims4()?;
         let mut embeds = Vec::new();
         for (b, seqlen_offset) in zip(0..b_size, input_positions) {
@@ -231,7 +234,7 @@ impl Attention {
         &mut self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
-        input_positions: &Vec<Vec<usize>>,
+        input_positions: &[Vec<usize>],
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &mut InputMetadata,
     ) -> Result<Tensor> {
@@ -284,6 +287,7 @@ impl Attention {
             cache.map(|(k_, _)| k_.clone()),
             cache.map(|(_, v_)| v_.clone()),
             input_metadata,
+            None,
         )?;
 
         let y = if attention_mask.is_some() {
@@ -321,7 +325,7 @@ impl DecoderLayer {
         &mut self,
         xs: &Tensor,
         mask: Option<&Tensor>,
-        input_positions: &Vec<Vec<usize>>,
+        input_positions: &[Vec<usize>],
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &mut InputMetadata,
     ) -> Result<Tensor> {
@@ -389,7 +393,7 @@ impl Phi2 {
     pub fn forward(
         &mut self,
         xs: &Tensor,
-        input_positions: &Vec<Vec<usize>>,
+        input_positions: &[Vec<usize>],
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &mut InputMetadata,
     ) -> Result<Tensor> {

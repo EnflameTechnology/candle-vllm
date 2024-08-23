@@ -11,7 +11,7 @@ use std::ffi::c_int;
 
 struct PagedAttention {
     softmax_scale: f32,
-
+    softcapping: f32,
     key_cache: Tensor,
     value_cache: Tensor,
     block_tables: Tensor,
@@ -187,6 +187,7 @@ impl PagedAttention {
                     kv_block_stride as c_int,
                     kv_head_stride as c_int,
                     internal_type,
+                    self.softcapping,
                 )
             }
         } else {
@@ -223,6 +224,7 @@ impl PagedAttention {
                     kv_block_stride as c_int,
                     kv_head_stride as c_int,
                     internal_type,
+                    self.softcapping,
                 )
             }
         }
@@ -261,7 +263,7 @@ impl candle::CustomOp1 for PagedAttention {
 ///
 /// * `q` - Query tensor with shape `(num_sequences, num_heads_q, head_size)`.
 /// * `key_cache` - Key cache paged tensor of shape `(num_blocks, num_heads_kv, head_size / x, block_size, x)`
-/// with `x` being the size of an element in bytes.
+///   with `x` being the size of an element in bytes.
 /// * `value_cache` - Value cache paged tensor of shape `(num_blocks, num_heads_kv, head_size, block_size)`.
 /// * `block_tables` - Padded table associating blocks to each sequence of shape `(num_sequences, max_context_len // block_size)`
 /// * `context_lens` - Tensor associating lengths to each sequence of shape `(num_sequences)`
@@ -277,6 +279,7 @@ pub fn paged_attention(
     context_lens: &Tensor,
     max_context_len: usize,
     softmax_scale: f32,
+    softcapping: f32,
 ) -> Result<Tensor> {
     let op = PagedAttention {
         softmax_scale,
@@ -285,6 +288,7 @@ pub fn paged_attention(
         block_tables: block_tables.clone(),
         context_lens: context_lens.clone(),
         max_context_len,
+        softcapping,
     };
     q.apply_op1(op)
 }
@@ -440,7 +444,7 @@ fn update_cache<
 /// * `key` - Key tensor of shape `(num_tokens, num_heads, head_size)`.
 /// * `value` - Value tensor of shape `(num_tokens, num_heads, head_size)`.
 /// * `key_cache` - Key cache paged tensor of shape `(num_blocks, num_heads, head_size / x, block_size, x)`
-/// with `x` being the size of an element in bytes.
+///   with `x` being the size of an element in bytes.
 /// * `value_cache` - Value cache paged tensor of shape `(num_blocks, num_heads, head_size, block_size)`.
 /// * `slot_mapping` - Mapping associating a slot to each token of shape `(num_tokens)`.
 pub fn reshape_and_cache(

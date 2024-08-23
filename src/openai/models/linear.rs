@@ -263,7 +263,7 @@ impl QLinear {
         Self {
             inner: QMatMul::QTensor(Arc::new(w)),
             bias: bx,
-            dtype: dtype,
+            dtype,
         }
     }
 
@@ -286,10 +286,7 @@ impl QLinear {
             _ => panic!("Unsupported GGML data type!"),
         };
         let qtensor = QTensor::quantize(weight, ggml_dtype).unwrap();
-        let qbias = match linear.bias() {
-            Some(b) => Some(b.clone()),
-            _ => None,
-        };
+        let qbias = linear.bias().cloned();
 
         QLinear::from_qparts_x(qtensor, qbias, dtype)
     }
