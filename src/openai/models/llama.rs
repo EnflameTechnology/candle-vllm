@@ -116,7 +116,7 @@ impl CausalSelfAttention {
         &self,
         q: &Tensor,
         k: &Tensor,
-        input_positions: &Vec<Vec<usize>>,
+        input_positions: &[Vec<usize>],
     ) -> Result<(Tensor, Tensor)> {
         let (b_sz, _h, seq_len, _n_embd) = q.dims4()?;
         if q.device().is_gcu() {

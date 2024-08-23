@@ -198,6 +198,7 @@ impl PagedAttention {
             input_metadata.max_context_len.unwrap(),
             self.scale,
             self.stream,
+            softcapping.unwrap_or(1.0f64) as f32,
         )
     }
 }
