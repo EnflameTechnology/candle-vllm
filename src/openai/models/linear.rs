@@ -321,6 +321,35 @@ impl QLinear {
 }
 
 impl QLinear {
+    #[cfg(feature = "gcu")]
+    fn forward_dequant(&self, x: &Tensor) -> Result<Tensor> {
+
+        let weight = match x.dtype() {
+            DType::BF16 => self.inner.dequantize_bf16()?,
+            DType::F16 => self.inner.dequantize_f16()?,
+            DType::F32 => self.inner.dequantize()?,
+            _=> { panic!("Invalid format for dequantization!"); }
+        };
+
+        let x = match *x.dims() {
+            [b1, b2, _, _] => {
+                x.matmul(&weight.broadcast_left((b1, b2))?.t()?)?
+            }
+            [bsize, _, _] => {
+                x.matmul(&weight.broadcast_left(bsize)?.t()?)?
+            }
+            _ => {
+                x.matmul(&weight.t()?)?
+            }
+        };
+
+        // let x = x.matmul(&w)?;
+        match &self.bias {
+            None => Ok(x),
+            Some(bias) => x.broadcast_add(bias),
+        }
+    }
+
     pub fn forward_no_dequant(&self, x: &Tensor) -> Result<Tensor> {
         let xs = match *x.dims() {
             [bsize, seq_len, dim1, dim2] => {
@@ -419,6 +448,9 @@ impl QLinear {
 
 impl Module for QLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "gcu")] //TODO: implement quantized matmul for GCU.
+        return self.forward_dequant(x);
+
         let batch = x.dims()[0];
         if batch > 4 {
             self.forward_via_f16(x) //suitable for batched
@@ -442,7 +474,7 @@ impl Module for LinearX {
 impl LinearX {
     pub fn new(weight: Tensor, bias: Option<Tensor>, quant: &Option<String>) -> Self {
         #[cfg(feature = "gcu")]
-        let ln = Linear::new(weight, bias, true);
+        let ln = Linear::new(weight, bias, if quant.is_some() { false } else { true });
         #[cfg(not(feature = "gcu"))]
         let ln = Linear::new(weight, bias);
 
@@ -463,7 +495,19 @@ pub fn linear_x(
     vb: candle_nn::VarBuilder,
     quant: &Option<String>,
 ) -> Result<LinearX> {
-    let ln = linear(in_dim, out_dim, vb).unwrap();
+    let init_ws = init::DEFAULT_KAIMING_NORMAL;
+    let ws = vb.get_with_hints((out_dim, in_dim), "weight", init_ws)?;
+    let bound = 1. / (in_dim as f64).sqrt();
+    let init_bs = init::Init::Uniform {
+        lo: -bound,
+        up: bound,
+    };
+    let bs = vb.get_with_hints(out_dim, "bias", init_bs)?;
+    #[cfg(feature = "gcu")]
+    let ln = Linear::new(ws, Some(bs), if quant.is_some() { false } else { true });
+    #[cfg(not(feature = "gcu"))]
+    let ln = Linear::new(ws, Some(bs), None);
+
     if let Some(quatized_type) = quant {
         Ok(LinearX(Either::Right(QLinear::from_linear_x(
             ln,
@@ -483,7 +527,7 @@ pub fn linear_no_bias_x(
     let init_ws = init::DEFAULT_KAIMING_NORMAL;
     let ws = vb.get_with_hints((out_dim, in_dim), "weight", init_ws)?;
     #[cfg(feature = "gcu")]
-    let ln = Linear::new(ws, None, true);
+    let ln = Linear::new(ws, None, if quant.is_some() { false } else { true });
     #[cfg(not(feature = "gcu"))]
     let ln = Linear::new(ws, None);
 
