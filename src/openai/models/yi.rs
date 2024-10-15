@@ -1,4 +1,4 @@
-use super::Config;
+use super::{Config, QuantConfig};
 use crate::openai::models::linear::{linear_no_bias_x as linear_no_bias, LinearX as Linear};
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
@@ -26,6 +26,7 @@ pub struct YiConfig {
     pub tie_word_embeddings: Option<bool>,
     pub bos_token_id: usize,
     pub eos_token_id: usize,
+    pub quantization_config: Option<QuantConfig>,
 }
 
 impl YiConfig {
@@ -63,6 +64,7 @@ impl YiConfig {
             specific_config: scfg.clone(),
             attn_logit_softcapping: None,
             final_logit_softcapping: None,
+            quantization_config: self.quantization_config,
         }
     }
 }
@@ -144,7 +146,7 @@ struct MLP {
 }
 
 impl MLP {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Config, dtype: DType, vb: VarBuilder) -> Result<Self> {
         let hidden_sz = cfg.hidden_size;
         let intermediate_sz = cfg.intermediate_size;
         let gate_proj = linear_no_bias(
@@ -152,18 +154,24 @@ impl MLP {
             intermediate_sz,
             vb.pp("gate_proj"),
             &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
         )?;
         let up_proj = linear_no_bias(
             hidden_sz,
             intermediate_sz,
             vb.pp("up_proj"),
             &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
         )?;
         let down_proj = linear_no_bias(
             intermediate_sz,
             hidden_sz,
             vb.pp("down_proj"),
             &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
         )?;
         Ok(Self {
             gate_proj,
@@ -196,7 +204,12 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(
+        rotary_emb: Arc<RotaryEmbedding>,
+        cfg: &Config,
+        dtype: DType,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let hidden_sz = cfg.hidden_size;
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
@@ -206,24 +219,32 @@ impl Attention {
             num_heads * head_dim,
             vb.pp("q_proj"),
             &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
         )?;
         let k_proj = linear_no_bias(
             hidden_sz,
             num_kv_heads * head_dim,
             vb.pp("k_proj"),
             &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
         )?;
         let v_proj = linear_no_bias(
             hidden_sz,
             num_kv_heads * head_dim,
             vb.pp("v_proj"),
             &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
         )?;
         let o_proj = linear_no_bias(
             num_heads * head_dim,
             hidden_sz,
             vb.pp("o_proj"),
             &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
         )?;
         Ok(Self {
             q_proj,
@@ -317,9 +338,14 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"))?;
-        let mlp = MLP::new(cfg, vb.pp("mlp"))?;
+    fn new(
+        rotary_emb: Arc<RotaryEmbedding>,
+        cfg: &Config,
+        dtype: DType,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let self_attn = Attention::new(rotary_emb, cfg, dtype, vb.pp("self_attn"))?;
+        let mlp = MLP::new(cfg, dtype, vb.pp("mlp"))?;
         let ln1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let ln2 = RmsNorm::new(
             cfg.hidden_size,
@@ -373,7 +399,7 @@ impl Yi {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers {
-            let layer = DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(layer_idx))?;
+            let layer = DecoderLayer::new(rotary_emb.clone(), cfg, dtype, vb_l.pp(layer_idx))?;
             layers.push(layer)
         }
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
@@ -381,7 +407,9 @@ impl Yi {
             cfg.hidden_size,
             cfg.vocab_size,
             vb.pp("lm_head"),
-            &cfg.specific_config.quant,
+            &None, //no quant for lm_head
+            &None,
+            dtype,
         )?;
         Ok(Self {
             embed_tokens,

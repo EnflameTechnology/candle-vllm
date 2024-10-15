@@ -1,6 +1,8 @@
 #[cfg(not(feature = "gcu"))]
 mod cache;
 #[cfg(not(feature = "gcu"))]
+pub mod gptq;
+#[cfg(not(feature = "gcu"))]
 mod paged_attention;
 
 const COPY_BLOCKS_KERNEL_NAME: &str = "copy_blocks_kernel";
@@ -75,6 +77,8 @@ use candle_core::{
     gcu_backend::ubridge::prelude::GcuFunction as CudaFunction, DType, GcuDevice as CudaDevice,
 };
 
+#[cfg(not(feature = "gcu"))]
+pub use gptq::*;
 #[cfg(not(feature = "gcu"))]
 pub use paged_attention::*;
 

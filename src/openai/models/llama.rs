@@ -1,4 +1,4 @@
-use super::Config;
+use super::{Config, QuantConfig};
 use crate::openai::models::linear::{linear_no_bias_x as linear, LinearX as Linear};
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
@@ -25,6 +25,7 @@ pub struct LlamaConfig {
     pub bos_token_id: TokenID,
     pub eos_token_id: TokenID,
     pub max_position_embeddings: Option<usize>,
+    pub quantization_config: Option<QuantConfig>,
 }
 
 fn default_rope() -> f32 {
@@ -66,6 +67,7 @@ impl LlamaConfig {
             specific_config: scfg.clone(),
             attn_logit_softcapping: None,
             final_logit_softcapping: None,
+            quantization_config: self.quantization_config,
         }
     }
 }
@@ -214,20 +216,38 @@ impl CausalSelfAttention {
         let size_in = cfg.hidden_size;
         let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
         let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
-        let q_proj = linear(size_in, size_q, vb.pp("q_proj"), &cfg.specific_config.quant)?;
+        let q_proj = linear(
+            size_in,
+            size_q,
+            vb.pp("q_proj"),
+            &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
+        )?;
         let k_proj = linear(
             size_in,
             size_kv,
             vb.pp("k_proj"),
             &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
         )?;
         let v_proj = linear(
             size_in,
             size_kv,
             vb.pp("v_proj"),
             &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
         )?;
-        let o_proj = linear(size_q, size_in, vb.pp("o_proj"), &cfg.specific_config.quant)?;
+        let o_proj = linear(
+            size_q,
+            size_in,
+            vb.pp("o_proj"),
+            &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
+        )?;
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
 
         Ok(Self {
@@ -269,7 +289,7 @@ impl Mlp {
         self.c_proj.forward(&x)
     }
 
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn load(vb: VarBuilder, dtype: DType, cfg: &Config) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "mlp");
         let h_size = cfg.hidden_size;
         let i_size = cfg.intermediate_size;
@@ -278,13 +298,24 @@ impl Mlp {
             i_size,
             vb.pp("gate_proj"),
             &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
         )?;
-        let c_fc2 = linear(h_size, i_size, vb.pp("up_proj"), &cfg.specific_config.quant)?;
+        let c_fc2 = linear(
+            h_size,
+            i_size,
+            vb.pp("up_proj"),
+            &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
+        )?;
         let c_proj = linear(
             i_size,
             h_size,
             vb.pp("down_proj"),
             &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
         )?;
         Ok(Self {
             c_fc1,
@@ -327,7 +358,7 @@ impl Block {
     fn load(vb: VarBuilder, cfg: &Config, dtype: DType, device: &Device) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "block");
         let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg, dtype, device)?;
-        let mlp = Mlp::load(vb.pp("mlp"), cfg)?;
+        let mlp = Mlp::load(vb.pp("mlp"), dtype, cfg)?;
         let rms_1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let rms_2 = RmsNorm::new(
             cfg.hidden_size,
@@ -413,7 +444,9 @@ impl Llama {
             cfg.hidden_size,
             cfg.vocab_size,
             vb.pp("lm_head"),
-            &cfg.specific_config.quant,
+            &None, //no quant for lm_head
+            &None,
+            dtype,
         )?;
         let ln_f = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let blocks: Vec<_> = (0..cfg.num_hidden_layers)

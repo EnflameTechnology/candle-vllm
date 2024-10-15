@@ -1,6 +1,6 @@
 // This implementation is based on:
 // https://huggingface.co/microsoft/Phi-3-mini-4k-instruct/blob/main/modeling_phi3.py
-use super::{Config, RopeScaling};
+use super::{Config, QuantConfig, RopeScaling};
 use crate::openai::models::linear::{linear_no_bias_x as linear, LinearX as Linear};
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
@@ -31,6 +31,7 @@ pub struct PhiConfig {
     pub max_position_embeddings: usize,
     pub original_max_position_embeddings: Option<usize>,
     pub sliding_window: Option<usize>,
+    pub quantization_config: Option<QuantConfig>,
 }
 
 impl PhiConfig {
@@ -68,6 +69,7 @@ impl PhiConfig {
             specific_config: scfg.clone(),
             attn_logit_softcapping: None,
             final_logit_softcapping: None,
+            quantization_config: self.quantization_config,
         }
     }
 }
@@ -280,7 +282,12 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(
+        rotary_emb: Arc<RotaryEmbedding>,
+        cfg: &Config,
+        dtype: DType,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
@@ -290,12 +297,16 @@ impl Attention {
             op_size,
             vb.pp("qkv_proj"),
             &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
         )?;
         let o_proj = linear(
             num_heads * head_dim,
             cfg.hidden_size,
             vb.pp("o_proj"),
             &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
         )?;
         Ok(Self {
             qkv_proj,
@@ -399,7 +410,7 @@ struct Mlp {
 }
 
 impl Mlp {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Config, dtype: DType, vb: VarBuilder) -> Result<Self> {
         let hidden_size = cfg.hidden_size;
         let i_size = cfg.intermediate_size;
         let gate_up_proj = linear(
@@ -407,12 +418,16 @@ impl Mlp {
             2 * i_size,
             vb.pp("gate_up_proj"),
             &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
         )?;
         let down_proj = linear(
             i_size,
             hidden_size,
             vb.pp("down_proj"),
             &cfg.specific_config.quant,
+            &cfg.quantization_config,
+            dtype,
         )?;
         Ok(Self {
             gate_up_proj,
@@ -441,9 +456,14 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"))?;
-        let mlp = Mlp::new(cfg, vb.pp("mlp"))?;
+    fn new(
+        rotary_emb: Arc<RotaryEmbedding>,
+        cfg: &Config,
+        dtype: DType,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let self_attn = Attention::new(rotary_emb, cfg, dtype, vb.pp("self_attn"))?;
+        let mlp = Mlp::new(cfg, dtype, vb.pp("mlp"))?;
         let input_layernorm =
             RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = RmsNorm::new(
@@ -498,7 +518,7 @@ impl Phi {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers {
-            let layer = DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(layer_idx))?;
+            let layer = DecoderLayer::new(rotary_emb.clone(), cfg, dtype, vb_l.pp(layer_idx))?;
             layers.push(layer)
         }
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
@@ -506,7 +526,9 @@ impl Phi {
             cfg.hidden_size,
             cfg.vocab_size,
             vb.pp("lm_head"),
-            &cfg.specific_config.quant,
+            &None, //no quant for lm_head
+            &None,
+            dtype,
         )?;
         Ok(Self {
             embed_tokens,
