@@ -18,7 +18,11 @@
 //! # Ok(()) }
 //! ```
 use super::QuantConfig;
+#[cfg(not(feature = "gcu"))]
 use crate::backend::gptq::{gptq_matmul, gptq_weight_repack};
+#[cfg(feature = "gcu")]
+use candle_nn::{gptq_matmul, gptq_weight_repack};
+
 use crate::candle::Module;
 use crate::candle::{
     quantized::{gguf_file, QMatMul, QTensor},
@@ -216,7 +220,7 @@ pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: candle_nn::VarBuilder) 
     return Ok(Linear::new(ws, None, true));
 
     #[cfg(not(feature = "gcu"))]
-    Ok(Linear::new(ws, true))
+    Ok(Linear::new(ws, None))
 }
 
 pub fn linear_b(
@@ -255,14 +259,25 @@ pub fn qlinear(
             } else {
                 false
             };
+
+            #[cfg(not(feature = "gcu"))]
+            let wtype = DType::U32;
+            #[cfg(not(feature = "gcu"))]
+            let pack_factor = 32 / cfg.bits;
+
+            #[cfg(feature = "gcu")]
+            let wtype = DType::I8;
+            #[cfg(feature = "gcu")]
+            let pack_factor = 1; //because GCU format repacked to i8 (instead of u32)
+
             let ws = vb.get_with_hints_dtype(
                 (
-                    in_dim / (32 / cfg.bits) / if marlin_format { 2 } else { 1 },
+                    in_dim / pack_factor / if marlin_format { 2 } else { 1 },
                     out_dim * if marlin_format { 2 } else { 1 },
                 ),
                 if marlin_format { "B" } else { "qweight" },
                 Default::default(),
-                DType::U32,
+                wtype,
             )?;
 
             let scale_and_zero_size = in_dim / (cfg.group_size as usize);
@@ -299,29 +314,47 @@ pub fn qlinear(
                     weight_transpose: false,
                 })
             } else {
-                let qzeros = vb.get_with_hints_dtype(
-                    (scale_and_zero_size, out_dim / (32 / cfg.bits)),
-                    "qzeros",
-                    Default::default(),
-                    DType::U32,
-                )?;
-                let g_idx =
-                    vb.get_with_hints_dtype((in_dim,), "g_idx", Default::default(), DType::U32)?;
+                let qzeros = if cfg.bits == 4 {
+                    let qzeros = vb.get_with_hints_dtype(
+                        (scale_and_zero_size, out_dim / (32 / cfg.bits)),
+                        "qzeros",
+                        Default::default(),
+                        DType::U32,
+                    )?;
+    
+                    let qzeros = if qzeros.device().is_gcu() {
+                        qzeros.to_dtype(dtype)?
+                    } else {
+                        qzeros
+                    };
+                    Some(qzeros)
+                } else {
+                    None
+                };
 
-                if !cfg.sym
+
+                let g_idx = if cfg.bits == 4 {
+                    let g_idx = vb.get_with_hints_dtype((in_dim,), "g_idx", Default::default(), DType::U32)?;
+                    Some(g_idx)
+                } else {
+                    None
+                };
+
+                if ws.device().is_gcu() || !cfg.sym
                     || cfg.bits != 4
                     || (cfg.group_size != 128 && cfg.group_size != -1)
                     || (cfg.desc_act.is_some() && cfg.desc_act.unwrap() == true)
                 {
                     //only model with 4-bit and desc_act==false can be repacked to marlin format
+                    #[cfg(not(feature = "gcu"))]
                     println!("The current GPTQ model does no compatible with marlin format because one of the following conditions: !cfg.sym || cfg.bits != 4 || (cfg.group_size != 128 && cfg.group_size != -1) || (cfg.desc_act == true)");
                     //conventional gptq format
                     Ok(Linear {
                         weight: ws,
                         bias: bs,
                         scales: Some(scales),
-                        qzeros: Some(qzeros),
-                        g_idx: Some(g_idx),
+                        qzeros: qzeros,
+                        g_idx: g_idx,
                         perm: None,
                         workspace: None,
                         weight_transpose: false,
@@ -392,8 +425,8 @@ pub fn qlinear(
                         weight: ws,
                         bias: bs,
                         scales: Some(scales),
-                        qzeros: Some(qzeros),
-                        g_idx: Some(g_idx),
+                        qzeros: qzeros,
+                        g_idx: g_idx,
                         perm: None,
                         workspace: Some(workspace),
                         weight_transpose: false,
@@ -697,6 +730,7 @@ impl QLinear {
 }
 
 impl Module for QLinear {
+    #[cfg(not(feature = "gcu"))]
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match (
             &self.inner,
@@ -733,13 +767,47 @@ impl Module for QLinear {
                     Ok(x)
                 }
             }
-            // (QMatMul::Tensor(qw), Some(scale), qzeros, g_idx, perm, workspace) => {
-            //     let qw = gptq_dequant(qw, scale, qzeros, g_idx, self.bits)?;
-            //     self.forward_via_dequant(x, &qw)
-            // }
             _ => self.forward_no_dequant(x),
         }
     }
+
+    #[cfg(feature = "gcu")]
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match (
+            &self.inner,
+            &self.scales,
+            &self.qzeros,
+            &self.g_idx,
+            &self.perm,
+            &self.workspace,
+        ) {
+            (QMatMul::Tensor(qw), Some(scale), qzeros, g_idx, perm, workspace) => {
+                let x = match *x.dims() {
+                    [b1, b2, _, _] => {
+                        let qw = qw.broadcast_left((b1, b2))?;
+                        gptq_matmul(&x, &qw, scale, qzeros, g_idx, perm, workspace, self.bits)?
+                    }
+                    [bsize, _, _] => {
+                        let qw = qw.broadcast_left(bsize)?;
+                        gptq_matmul(&x, &qw, scale, qzeros, g_idx, perm, workspace, self.bits)?
+                    }
+                    _ => {
+                        gptq_matmul(&x, &qw, scale, qzeros, g_idx, perm, workspace, self.bits)?
+                    }
+                };
+
+                if let Some(bias) = &self.bias {
+                    x.broadcast_add(bias)
+                } else {
+                    Ok(x)
+                }
+            }
+            _ => self.forward_no_dequant(x),
+
+        }
+        
+    }
+
 }
 
 #[derive(Debug, Clone)]
