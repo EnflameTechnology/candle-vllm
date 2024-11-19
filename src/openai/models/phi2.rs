@@ -78,10 +78,11 @@ struct RotaryEmbedding {
     dim: usize,
     sin: Tensor,
     cos: Tensor,
+    cos_sin: Tensor,
 }
 
 impl RotaryEmbedding {
-    fn new(cfg: &Config, _dtype: DType, dev: &Device) -> Result<Self> {
+    fn new(cfg: &Config, dtype: DType, dev: &Device) -> Result<Self> {
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
         let dim = (cfg.partial_rotary_factor.unwrap() * head_dim as f32) as usize;
         let inv_freq: Vec<_> = (0..dim)
@@ -94,13 +95,18 @@ impl RotaryEmbedding {
             .to_dtype(DType::F32)?
             .reshape((cfg.max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
+        let cos = freqs.cos()?.to_dtype(dtype)?;
+        let sin = freqs.sin()?.to_dtype(dtype)?;
+        let cos_sin = Tensor::cat(&[&cos, &sin], D::Minus1)?.contiguous()?; //must be contiguous tensor;
         Ok(Self {
             dim,
-            sin: freqs.sin()?,
-            cos: freqs.cos()?,
+            sin,
+            cos,
+            cos_sin,
         })
     }
 
+    #[cfg(not(feature = "gcu"))]
     fn apply_rotary_emb(&self, xs: &Tensor, input_positions: &[Vec<usize>]) -> Result<Tensor> {
         let (b_size, _num_heads, seq_len, _headdim) = xs.dims4()?;
         let mut embeds = Vec::new();
@@ -114,6 +120,29 @@ impl RotaryEmbedding {
             embeds.push(embed);
         }
         Tensor::cat(&embeds, 0)
+    }
+
+    #[cfg(feature = "gcu")]
+    fn apply_rotary_emb_qkv(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        input_positions: &[Vec<usize>],
+    ) -> Result<(Tensor, Tensor)> {
+        let mut _input_positions = Vec::<i32>::new();
+        for seqlen_offset in input_positions {
+            _input_positions.push(seqlen_offset[0] as i32);
+        }
+        candle_nn::apply_rotary_emb_qkv(
+            &q,
+            &k,
+            &self.cos_sin,
+            &self.sin,
+            &_input_positions,
+            self.dim,
+            true,
+            true,
+        )
     }
 }
 
@@ -285,13 +314,21 @@ impl Attention {
             (q, k, v)
         };
 
+        #[cfg(not(feature = "gcu"))]
         let q = self
             .rotary_emb
             .apply_rotary_emb(&q.to_dtype(DType::F32)?, input_positions)?;
+        #[cfg(not(feature = "gcu"))]
         let k = self
             .rotary_emb
             .apply_rotary_emb(&k.to_dtype(DType::F32)?, input_positions)?;
+        #[cfg(not(feature = "gcu"))]
         let v = v.to_dtype(DType::F32)?;
+    
+        #[cfg(feature = "gcu")]
+        let (q, k) = self
+            .rotary_emb
+            .apply_rotary_emb_qkv(&q, &k, input_positions)?;
 
         let y = self.attn.forward(
             &q,
@@ -310,7 +347,12 @@ impl Attention {
         } else {
             y.reshape(&[b_size, seq_len, self.hidden_size])?
         };
-        y.to_dtype(dtype)?.apply(&self.dense)
+
+        #[cfg(not(feature = "gcu"))]
+        return y.to_dtype(dtype)?.apply(&self.dense);
+
+        #[cfg(feature = "gcu")]
+        return y.apply(&self.dense);
     }
 }
 
@@ -359,6 +401,7 @@ pub struct Phi2 {
     layers: Vec<DecoderLayer>,
     final_layernorm: LayerNorm,
     lm_head: Linear,
+    dtype: DType,
     cfg: Config,
     device: Device,
 }
@@ -392,6 +435,7 @@ impl Phi2 {
             layers,
             final_layernorm,
             lm_head,
+            dtype,
             cfg: cfg.clone(),
             device: device.clone(),
         })
@@ -403,7 +447,7 @@ impl Phi2 {
             .collect();
         let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?;
         mask.expand((b_size, 1, tgt_len, tgt_len))?
-            .to_dtype(DType::F32)
+            .to_dtype(self.dtype)
     }
 
     pub fn forward(

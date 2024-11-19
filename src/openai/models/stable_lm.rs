@@ -136,12 +136,16 @@ impl RotaryEmbedding {
         k: &Tensor,
         input_positions: &[Vec<usize>],
     ) -> Result<(Tensor, Tensor)> {
+        let mut _input_positions = Vec::<i32>::new();
+        for seqlen_offset in input_positions {
+            _input_positions.push(seqlen_offset[0] as i32);
+        }
         candle_nn::apply_rotary_emb_qkv(
             &q,
             &k,
             &self.cos_sin,
             &self.sin,
-            input_positions[0][0],
+            &_input_positions,
             self.dim,
             true,
             true,
