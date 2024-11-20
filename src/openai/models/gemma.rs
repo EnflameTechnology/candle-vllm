@@ -100,7 +100,7 @@ struct RotaryEmbedding {
 }
 
 impl RotaryEmbedding {
-    fn new(_dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
+    fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
         let dim = cfg.get_head_size();
         let max_seq_len = cfg.max_seq_len;
         let inv_freq: Vec<_> = (0..dim)
@@ -108,9 +108,9 @@ impl RotaryEmbedding {
             .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(DType::F32)?;
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
         let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(DType::F32)?
+            .to_dtype(dtype)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
         let cos = freqs.cos()?;
@@ -305,8 +305,8 @@ impl Attention {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = xs.dims3()?;
 
-        let query_states = self.q_proj.forward(xs)?.to_dtype(DType::F32)?;
-        let key_states = self.k_proj.forward(xs)?.to_dtype(DType::F32)?;
+        let query_states = self.q_proj.forward(xs)?;
+        let key_states = self.k_proj.forward(xs)?;
         let value_states = self.v_proj.forward(xs)?;
 
         let (q, k, v) = if seq_len == 1 {
@@ -332,8 +332,8 @@ impl Attention {
             .rotary_emb
             .apply_rotary_emb_qkv(&q, &k, input_positions)?;
 
-        let q = q.to_dtype(v.dtype())?;
-        let k = k.to_dtype(v.dtype())?;
+        // let q = q.to_dtype(v.dtype())?;
+        // let k = k.to_dtype(v.dtype())?;
         // No need repeat_kv since we performed broadcasted matmul in the prefiling stage
         // while, the decoding stage used paged-attention which also does not need kv stacking (to match query dim)
         // let k = candle_transformers::utils::repeat_kv(k, self.num_kv_groups)?.contiguous()?;
