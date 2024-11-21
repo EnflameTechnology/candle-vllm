@@ -9,7 +9,6 @@ use kernels::ffi::{gemm_half_q_half_alt, gptq_repack, marlin_4bit_bf16, marlin_4
 struct GPTQMatMul {
     qzeros: Option<Tensor>,
     g_idx: Option<Tensor>,
-    perm: Option<Tensor>,
     workspace: Option<Tensor>,
     bits: i32,
 }
@@ -204,14 +203,12 @@ pub fn gptq_matmul(
     scale: &Tensor,
     qzeros: &Option<Tensor>,
     g_idx: &Option<Tensor>,
-    perm: &Option<Tensor>,
     workspace: &Option<Tensor>,
     bits: i32,
 ) -> Result<Tensor> {
     let op = GPTQMatMul {
         qzeros: qzeros.to_owned(),
         g_idx: g_idx.to_owned(),
-        perm: perm.to_owned(),
         workspace: workspace.to_owned(),
         bits,
     };
