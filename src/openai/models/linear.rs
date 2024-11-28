@@ -254,22 +254,28 @@ pub fn qlinear(
                 false
             };
 
-            #[cfg(not(feature = "gcu"))]
-            let wtype = DType::U32;
-            #[cfg(not(feature = "gcu"))]
-            let pack_factor = 32 / cfg.bits;
+            let (wtype, pack_factor) = if vb.device().is_gcu() {
+                (DType::I8, 1) //because GCU format repacked to i8 (instead of u32)
+            } else {
+                (DType::U32, 32 / cfg.bits)
+            };
 
-            #[cfg(feature = "gcu")]
-            let wtype = DType::I8;
-            #[cfg(feature = "gcu")]
-            let pack_factor = 1; //because GCU format repacked to i8 (instead of u32)
+            let (actual_in_dim, actual_out_dim, weight_name, w_transposed) = 
+                if cfg.quant_method == "w8a16" {
+                (out_dim * if marlin_format { 2 } else { 1 }, //enflame format (w8a16)
+                    in_dim / pack_factor / if marlin_format { 2 } else { 1 }, "qweight", false
+                )
+                } else {
+                    (in_dim / pack_factor / if marlin_format { 2 } else { 1 },
+                        out_dim * if marlin_format { 2 } else { 1 }, "qweight", true)
+                };
 
             let ws = vb.get_with_hints_dtype(
                 (
-                    in_dim / pack_factor / if marlin_format { 2 } else { 1 },
-                    out_dim * if marlin_format { 2 } else { 1 },
+                    actual_in_dim,
+                    actual_out_dim,
                 ),
-                if marlin_format { "B" } else { "qweight" },
+                if marlin_format { "B" } else { weight_name },
                 Default::default(),
                 wtype,
             )?;
@@ -349,7 +355,7 @@ pub fn qlinear(
                         qzeros: qzeros,
                         g_idx: g_idx,
                         workspace: None,
-                        weight_transpose: false,
+                        weight_transpose: w_transposed,
                     })
                 } else {
                     //repack gptq format to marlin
@@ -437,6 +443,7 @@ pub struct QLinear {
     qzeros: Option<Tensor>,
     g_idx: Option<Tensor>,
     workspace: Option<Tensor>,
+    weight_transposed: bool,
     group_size: i32,
     bits: i32,
     dtype: DType,
@@ -460,6 +467,7 @@ impl QLinear {
             qzeros: None,
             g_idx: None,
             workspace: None,
+            weight_transposed: false,
             group_size: 0,
             bits: 0,
             dtype: DType::F32,
@@ -474,6 +482,7 @@ impl QLinear {
             qzeros: linear.qzeros().cloned(),
             g_idx: linear.g_idx().cloned(),
             workspace: linear.workspace().cloned(),
+            weight_transposed: linear.weight_transpose,
             group_size,
             bits,
             dtype: linear.weight().dtype(),
@@ -489,6 +498,7 @@ impl QLinear {
             qzeros: None,
             g_idx: None,
             workspace: None,
+            weight_transposed: false,
             group_size: 0,
             bits: 0,
             dtype,
@@ -506,6 +516,7 @@ impl QLinear {
             qzeros: None,
             g_idx: None,
             workspace: None,
+            weight_transposed: false,
             group_size: 0,
             bits: 0,
             dtype: DType::F32,
@@ -531,6 +542,7 @@ impl QLinear {
             qzeros: None,
             g_idx: None,
             workspace: None,
+            weight_transposed: false,
             group_size: 0,
             bits: 0,
             dtype,
@@ -548,7 +560,7 @@ impl QLinear {
         match quant_config {
             Some(cfg) => {
                 assert!(
-                    cfg.quant_method == "gptq" || cfg.quant_method == "marlin" || quant == "marlin"
+                    cfg.quant_method == "gptq" || cfg.quant_method == "w8a16"  || quant == "w8a16" || cfg.quant_method == "marlin" || quant == "marlin"
                 );
                 QLinear::from_linear(linear, cfg.group_size as i32, cfg.bits as i32)
             }
@@ -581,6 +593,7 @@ impl QLinear {
             qzeros: None,
             g_idx: None,
             workspace: None,
+            weight_transposed: false,
             group_size: 0,
             bits: 0,
             dtype: old.dtype,
@@ -763,14 +776,17 @@ impl Module for QLinear {
                 let x = match *x.dims() {
                     [b1, b2, _, _] => {
                         let qw = qw.broadcast_left((b1, b2))?;
-                        gptq_matmul(&x, &qw, scale, qzeros, g_idx, workspace, self.bits)?
+                        let qw = if self.weight_transposed { &qw } else { &qw.t()? };
+                        gptq_matmul(&x, &qw, scale, qzeros, g_idx, workspace, self.bits, self.group_size)?
                     }
                     [bsize, _, _] => {
                         let qw = qw.broadcast_left(bsize)?;
-                        gptq_matmul(&x, &qw, scale, qzeros, g_idx, workspace, self.bits)?
+                        let qw = if self.weight_transposed { &qw } else { &qw.t()? };
+                        gptq_matmul(&x, &qw, scale, qzeros, g_idx, workspace, self.bits, self.group_size)?
                     }
                     _ => {
-                        gptq_matmul(&x, &qw, scale, qzeros, g_idx, workspace, self.bits)?
+                        let qw = if self.weight_transposed { &qw } else { &qw.t()? };
+                        gptq_matmul(&x, &qw, scale, qzeros, g_idx, workspace, self.bits, self.group_size)?
                     }
                 };
 
