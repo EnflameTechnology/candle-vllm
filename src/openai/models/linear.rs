@@ -37,7 +37,6 @@ use std::sync::Arc;
 pub struct Linear {
     weight: Tensor,
     bias: Option<Tensor>,
-    weight_transpose: bool,
     scales: Option<Tensor>,
     qzeros: Option<Tensor>,
     g_idx: Option<Tensor>,
@@ -45,30 +44,10 @@ pub struct Linear {
 }
 
 impl Linear {
-    #[cfg(not(feature = "gcu"))]
     pub fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
         Self {
             weight,
             bias,
-            weight_transpose: false,
-            scales: None,
-            qzeros: None,
-            g_idx: None,
-            perm: None,
-            workspace: None,
-        }
-    }
-
-    #[cfg(feature = "gcu")]
-    pub fn new(weight: Tensor, bias: Option<Tensor>, weight_transpose: bool) -> Self {
-        Self {
-            weight: if weight_transpose {
-                weight.t().unwrap().contiguous().unwrap()
-            } else {
-                weight
-            },
-            bias,
-            weight_transpose,
             scales: None,
             qzeros: None,
             g_idx: None,
@@ -157,29 +136,16 @@ impl Module for Linear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = match *x.dims() {
             [b1, b2, _, _] => {
-                if self.weight_transpose {
-                    x.matmul(&self.weight.broadcast_left((b1, b2))?)?
-                } else {
-                    x.matmul(&self.weight.broadcast_left((b1, b2))?.t()?)?
-                }
+                x.matmul(&self.weight.broadcast_left((b1, b2))?.t()?)?
             }
             [bsize, _, _] => {
-                if self.weight_transpose {
-                    x.matmul(&self.weight.broadcast_left(bsize)?)?
-                } else {
-                    x.matmul(&self.weight.broadcast_left(bsize)?.t()?)?
-                }
+                x.matmul(&self.weight.broadcast_left(bsize)?.t()?)?
             }
             _ => {
-                if self.weight_transpose {
-                    x.matmul(&self.weight)?
-                } else {
-                    x.matmul(&self.weight.t()?)?
-                }
+                x.matmul(&self.weight.t()?)?
             }
         };
 
-        // let x = x.matmul(&w)?;
         match &self.bias {
             None => Ok(x),
             Some(bias) => x.broadcast_add(bias),
@@ -199,10 +165,6 @@ pub fn linear(in_dim: usize, out_dim: usize, vb: candle_nn::VarBuilder) -> Resul
         up: bound,
     };
     let bs = vb.get_with_hints(out_dim, "bias", init_bs)?;
-    #[cfg(feature = "gcu")]
-    return Ok(Linear::new(ws, Some(bs), true));
-
-    #[cfg(not(feature = "gcu"))]
     Ok(Linear::new(ws, Some(bs)))
 }
 
@@ -210,10 +172,6 @@ pub fn linear(in_dim: usize, out_dim: usize, vb: candle_nn::VarBuilder) -> Resul
 pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: candle_nn::VarBuilder) -> Result<Linear> {
     let init_ws = init::DEFAULT_KAIMING_NORMAL;
     let ws = vb.get_with_hints((out_dim, in_dim), "weight", init_ws)?;
-    #[cfg(feature = "gcu")]
-    return Ok(Linear::new(ws, None, true));
-
-    #[cfg(not(feature = "gcu"))]
     Ok(Linear::new(ws, None))
 }
 
@@ -260,15 +218,10 @@ pub fn qlinear(
                 (DType::U32, 32 / cfg.bits)
             };
 
-            let (actual_in_dim, actual_out_dim, weight_name, w_transposed) = 
-                if cfg.quant_method == "w8a16" {
+            let (actual_in_dim, actual_out_dim, weight_name) = 
                 (out_dim * if marlin_format { 2 } else { 1 }, //enflame format (w8a16)
-                    in_dim / pack_factor / if marlin_format { 2 } else { 1 }, "qweight", false
-                )
-                } else {
-                    (in_dim / pack_factor / if marlin_format { 2 } else { 1 },
-                        out_dim * if marlin_format { 2 } else { 1 }, "qweight", true)
-                };
+                    in_dim / pack_factor / if marlin_format { 2 } else { 1 }, "qweight"
+                );
 
             let ws = vb.get_with_hints_dtype(
                 (
@@ -310,7 +263,6 @@ pub fn qlinear(
                     qzeros: None,
                     g_idx: None,
                     workspace: Some(workspace),
-                    weight_transpose: false,
                 })
             } else {
                 let qzeros = if cfg.bits == 4 {
@@ -355,7 +307,6 @@ pub fn qlinear(
                         qzeros: qzeros,
                         g_idx: g_idx,
                         workspace: None,
-                        weight_transpose: w_transposed,
                     })
                 } else {
                     //repack gptq format to marlin
@@ -426,7 +377,6 @@ pub fn qlinear(
                         qzeros: qzeros,
                         g_idx: g_idx,
                         workspace: Some(workspace),
-                        weight_transpose: false,
                     })
                 }
             }
@@ -443,7 +393,6 @@ pub struct QLinear {
     qzeros: Option<Tensor>,
     g_idx: Option<Tensor>,
     workspace: Option<Tensor>,
-    weight_transposed: bool,
     group_size: i32,
     bits: i32,
     dtype: DType,
@@ -467,7 +416,6 @@ impl QLinear {
             qzeros: None,
             g_idx: None,
             workspace: None,
-            weight_transposed: false,
             group_size: 0,
             bits: 0,
             dtype: DType::F32,
@@ -482,7 +430,6 @@ impl QLinear {
             qzeros: linear.qzeros().cloned(),
             g_idx: linear.g_idx().cloned(),
             workspace: linear.workspace().cloned(),
-            weight_transposed: linear.weight_transpose,
             group_size,
             bits,
             dtype: linear.weight().dtype(),
@@ -498,7 +445,6 @@ impl QLinear {
             qzeros: None,
             g_idx: None,
             workspace: None,
-            weight_transposed: false,
             group_size: 0,
             bits: 0,
             dtype,
@@ -516,7 +462,6 @@ impl QLinear {
             qzeros: None,
             g_idx: None,
             workspace: None,
-            weight_transposed: false,
             group_size: 0,
             bits: 0,
             dtype: DType::F32,
@@ -542,7 +487,6 @@ impl QLinear {
             qzeros: None,
             g_idx: None,
             workspace: None,
-            weight_transposed: false,
             group_size: 0,
             bits: 0,
             dtype,
@@ -593,7 +537,6 @@ impl QLinear {
             qzeros: None,
             g_idx: None,
             workspace: None,
-            weight_transposed: false,
             group_size: 0,
             bits: 0,
             dtype: old.dtype,
@@ -775,18 +718,15 @@ impl Module for QLinear {
             (QMatMul::Tensor(qw), Some(scale), qzeros, g_idx, workspace) => {
                 let x = match *x.dims() {
                     [b1, b2, _, _] => {
-                        let qw = qw.broadcast_left((b1, b2))?;
-                        let qw = if self.weight_transposed { &qw } else { &qw.t()? };
+                        let qw = qw.broadcast_left((b1, b2))?.t()?;
                         gptq_matmul(&x, &qw, scale, qzeros, g_idx, workspace, self.bits, self.group_size)?
                     }
                     [bsize, _, _] => {
-                        let qw = qw.broadcast_left(bsize)?;
-                        let qw = if self.weight_transposed { &qw } else { &qw.t()? };
+                        let qw = qw.broadcast_left(bsize)?.t()?;
                         gptq_matmul(&x, &qw, scale, qzeros, g_idx, workspace, self.bits, self.group_size)?
                     }
                     _ => {
-                        let qw = if self.weight_transposed { &qw } else { &qw.t()? };
-                        gptq_matmul(&x, &qw, scale, qzeros, g_idx, workspace, self.bits, self.group_size)?
+                        gptq_matmul(&x, &qw.t()?, scale, qzeros, g_idx, workspace, self.bits, self.group_size)?
                     }
                 };
 
@@ -822,9 +762,6 @@ impl LinearX {
         quant: &Option<String>,
         quant_config: &Option<QuantConfig>,
     ) -> Self {
-        #[cfg(feature = "gcu")]
-        let ln = Linear::new(weight, bias, if quant.is_some() { false } else { true });
-        #[cfg(not(feature = "gcu"))]
         let ln = Linear::new(weight, bias);
 
         if let Some(quatized_type) = quant {
@@ -855,7 +792,6 @@ pub fn linear_x(
             quant_config,
         ))))
     } else {
-        // let ln = linear(in_dim, out_dim, vb).unwrap();
         let init_ws = init::DEFAULT_KAIMING_NORMAL;
         let ws = vb.get_with_hints((out_dim, in_dim), "weight", init_ws)?;
         let bound = 1. / (in_dim as f64).sqrt();
@@ -864,9 +800,6 @@ pub fn linear_x(
             up: bound,
         };
         let bs = vb.get_with_hints(out_dim, "bias", init_bs)?;
-        #[cfg(feature = "gcu")]
-        let ln = Linear::new(ws, Some(bs), if quant.is_some() { false } else { true });
-        #[cfg(not(feature = "gcu"))]
         let ln = Linear::new(ws, Some(bs));
         Ok(LinearX(Either::Left(ln)))
     }
@@ -890,9 +823,6 @@ pub fn linear_no_bias_x(
     } else {
         let init_ws = init::DEFAULT_KAIMING_NORMAL;
         let ws = vb.get_with_hints((out_dim, in_dim), "weight", init_ws)?;
-        #[cfg(feature = "gcu")]
-        let ln = Linear::new(ws, None, if quant.is_some() { false } else { true });
-        #[cfg(not(feature = "gcu"))]
         let ln = Linear::new(ws, None);
         Ok(LinearX(Either::Left(ln)))
     }
