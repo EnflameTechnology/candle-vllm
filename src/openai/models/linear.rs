@@ -213,15 +213,26 @@ pub fn qlinear(
             };
 
             let (wtype, pack_factor) = if vb.device().is_gcu() {
-                (DType::I8, 1) //because GCU format repacked to i8 (instead of u32)
+                if cfg.bits == 4 {
+                    (DType::U8, 2) //w4a16
+                } else {
+                    (DType::I8, 1) //because GCU format repacked to i8 (instead of u32)
+                }
             } else {
                 (DType::U32, 32 / cfg.bits)
             };
 
             let (actual_in_dim, actual_out_dim, weight_name) = 
-                (out_dim * if marlin_format { 2 } else { 1 }, //enflame format (w8a16)
-                    in_dim / pack_factor / if marlin_format { 2 } else { 1 }, "qweight"
-                );
+            if cfg.bits == 4 {
+                (in_dim / pack_factor, 
+                out_dim, //enflame format (w4a16), transposed (kn format)
+                "qweight"
+                )
+            } else {
+                (out_dim * if marlin_format { 2 } else { 1 }, //enflame format (w8a16), nk format
+                in_dim / pack_factor / if marlin_format { 2 } else { 1 }, "qweight"
+                )
+            };
 
             let ws = vb.get_with_hints_dtype(
                 (
@@ -232,7 +243,7 @@ pub fn qlinear(
                 Default::default(),
                 wtype,
             )?;
-
+            let ws = if cfg.bits == 4 { ws.t()?.contiguous()? } else { ws };
             let scale_and_zero_size = in_dim / (cfg.group_size as usize);
             let scales = vb.get_with_hints_dtype(
                 (scale_and_zero_size, out_dim),
@@ -266,13 +277,14 @@ pub fn qlinear(
                 })
             } else {
                 let qzeros = if cfg.bits == 4 {
+                    //non-marlin format has qzeros
                     let qzeros = vb.get_with_hints_dtype(
-                        (scale_and_zero_size, out_dim / (32 / cfg.bits)),
+                        (scale_and_zero_size, out_dim),
                         "qzeros",
                         Default::default(),
-                        DType::U32,
+                        if scales.device().is_gcu() { DType::F16 } else { DType::U32 },
                     )?;
-    
+
                     let qzeros = if qzeros.device().is_gcu() {
                         qzeros.to_dtype(dtype)?
                     } else {
@@ -282,9 +294,8 @@ pub fn qlinear(
                 } else {
                     None
                 };
-
-
-                let g_idx = if cfg.bits == 4 {
+                
+                let g_idx = if cfg.bits == 4 && !scales.device().is_gcu(){ //we removed g_idx in gcu platform since we repacked the weights
                     let g_idx = vb.get_with_hints_dtype((in_dim,), "g_idx", Default::default(), DType::U32)?;
                     Some(g_idx)
                 } else {

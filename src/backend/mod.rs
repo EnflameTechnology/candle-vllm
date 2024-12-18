@@ -18,6 +18,7 @@ pub fn get_or_load_func(
         DType::U8 => "_u8",
         DType::I8 => "_i8",
         DType::U32 => "_u32",
+        DType::I32 => "_i32",
         DType::I64 => "_i64",
         DType::BF16 => "_bf16",
         DType::F16 => "_f16",

@@ -95,8 +95,8 @@ impl RotaryEmbedding {
             .to_dtype(DType::F32)?
             .reshape((cfg.max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        let cos = freqs.cos()?.to_dtype(dtype)?;
-        let sin = freqs.sin()?.to_dtype(dtype)?;
+        let cos = freqs.cos()?;
+        let sin = freqs.sin()?;
         let cos_sin = Tensor::cat(&[&cos, &sin], D::Minus1)?.contiguous()?; //must be contiguous tensor;
         Ok(Self {
             dim,

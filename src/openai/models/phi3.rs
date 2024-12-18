@@ -345,17 +345,15 @@ impl Attention {
         let qkv = self.qkv_proj.forward(xs)?;
         let query_pos = self.num_heads * self.head_dim;
         let dtype = qkv.dtype();
-        let query_states = qkv.narrow(D::Minus1, 0, query_pos)?.to_dtype(DType::F32)?;
+        let query_states = qkv.narrow(D::Minus1, 0, query_pos)?;
         let key_states = qkv
-            .narrow(D::Minus1, query_pos, self.num_kv_heads * self.head_dim)?
-            .to_dtype(DType::F32)?;
+            .narrow(D::Minus1, query_pos, self.num_kv_heads * self.head_dim)?;
         let value_states = qkv
             .narrow(
                 D::Minus1,
                 query_pos + self.num_kv_heads * self.head_dim,
                 self.num_kv_heads * self.head_dim,
-            )?
-            .contiguous()?;
+            )?;
 
         let (q, k, v) = if seq_len == 1 {
             //no need transpose for seq_len == 1, change reshape dim
@@ -379,9 +377,6 @@ impl Attention {
         let (q, k) = self
             .rotary_emb
             .apply_rotary_emb_qkv(&q, &k, input_positions)?;
-
-        let q = q.to_dtype(v.dtype())?;
-        let k = k.to_dtype(v.dtype())?;
 
         let y = self.attn.forward(
             &q,

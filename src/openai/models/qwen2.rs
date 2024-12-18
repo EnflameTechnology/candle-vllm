@@ -283,8 +283,8 @@ impl Attention {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = xs.dims3()?;
 
-        let query_states = self.q_proj.forward(xs)?.to_dtype(DType::F32)?;
-        let key_states = self.k_proj.forward(xs)?.to_dtype(DType::F32)?;
+        let query_states = self.q_proj.forward(xs)?;
+        let key_states = self.k_proj.forward(xs)?;
         let value_states = self.v_proj.forward(xs)?;
 
         let (q, k, v) = if seq_len == 1 {
@@ -309,9 +309,6 @@ impl Attention {
         let (q, k) = self
             .rotary_emb
             .apply_rotary_emb_qkv(&q, &k, input_positions)?;
-
-        let q = q.to_dtype(v.dtype())?;
-        let k = k.to_dtype(v.dtype())?;
 
         let y = self.attn.forward(
             &q,

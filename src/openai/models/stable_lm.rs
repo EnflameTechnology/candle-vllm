@@ -87,7 +87,6 @@ pub(crate) struct RotaryEmbedding {
 
 impl RotaryEmbedding {
     pub(crate) fn new(_dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
-        let dtype = if dev.is_cpu() { _dtype } else { DType::F32 };
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
         let dim = (cfg.partial_rotary_factor.unwrap() * head_dim as f32) as usize;
         let max_seq_len = cfg.max_seq_len;
@@ -96,9 +95,9 @@ impl RotaryEmbedding {
             .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(DType::F32)?;
         let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(dtype)?
+            .to_dtype(DType::F32)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
         let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?.contiguous()?; //must be contiguous tensor;
@@ -110,26 +109,6 @@ impl RotaryEmbedding {
         })
     }
 
-    #[cfg(not(feature = "gcu"))]
-    fn apply_rotary_emb(&self, xs: &Tensor, input_positions: &Vec<Vec<usize>>) -> Result<Tensor> {
-        let (b_size, _num_heads, seq_len, _headdim) = xs.dims4()?;
-        let mut embeds = Vec::new();
-        for (b, seqlen_offset) in zip(0..b_size, input_positions) {
-            let xs_rot = xs.narrow(3, 0, self.dim)?.contiguous()?;
-            let xs_pass = xs.narrow(3, self.dim, _headdim - self.dim)?;
-            let c = self.cos.narrow(0, seqlen_offset[0], seq_len)?;
-            let s = self.sin.narrow(0, seqlen_offset[0], seq_len)?;
-            let xs_rot = xs_rot.narrow(0, b, 1)?;
-            let xs_pass = xs_pass.narrow(0, b, 1)?;
-
-            let xs_rot = candle_nn::rotary_emb::rope(&xs_rot, &c, &s)?;
-            let embed = Tensor::cat(&[&xs_rot, &xs_pass], D::Minus1)?.contiguous()?;
-            embeds.push(embed);
-        }
-        Tensor::cat(&embeds, 0)
-    }
-
-    #[cfg(feature = "gcu")]
     fn apply_rotary_emb_qkv(
         &self,
         q: &Tensor,
@@ -305,8 +284,8 @@ impl Attention {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = xs.dims3()?;
 
-        let query_states = self.q_proj.forward(xs)?.to_dtype(DType::F32)?;
-        let key_states = self.k_proj.forward(xs)?.to_dtype(DType::F32)?;
+        let query_states = self.q_proj.forward(xs)?;
+        let key_states = self.k_proj.forward(xs)?;
         let value_states = self.v_proj.forward(xs)?;
 
         let (q, k, v) = if seq_len == 1 {
@@ -328,23 +307,9 @@ impl Attention {
             (q, k, v.contiguous()?)
         };
 
-        #[cfg(feature = "gcu")]
         let (q, k) = self
             .rotary_emb
             .apply_rotary_emb_qkv(&q, &k, input_positions)?;
-
-        #[cfg(not(feature = "gcu"))]
-        let q = self
-            .rotary_emb
-            .apply_rotary_emb(&q.to_dtype(DType::F32)?, input_positions)?;
-
-        #[cfg(not(feature = "gcu"))]
-        let k = self
-            .rotary_emb
-            .apply_rotary_emb(&k.to_dtype(DType::F32)?, input_positions)?;
-
-        let q = q.to_dtype(v.dtype())?;
-        let k = k.to_dtype(v.dtype())?;
 
         let y = self.attn.forward(
             &q,
