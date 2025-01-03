@@ -38,11 +38,7 @@ impl PagedAttention {
 
         let stream = match &device {
             Device::Gcu(d) => {
-                if d.gcu_device().stream.is_some() {
-                    d.gcu_device().stream.unwrap().as_inner() as *const c_void
-                } else {
-                    std::ptr::null()
-                }
+                d.gcu_device().stream_inner().expect("unable to obtain stream")
             }
             _ => std::ptr::null(),
         };
@@ -60,7 +56,7 @@ impl PagedAttention {
             sliding_window,
             num_queries_per_kv,
             alibi_slopes,
-            stream: stream,
+            stream: stream as *const c_void,
         })
     }
 
