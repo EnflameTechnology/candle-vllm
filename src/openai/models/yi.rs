@@ -278,7 +278,7 @@ impl Attention {
         attention_mask: Option<&Tensor>,
         input_positions: &[Vec<usize>],
         cache: Option<(&Tensor, &Tensor)>,
-        input_metadata: &mut InputMetadata,
+        input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = xs.dims3()?;
 
@@ -367,7 +367,7 @@ impl DecoderLayer {
         attention_mask: Option<&Tensor>,
         input_positions: &[Vec<usize>],
         cache: Option<(&Tensor, &Tensor)>,
-        input_metadata: &mut InputMetadata,
+        input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.ln1.forward(xs)?;
@@ -438,7 +438,7 @@ impl Yi {
         input_ids: &Tensor,
         input_positions: &[Vec<usize>],
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
-        input_metadata: &mut InputMetadata,
+        input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
         let (b_size, seq_len) = input_ids.dims2()?;
         let attention_mask = if seq_len <= 1 {
