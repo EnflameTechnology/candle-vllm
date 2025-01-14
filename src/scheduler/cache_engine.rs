@@ -39,6 +39,7 @@ impl CacheConfig {
 
 pub type KVCache = (Tensor, Tensor);
 
+#[derive(Debug)]
 pub struct CacheEngine {
     gpu_cache: Arc<Mutex<Vec<KVCache>>>,
     cpu_cache: Vec<KVCache>,
@@ -51,6 +52,7 @@ impl CacheEngine {
         cache_config: &CacheConfig,
         dtype: DType,
         device: &Device,
+        num_shards: usize,
     ) -> Result<Self, APIError> {
         Ok(Self {
             gpu_cache: Arc::new(Mutex::new(Self::allocate_gpu_cache(
@@ -58,8 +60,15 @@ impl CacheEngine {
                 cache_config,
                 dtype,
                 device,
+                num_shards,
             )?)),
-            cpu_cache: Self::allocate_cpu_cache(model_config, cache_config, dtype, device)?,
+            cpu_cache: Self::allocate_cpu_cache(
+                model_config,
+                cache_config,
+                dtype,
+                device,
+                num_shards,
+            )?,
             num_layers: model_config.num_hidden_layers,
         })
     }
@@ -77,13 +86,18 @@ impl CacheEngine {
         cache_config: &CacheConfig,
         dtype: DType,
         device: &Device,
+        num_shards: usize,
     ) -> Result<Vec<KVCache>, APIError> {
         assert!(cache_config.fully_init);
 
-        let key_block_shape =
-            Self::calculate_key_block_shape(model_config, dtype, cache_config.block_size);
+        let key_block_shape = Self::calculate_key_block_shape(
+            model_config,
+            dtype,
+            cache_config.block_size,
+            num_shards,
+        );
         let value_block_shape =
-            Self::calculate_value_block_shape(model_config, cache_config.block_size);
+            Self::calculate_value_block_shape(model_config, cache_config.block_size, num_shards);
         let mut gpu_cache = Vec::new();
         for _ in 0..model_config.num_hidden_layers {
             let key_blocks = try_api!(Tensor::zeros(
@@ -117,13 +131,18 @@ impl CacheEngine {
         cache_config: &CacheConfig,
         dtype: DType,
         device: &Device,
+        num_shards: usize,
     ) -> Result<Vec<KVCache>, APIError> {
         assert!(cache_config.fully_init);
 
-        let key_block_shape =
-            Self::calculate_key_block_shape(model_config, dtype, cache_config.block_size);
+        let key_block_shape = Self::calculate_key_block_shape(
+            model_config,
+            dtype,
+            cache_config.block_size,
+            num_shards,
+        );
         let value_block_shape =
-            Self::calculate_value_block_shape(model_config, cache_config.block_size);
+            Self::calculate_value_block_shape(model_config, cache_config.block_size, num_shards);
         let mut cpu_cache = Vec::new();
         for _ in 0..model_config.num_hidden_layers {
             let key_blocks = try_api!(Tensor::zeros(
@@ -158,11 +177,12 @@ impl CacheEngine {
         model_config: &Config,
         dtype: DType,
         block_size: usize,
+        num_shards: usize,
     ) -> (usize, usize, usize, usize) {
         let element_size = dtype.size_in_bytes();
         let x = 16 / element_size;
         (
-            model_config.num_key_value_heads,
+            model_config.num_key_value_heads / num_shards,
             model_config.get_head_size() / x,
             block_size,
             x,
@@ -172,9 +192,10 @@ impl CacheEngine {
     fn calculate_value_block_shape(
         model_config: &Config,
         block_size: usize,
+        num_shards: usize,
     ) -> (usize, usize, usize) {
         (
-            model_config.num_key_value_heads,
+            model_config.num_key_value_heads / num_shards,
             model_config.get_head_size(),
             block_size,
         )

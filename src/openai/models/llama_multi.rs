@@ -1,17 +1,17 @@
 use super::{Config, QuantConfig};
-use crate::openai::models::linear::{linear_no_bias_x as linear, LinearX as Linear};
+use crate::openai::distributed::{shard, TensorParallelColumnLinear, TensorParallelRowLinear};
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
 use crate::SpecificConfig;
 use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_core as candle;
-use candle_nn::{embedding, Embedding, Module, VarBuilder};
-use candle_transformers::models::with_tracing::RmsNorm;
+use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
+use candle_nn::{Embedding, Linear, Module, RmsNorm};
+pub use cudarc::nccl::safe::{Comm, ReduceOp};
 pub const MAX_SEQ_LEN: usize = 4096;
 use crate::openai::models::TokenID;
 use std::iter::zip;
-pub use std::rc::Rc;
-
+use std::rc::Rc;
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct LlamaConfig {
     pub hidden_size: usize,
@@ -77,7 +77,6 @@ impl LlamaConfig {
 pub struct Cache {
     cos: Tensor,
     sin: Tensor,
-    cos_sin: Tensor,
 }
 
 impl Cache {
@@ -95,69 +94,48 @@ impl Cache {
             .matmul(&theta.reshape((1, theta.elem_count()))?)?;
         let cos = idx_theta.cos()?.to_dtype(dtype)?;
         let sin = idx_theta.sin()?.to_dtype(dtype)?;
-        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
-        Ok(Self { cos, sin, cos_sin })
+        Ok(Self { cos, sin })
     }
 }
 
+fn linear(size1: usize, size2: usize, vb: VarBuilder) -> Result<Linear> {
+    let weight = vb.get((size2, size1), "weight")?;
+    Ok(Linear::new(weight, None))
+}
+
+fn embedding(cfg: &Config, vb: VarBuilder) -> Result<Embedding> {
+    let embeddings = vb.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
+    Ok(Embedding::new(embeddings, cfg.hidden_size))
+}
+
 struct CausalSelfAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    qkv_proj: TensorParallelColumnLinear,
+    o_proj: TensorParallelRowLinear,
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
-    span: tracing::Span,
-    span_rot: tracing::Span,
     attn: PagedAttention,
     cos_sin_cache: Cache,
 }
 
 impl CausalSelfAttention {
-    fn apply_rotary_emb_qkv(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        input_positions: &[Vec<usize>],
-    ) -> Result<(Tensor, Tensor)> {
-        let (b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-        if q.device().is_gcu() {
-            let mut _input_positions = Vec::<i32>::new();
-            for seqlen_offset in input_positions {
-                _input_positions.push(seqlen_offset[0] as i32);
-            }
-            candle_nn::apply_rotary_emb_qkv(
-                &q,
-                &k,
-                &self.cos_sin_cache.cos_sin,
-                &self.cos_sin_cache.sin,
-                &_input_positions,
-                0,
-                true,
-                true,
-            )
-        } else {
-            let mut q_embeds = Vec::new();
-            let mut k_embeds = Vec::new();
-            for (b, seqlen_offset) in zip(0..b_sz, input_positions) {
-                let cos = self
-                    .cos_sin_cache
-                    .cos
-                    .narrow(0, seqlen_offset[0], seq_len)?;
-                let sin = self
-                    .cos_sin_cache
-                    .sin
-                    .narrow(0, seqlen_offset[0], seq_len)?;
-                let x_q = q.narrow(0, b, 1)?;
-                let x_k = k.narrow(0, b, 1)?;
-                let q_embed = candle_nn::rotary_emb::rope(&x_q, &cos, &sin).unwrap();
-                let k_embed = candle_nn::rotary_emb::rope(&x_k, &cos, &sin).unwrap();
-                q_embeds.push(q_embed);
-                k_embeds.push(k_embed);
-            }
-            Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
+    fn apply_rotary_emb(&self, x: &Tensor, input_positions: &[Vec<usize>]) -> Result<Tensor> {
+        let (b_sz, _, seq_len, _hidden_size) = x.dims4()?;
+        let mut embeds = Vec::new();
+        for (b, seqlen_offset) in zip(0..b_sz, input_positions) {
+            let cos = self
+                .cos_sin_cache
+                .cos
+                .narrow(0, seqlen_offset[0], seq_len)?;
+            let sin = self
+                .cos_sin_cache
+                .sin
+                .narrow(0, seqlen_offset[0], seq_len)?;
+            let x_b = x.narrow(0, b, 1)?;
+            let embed = candle_nn::rotary_emb::rope(&x_b, &cos, &sin).unwrap();
+            embeds.push(embed);
         }
+        Tensor::cat(&embeds, 0)
     }
 
     fn forward(
@@ -168,11 +146,23 @@ impl CausalSelfAttention {
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        let (b_sz, seq_len, hidden_size) = x.dims3()?;
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let (b_sz, seq_len, _) = x.dims3()?;
+        let qkv = self.qkv_proj.forward(x)?;
+        let hidden_size = self.num_attention_heads * self.head_dim;
+
+        let q = qkv.i((.., .., ..self.num_attention_heads * self.head_dim))?;
+        let k = qkv.i((
+            ..,
+            ..,
+            self.num_attention_heads * self.head_dim
+                ..self.num_attention_heads * self.head_dim
+                    + self.num_key_value_heads * self.head_dim,
+        ))?;
+        let v = qkv.i((
+            ..,
+            ..,
+            self.num_attention_heads * self.head_dim + self.num_key_value_heads * self.head_dim..,
+        ))?;
 
         let (q, k, v) = if seq_len == 1 {
             //no need transpose for seq_len == 1, change reshape dim
@@ -183,17 +173,20 @@ impl CausalSelfAttention {
         } else {
             let q = q
                 .reshape((b_sz, seq_len, self.num_attention_heads, self.head_dim))?
-                .transpose(1, 2)?;
+                .transpose(1, 2)?
+                .contiguous()?;
             let k = k
                 .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
-                .transpose(1, 2)?;
+                .transpose(1, 2)?
+                .contiguous()?;
             let v = v
                 .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
                 .transpose(1, 2)?;
             (q, k, v.contiguous()?)
         };
 
-        let (q, k) = self.apply_rotary_emb_qkv(&q, &k, input_positions)?;
+        let q = self.apply_rotary_emb(&q, input_positions)?;
+        let k = self.apply_rotary_emb(&k, input_positions)?;
 
         let y = self.attn.forward(
             &q,
@@ -215,61 +208,33 @@ impl CausalSelfAttention {
         Ok(y)
     }
 
-    fn load(vb: VarBuilder, cfg: &Config, dtype: DType, device: &Device) -> Result<Self> {
-        let span = tracing::span!(tracing::Level::TRACE, "attn");
-        let span_rot = tracing::span!(tracing::Level::TRACE, "attn-rot");
-        let size_in = cfg.hidden_size;
-        let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
-        let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
-        let q_proj = linear(
-            size_in,
-            size_q,
-            vb.pp("q_proj"),
-            &cfg.specific_config.quant,
-            &cfg.quantization_config,
-            dtype,
+    fn load(
+        vb: VarBuilder,
+        cfg: &Config,
+        dtype: DType,
+        device: &Device,
+        comm: Rc<Comm>,
+    ) -> Result<Self> {
+        let qkv_proj = TensorParallelColumnLinear::load_multi(
+            vb.clone(),
+            &["q_proj", "k_proj", "v_proj"],
+            comm.clone(),
         )?;
-        let k_proj = linear(
-            size_in,
-            size_kv,
-            vb.pp("k_proj"),
-            &cfg.specific_config.quant,
-            &cfg.quantization_config,
-            dtype,
-        )?;
-        let v_proj = linear(
-            size_in,
-            size_kv,
-            vb.pp("v_proj"),
-            &cfg.specific_config.quant,
-            &cfg.quantization_config,
-            dtype,
-        )?;
-        let o_proj = linear(
-            size_q,
-            size_in,
-            vb.pp("o_proj"),
-            &cfg.specific_config.quant,
-            &cfg.quantization_config,
-            dtype,
-        )?;
+        let o_proj = TensorParallelRowLinear::load(vb.pp("o_proj"), comm.clone())?;
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
-
+        let attention_heads = cfg.num_attention_heads / comm.world_size();
+        let kv_heads = cfg.num_key_value_heads / comm.world_size();
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
-            num_attention_heads: cfg.num_attention_heads,
-            num_key_value_heads: cfg.num_key_value_heads,
+            num_attention_heads: attention_heads,
+            num_key_value_heads: kv_heads,
             head_dim,
-            span,
-            span_rot,
             attn: PagedAttention::new(
-                cfg.num_attention_heads,
+                attention_heads,
                 head_dim,
                 1. / ((head_dim as f32).sqrt()),
-                Some(cfg.num_key_value_heads),
+                Some(kv_heads),
                 None,
                 vb.device().clone(),
                 None,
@@ -279,56 +244,32 @@ impl CausalSelfAttention {
     }
 }
 
-#[derive(Debug, Clone)]
 struct Mlp {
-    c_fc1: Linear,
-    c_fc2: Linear,
-    c_proj: Linear,
-    span: tracing::Span,
+    c_fc1: TensorParallelColumnLinear,
+    c_fc2: TensorParallelColumnLinear,
+    c_proj: TensorParallelRowLinear,
 }
 
 impl Mlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let _enter = self.span.enter();
         let x = (candle_nn::ops::silu(&self.c_fc1.forward(x)?)? * self.c_fc2.forward(x)?)?;
         self.c_proj.forward(&x)
     }
 
-    fn load(vb: VarBuilder, dtype: DType, cfg: &Config) -> Result<Self> {
-        let span = tracing::span!(tracing::Level::TRACE, "mlp");
-        let h_size = cfg.hidden_size;
-        let i_size = cfg.intermediate_size;
-        let c_fc1 = linear(
-            h_size,
-            i_size,
-            vb.pp("gate_proj"),
-            &cfg.specific_config.quant,
-            &cfg.quantization_config,
-            dtype,
-        )?;
-        let c_fc2 = linear(
-            h_size,
-            i_size,
-            vb.pp("up_proj"),
-            &cfg.specific_config.quant,
-            &cfg.quantization_config,
-            dtype,
-        )?;
-        let c_proj = linear(
-            i_size,
-            h_size,
-            vb.pp("down_proj"),
-            &cfg.specific_config.quant,
-            &cfg.quantization_config,
-            dtype,
-        )?;
+    fn load(vb: VarBuilder, comm: Rc<Comm>) -> Result<Self> {
+        let c_fc1 = TensorParallelColumnLinear::load(vb.pp("gate_proj"), comm.clone())?;
+        let c_fc2 = TensorParallelColumnLinear::load(vb.pp("up_proj"), comm.clone())?;
+        let c_proj = TensorParallelRowLinear::load(vb.pp("down_proj"), comm)?;
         Ok(Self {
             c_fc1,
             c_fc2,
             c_proj,
-            span,
         })
     }
+}
+fn rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
+    let weight = vb.get_with_hints(size, "weight", shard(0, 0, 1))?;
+    Ok(RmsNorm::new(weight, eps))
 }
 
 struct Block {
@@ -336,7 +277,6 @@ struct Block {
     attn: CausalSelfAttention,
     rms_2: RmsNorm,
     mlp: Mlp,
-    span: tracing::Span,
 }
 
 impl Block {
@@ -348,7 +288,6 @@ impl Block {
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        let _enter = self.span.enter();
         let residual = x;
         let x = self.rms_1.forward(x)?;
         let x = (self
@@ -360,27 +299,27 @@ impl Block {
         Ok(x)
     }
 
-    fn load(vb: VarBuilder, cfg: &Config, dtype: DType, device: &Device) -> Result<Self> {
-        let span = tracing::span!(tracing::Level::TRACE, "block");
-        let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg, dtype, device)?;
-        let mlp = Mlp::load(vb.pp("mlp"), dtype, cfg)?;
-        let rms_1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let rms_2 = RmsNorm::new(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
-        )?;
+    fn load(
+        vb: VarBuilder,
+        cfg: &Config,
+        dtype: DType,
+        device: &Device,
+        comm: Rc<Comm>,
+    ) -> Result<Self> {
+        let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg, dtype, device, comm.clone())?;
+        let mlp = Mlp::load(vb.pp("mlp"), comm.clone())?;
+        let rms_1 = rms_norm(cfg.hidden_size, 1e-5, vb.pp("input_layernorm"))?;
+        let rms_2 = rms_norm(cfg.hidden_size, 1e-5, vb.pp("post_attention_layernorm"))?;
         Ok(Self {
             rms_1,
             attn,
             rms_2,
             mlp,
-            span,
         })
     }
 }
 
-pub struct Llama {
+pub struct LlamaMulti {
     wte: Embedding,
     blocks: Vec<Block>,
     ln_f: RmsNorm,
@@ -390,7 +329,7 @@ pub struct Llama {
     device: Device,
 }
 
-impl Llama {
+impl LlamaMulti {
     fn prepare_decoder_attention_mask(&self, b_size: usize, tgt_len: usize) -> Result<Tensor> {
         let mask: Vec<_> = (0..tgt_len)
             .flat_map(|i| (0..tgt_len).map(move |j| if i < j { f32::NEG_INFINITY } else { 0. }))
@@ -443,19 +382,27 @@ impl Llama {
         logits.to_dtype(DType::F32)
     }
 
-    pub fn load(vb: VarBuilder, cfg: &Config, dtype: DType, device: &Device) -> Result<Self> {
-        let wte = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
-        let lm_head = linear(
-            cfg.hidden_size,
-            cfg.vocab_size,
-            vb.pp("lm_head"),
-            &None, //no quant for lm_head
-            &None,
-            dtype,
-        )?;
-        let ln_f = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
+    pub fn load(
+        vb: VarBuilder,
+        cfg: &Config,
+        dtype: DType,
+        device: &Device,
+        comm: Rc<Comm>,
+    ) -> Result<Self> {
+        let wte = embedding(cfg, vb.pp("model.embed_tokens"))?;
+        let lm_head = linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
+        let ln_f = rms_norm(cfg.hidden_size, 1e-5, vb.pp("model.norm"))?;
         let blocks: Vec<_> = (0..cfg.num_hidden_layers)
-            .map(|i| Block::load(vb.pp(&format!("model.layers.{i}")), cfg, dtype, device).unwrap())
+            .map(|i| {
+                Block::load(
+                    vb.pp(&format!("model.layers.{i}")),
+                    cfg,
+                    dtype,
+                    device,
+                    comm.clone(),
+                )
+                .unwrap()
+            })
             .collect();
 
         Ok(Self {

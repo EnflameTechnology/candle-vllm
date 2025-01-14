@@ -295,7 +295,7 @@ impl Attention {
     }
 
     fn forward(
-        &mut self,
+        &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         input_positions: &[Vec<usize>],
@@ -418,7 +418,7 @@ impl DecoderLayer {
     }
 
     fn forward(
-        &mut self,
+        &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         input_positions: &[Vec<usize>],
@@ -511,7 +511,7 @@ impl Gemma {
     }
 
     pub fn forward(
-        &mut self,
+        &self,
         input_ids: &Tensor,
         input_positions: &[Vec<usize>],
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
@@ -527,7 +527,7 @@ impl Gemma {
         let xs = self.embed_tokens.forward(input_ids)?;
         let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
         if let Some(kv_caches) = kv_caches {
-            for ((k_cache, v_cache), layer) in zip(kv_caches.iter(), self.layers.iter_mut()) {
+            for ((k_cache, v_cache), layer) in zip(kv_caches.iter(), self.layers.iter()) {
                 xs = layer.forward(
                     &xs,
                     attention_mask.as_ref(),
@@ -538,7 +538,7 @@ impl Gemma {
                 )?
             }
         } else {
-            for layer in self.layers.iter_mut() {
+            for layer in self.layers.iter() {
                 xs = layer.forward(
                     &xs,
                     attention_mask.as_ref(),
