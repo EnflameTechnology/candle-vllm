@@ -31,7 +31,7 @@ use crate::{
     try_api, SpecificConfig,
 };
 
-#[cfg(feature = "nccl")]
+#[cfg(feature = "eccl")]
 use crate::openai::models::llama_multi::LlamaMulti;
 
 use candle_core::quantized::gguf_file;
@@ -61,7 +61,7 @@ enum LLMModel {
     StableLM(StableLM),
     LlamaGGUF(GGUFLLaMa),
     Phi3GGUF(GGUFPhi3),
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     LlamaMulti(LlamaMulti),
 }
 /// top-p, multinomial, and argmax sampling are implemented. Beam search is not implemented.
@@ -250,9 +250,9 @@ impl DefaultLoader {
             println!("Model {:?}", config);
 
             println!("Loading {} model.", self.name);
-            #[cfg(feature = "nccl")]
+            #[cfg(feature = "eccl")]
             let (models, devices, sep_style) = if device_ids.len() > 1 {
-                use cudarc::nccl::safe::{Comm, Id};
+                pub use candle_core::gcu_backend::ubridge::eccl::{Comm, Id};
                 let id = Id::new().unwrap();
                 let results: Vec<_> = device_ids
                     .par_iter()
@@ -266,7 +266,7 @@ impl DefaultLoader {
                         let device = crate::new_device(*dev_id).unwrap();
                         let comm = Rc::new(
                             Comm::from_rank(
-                                device.as_cuda_device().unwrap().cuda_device(),
+                                device.as_gcu_device().unwrap().gcu_device(),
                                 rank,
                                 device_ids.len(),
                                 id,
@@ -308,10 +308,10 @@ impl DefaultLoader {
 
                 (models, devices, SeparatorStyle::Llama3)
             } else {
-                panic!("You've enabled nccl feature for multi-gpu inference but only one device was given!");
+                panic!("You've enabled eccl feature for multi-gpu inference but only one device was given!");
             };
 
-            #[cfg(not(feature = "nccl"))]
+            #[cfg(not(feature = "eccl"))]
             let (models, devices, sep_style) = if device_ids.len() < 2 {
                 let device = crate::new_device(device_ids[0]).unwrap();
                 let vb = match unsafe {
@@ -502,7 +502,7 @@ impl DefaultPipeline {
             LLMModel::Llama(llama) => llama
                 .forward(&input_tokens, input_positions, kv_cache, &input_metadata)
                 .map_err(APIError::from),
-            #[cfg(feature = "nccl")]
+            #[cfg(feature = "eccl")]
             LLMModel::LlamaMulti(llama) => llama
                 .forward(&input_tokens, input_positions, kv_cache, &input_metadata)
                 .map_err(APIError::from),
@@ -712,7 +712,7 @@ impl DefaultPipeline {
     pub fn get_model_config(&self) -> Config {
         match &self.model {
             LLMModel::Llama(llama) => llama.get_config().clone(),
-            #[cfg(feature = "nccl")]
+            #[cfg(feature = "eccl")]
             LLMModel::LlamaMulti(llama) => llama.get_config().clone(),
             LLMModel::Phi2(phi) => phi.get_config().clone(),
             LLMModel::Phi3(phi) => phi.get_config().clone(),

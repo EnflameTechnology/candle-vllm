@@ -1,7 +1,7 @@
 pub mod gemma;
 pub mod linear;
 pub mod llama;
-#[cfg(feature = "nccl")]
+#[cfg(feature = "eccl")]
 pub mod llama_multi;
 pub mod mistral;
 pub mod phi2;

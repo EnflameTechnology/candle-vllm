@@ -44,9 +44,9 @@ metal = { version = "0.27.0", features = ["mps"], optional = true }
 kernels = {path = "./kernels", version="0.1.0", optional = true}
 metal-kernels = {path = "./metal-kernels", version="0.1.0", optional = true}
 candle-paged-attention = {path = "../candle-paged-attention", version="0.0.1", optional = true}
+lazy_static = {version = "1.4.0"}
 
 [features]
-default = ["gcu"]
 accelerate = ["dep:accelerate-src", "candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "dep:kernels"]
 gcu = ["candle-core/gcu", "candle-core/async", "candle-nn/gcu", "candle-transformers/gcu", "candle-examples/gcu", "dep:candle-paged-attention"]
@@ -55,3 +55,4 @@ cudnn = ["candle-core/cudnn"]
 flash-attn = ["cuda", "candle-transformers/flash-attn"]
 mkl = ["dep:intel-mkl-src", "candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
 nccl = ["cuda", "cudarc/nccl"]
+eccl = ["gcu", "candle-core/eccl", "candle-nn/eccl"]

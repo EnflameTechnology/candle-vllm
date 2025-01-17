@@ -80,6 +80,7 @@ impl LLMEngine {
                     notify.notified().await; // Blocking call to wait for notification
                     let _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                     let mut e = engine.lock().await;
+                    e.bind_to_thread();
                     let result = e.generate_once().unwrap();
                     if result.len() == 0 {
                         continue;
@@ -176,6 +177,12 @@ impl LLMEngine {
         }
     }
 
+    pub fn bind_to_thread(&self) {
+        let pipeline = self.get_pipeline(0).unwrap().0.as_ref();
+        let device = pipeline.device();
+        device.as_gcu_device().unwrap().bind_to_thread();
+    }
+
     pub fn generate_once(
         &mut self,
     ) -> Result<HashMap<String, (Vec<ChatChoice>, ChatCompletionUsageResponse)>, APIError> {
@@ -193,16 +200,20 @@ impl LLMEngine {
             let scheduled: &VecDeque<Arc<SequenceGroup>> = &scheduler_outputs.scheduled;
             let seqs = scheduled[0].get_seqs();
 
-            #[cfg(feature = "nccl")]
+            #[cfg(feature = "eccl")]
             use rayon::iter::IntoParallelRefIterator;
-            #[cfg(feature = "nccl")]
+            #[cfg(feature = "eccl")]
             use rayon::iter::ParallelIterator;
-            #[cfg(feature = "nccl")]
+            #[cfg(feature = "eccl")]
             let vec_logits: HashMap<usize, Tensor> = self
                 .pipelines
                 .par_iter()
                 .map(|(rank, (pipeline, cache_engine))| {
                     let device = pipeline.device();
+                    //Not stable
+                    //TODO: fix this with 'context' instead of 'device' change 
+                    device.as_gcu_device().unwrap().bind_to_thread();
+                    // device.synchronize();
                     let PreparedInputs {
                         tokens,
                         positions,
@@ -227,7 +238,7 @@ impl LLMEngine {
                 })
                 .collect();
 
-            #[cfg(not(feature = "nccl"))]
+            #[cfg(not(feature = "eccl"))]
             let vec_logits: HashMap<usize, Tensor> = self
                 .pipelines
                 .iter()

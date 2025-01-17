@@ -108,8 +108,6 @@ struct CausalSelfAttention {
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
-    span: tracing::Span,
-    span_rot: tracing::Span,
     attn: PagedAttention,
     cos_sin_cache: Cache,
 }
@@ -168,7 +166,6 @@ impl CausalSelfAttention {
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        let _enter = self.span.enter();
         let (b_sz, seq_len, hidden_size) = x.dims3()?;
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
@@ -216,8 +213,6 @@ impl CausalSelfAttention {
     }
 
     fn load(vb: VarBuilder, cfg: &Config, dtype: DType, device: &Device) -> Result<Self> {
-        let span = tracing::span!(tracing::Level::TRACE, "attn");
-        let span_rot = tracing::span!(tracing::Level::TRACE, "attn-rot");
         let size_in = cfg.hidden_size;
         let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
         let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
@@ -263,8 +258,6 @@ impl CausalSelfAttention {
             num_attention_heads: cfg.num_attention_heads,
             num_key_value_heads: cfg.num_key_value_heads,
             head_dim,
-            span,
-            span_rot,
             attn: PagedAttention::new(
                 cfg.num_attention_heads,
                 head_dim,
@@ -284,18 +277,15 @@ struct Mlp {
     c_fc1: Linear,
     c_fc2: Linear,
     c_proj: Linear,
-    span: tracing::Span,
 }
 
 impl Mlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let _enter = self.span.enter();
         let x = (candle_nn::ops::silu(&self.c_fc1.forward(x)?)? * self.c_fc2.forward(x)?)?;
         self.c_proj.forward(&x)
     }
 
     fn load(vb: VarBuilder, dtype: DType, cfg: &Config) -> Result<Self> {
-        let span = tracing::span!(tracing::Level::TRACE, "mlp");
         let h_size = cfg.hidden_size;
         let i_size = cfg.intermediate_size;
         let c_fc1 = linear(
@@ -326,7 +316,6 @@ impl Mlp {
             c_fc1,
             c_fc2,
             c_proj,
-            span,
         })
     }
 }
@@ -336,7 +325,6 @@ struct Block {
     attn: CausalSelfAttention,
     rms_2: RmsNorm,
     mlp: Mlp,
-    span: tracing::Span,
 }
 
 impl Block {
@@ -348,7 +336,6 @@ impl Block {
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        let _enter = self.span.enter();
         let residual = x;
         let x = self.rms_1.forward(x)?;
         let x = (self
@@ -361,7 +348,6 @@ impl Block {
     }
 
     fn load(vb: VarBuilder, cfg: &Config, dtype: DType, device: &Device) -> Result<Self> {
-        let span = tracing::span!(tracing::Level::TRACE, "block");
         let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg, dtype, device)?;
         let mlp = Mlp::load(vb.pp("mlp"), dtype, cfg)?;
         let rms_1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
@@ -375,7 +361,6 @@ impl Block {
             attn,
             rms_2,
             mlp,
-            span,
         })
     }
 }
@@ -443,7 +428,12 @@ impl Llama {
         logits.to_dtype(DType::F32)
     }
 
-    pub fn load(vb: VarBuilder, cfg: &Config, dtype: DType, device: &Device) -> Result<Self> {
+    pub fn load(
+        vb: VarBuilder,
+        cfg: &Config,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
         let wte = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let lm_head = linear(
             cfg.hidden_size,

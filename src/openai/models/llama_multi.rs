@@ -7,7 +7,7 @@ use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_core as candle;
 use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
 use candle_nn::{Embedding, Linear, Module, RmsNorm};
-pub use cudarc::nccl::safe::{Comm, ReduceOp};
+pub use candle::gcu_backend::ubridge::eccl::{Comm, ReduceOp};
 pub const MAX_SEQ_LEN: usize = 4096;
 use crate::openai::models::TokenID;
 use std::iter::zip;
@@ -77,6 +77,7 @@ impl LlamaConfig {
 pub struct Cache {
     cos: Tensor,
     sin: Tensor,
+    cos_sin: Tensor,
 }
 
 impl Cache {
@@ -92,9 +93,10 @@ impl Cache {
             .to_dtype(DType::F32)?
             .reshape((config.max_seq_len, 1))?
             .matmul(&theta.reshape((1, theta.elem_count()))?)?;
+        let cos_sin = Tensor::cat(&[&idx_theta.cos()?, &idx_theta.sin()?], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
         let cos = idx_theta.cos()?.to_dtype(dtype)?;
         let sin = idx_theta.sin()?.to_dtype(dtype)?;
-        Ok(Self { cos, sin })
+        Ok(Self { cos, sin, cos_sin })
     }
 }
 
@@ -119,23 +121,49 @@ struct CausalSelfAttention {
 }
 
 impl CausalSelfAttention {
-    fn apply_rotary_emb(&self, x: &Tensor, input_positions: &[Vec<usize>]) -> Result<Tensor> {
-        let (b_sz, _, seq_len, _hidden_size) = x.dims4()?;
-        let mut embeds = Vec::new();
-        for (b, seqlen_offset) in zip(0..b_sz, input_positions) {
-            let cos = self
-                .cos_sin_cache
-                .cos
-                .narrow(0, seqlen_offset[0], seq_len)?;
-            let sin = self
-                .cos_sin_cache
-                .sin
-                .narrow(0, seqlen_offset[0], seq_len)?;
-            let x_b = x.narrow(0, b, 1)?;
-            let embed = candle_nn::rotary_emb::rope(&x_b, &cos, &sin).unwrap();
-            embeds.push(embed);
+    fn apply_rotary_emb_qkv(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        input_positions: &[Vec<usize>],
+    ) -> Result<(Tensor, Tensor)> {
+        let (b_sz, _h, seq_len, _n_embd) = q.dims4()?;
+        if q.device().is_gcu() {
+            let mut _input_positions = Vec::<i32>::new();
+            for seqlen_offset in input_positions {
+                _input_positions.push(seqlen_offset[0] as i32);
+            }
+            candle_nn::apply_rotary_emb_qkv(
+                &q,
+                &k,
+                &self.cos_sin_cache.cos_sin,
+                &self.cos_sin_cache.sin,
+                &_input_positions,
+                0,
+                true,
+                true,
+            )
+        } else {
+            let mut q_embeds = Vec::new();
+            let mut k_embeds = Vec::new();
+            for (b, seqlen_offset) in zip(0..b_sz, input_positions) {
+                let cos = self
+                    .cos_sin_cache
+                    .cos
+                    .narrow(0, seqlen_offset[0], seq_len)?;
+                let sin = self
+                    .cos_sin_cache
+                    .sin
+                    .narrow(0, seqlen_offset[0], seq_len)?;
+                let x_q = q.narrow(0, b, 1)?;
+                let x_k = k.narrow(0, b, 1)?;
+                let q_embed = candle_nn::rotary_emb::rope(&x_q, &cos, &sin).unwrap();
+                let k_embed = candle_nn::rotary_emb::rope(&x_k, &cos, &sin).unwrap();
+                q_embeds.push(q_embed);
+                k_embeds.push(k_embed);
+            }
+            Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
         }
-        Tensor::cat(&embeds, 0)
     }
 
     fn forward(
@@ -185,8 +213,7 @@ impl CausalSelfAttention {
             (q, k, v.contiguous()?)
         };
 
-        let q = self.apply_rotary_emb(&q, input_positions)?;
-        let k = self.apply_rotary_emb(&k, input_positions)?;
+        let (q, k) = self.apply_rotary_emb_qkv(&q, &k, input_positions)?;
 
         let y = self.attn.forward(
             &q,

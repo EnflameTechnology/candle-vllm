@@ -526,6 +526,7 @@ dependencies = [
  "hyper 0.14.29",
  "intel-mkl-src",
  "kernels",
+ "lazy_static",
  "metal 0.27.0",
  "metal-kernels",
  "rand",
@@ -924,6 +925,14 @@ checksum = "56e53799688f5632f364f8fb387488dd05db9fe45db7011be066fc20e7027f8b"
 dependencies = [
  "bytemuck",
  "reborrow",
+]
+
+[[package]]
+name = "eccl_raw"
+version = "0.1.1"
+dependencies = [
+ "libloading",
+ "tops_raw",
 ]
 
 [[package]]
@@ -3354,6 +3363,8 @@ dependencies = [
  "bitflags 1.3.2",
  "cust_core",
  "cust_derive",
+ "eccl_raw",
+ "libloading",
  "tops_raw",
  "uhal",
 ]
@@ -3457,6 +3468,7 @@ dependencies = [
  "cust_core",
  "float_eq 0.7.0",
  "gcu-kernels",
+ "half",
  "lazy_static",
  "num-traits",
  "once_cell",

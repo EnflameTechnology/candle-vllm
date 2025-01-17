@@ -1,3 +1,4 @@
+#![allow(unused_variables)]
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard},
@@ -100,6 +101,7 @@ impl CacheEngine {
             Self::calculate_value_block_shape(model_config, cache_config.block_size, num_shards);
         let mut gpu_cache = Vec::new();
         for _ in 0..model_config.num_hidden_layers {
+            #[cfg(not(feature = "gcu"))]
             let key_blocks = try_api!(Tensor::zeros(
                 (
                     cache_config.num_gpu_blocks.unwrap(),
@@ -111,7 +113,31 @@ impl CacheEngine {
                 dtype,
                 device,
             ));
+            #[cfg(not(feature = "gcu"))]
             let value_blocks = try_api!(Tensor::zeros(
+                (
+                    cache_config.num_gpu_blocks.unwrap(),
+                    value_block_shape.0,
+                    value_block_shape.1,
+                    value_block_shape.2,
+                ),
+                dtype,
+                device,
+            ));
+            #[cfg(feature = "gcu")]
+            let key_blocks = try_api!(Tensor::empty(
+                (
+                    cache_config.num_gpu_blocks.unwrap(),
+                    key_block_shape.0,
+                    key_block_shape.1,
+                    key_block_shape.2,
+                    key_block_shape.3,
+                ),
+                dtype,
+                device,
+            ));
+            #[cfg(feature = "gcu")]
+            let value_blocks = try_api!(Tensor::empty(
                 (
                     cache_config.num_gpu_blocks.unwrap(),
                     value_block_shape.0,

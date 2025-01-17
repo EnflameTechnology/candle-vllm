@@ -531,7 +531,17 @@ pub fn hub_load_local_safetensors(
     Ok(safetensors_files)
 }
 
+use lazy_static::lazy_static;
+use std::sync::Mutex;
+
+// Define a global Mutex
+lazy_static! {
+    static ref GLOBAL_LOCK: Mutex<()> = Mutex::new(());
+}
+
+//Avoid new_device in parallel
 pub fn new_device(ordinal: usize) -> Result<Device> {
+    let _guard = GLOBAL_LOCK.lock().unwrap(); // Acquire the lock
     if cuda_is_available() {
         use candle_core::CudaDevice;
         let device = Device::Cuda(CudaDevice::new_with_stream(ordinal).unwrap());
@@ -547,7 +557,13 @@ pub fn new_device(ordinal: usize) -> Result<Device> {
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
+            #[cfg(not(feature = "gcu"))]
             println!("Running on CPU, to run on GPU, build this example with `--features cuda`");
+
+            #[cfg(feature = "gcu")]
+            println!("Cuda not available, Running on GCU!");
+            #[cfg(feature = "gcu")]
+            return Device::new_gcu(ordinal);
         }
         Ok(Device::Cpu)
     }

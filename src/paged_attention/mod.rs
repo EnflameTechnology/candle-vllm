@@ -20,7 +20,6 @@ pub struct PagedAttention {
     sliding_window: Option<usize>,
     num_queries_per_kv: usize,
     alibi_slopes: Option<Tensor>,
-    stream: *const c_void,
 }
 
 impl PagedAttention {
@@ -35,14 +34,6 @@ impl PagedAttention {
     ) -> Result<Self> {
         let num_key_value_heads = num_key_value_heads.unwrap_or(num_attention_heads);
         let num_queries_per_kv = num_attention_heads / num_key_value_heads;
-
-        let stream = match &device {
-            Device::Gcu(d) => {
-                d.gcu_device().stream_inner().expect("unable to obtain stream")
-            }
-            _ => std::ptr::null(),
-        };
-
         let alibi_slopes = if let Some(alibi_slopes) = alibi_slopes {
             Some(Tensor::new(alibi_slopes, &device)?)
         } else {
@@ -56,7 +47,6 @@ impl PagedAttention {
             sliding_window,
             num_queries_per_kv,
             alibi_slopes,
-            stream: stream as *const c_void,
         })
     }
 
@@ -163,7 +153,6 @@ impl PagedAttention {
                 key_cache.as_ref().unwrap(),
                 value_cache.as_ref().unwrap(),
                 &slot_mapping,
-                self.stream,
             )?;
         }
 
@@ -194,7 +183,6 @@ impl PagedAttention {
             None,
             input_metadata.max_context_len.unwrap(),
             self.scale,
-            self.stream,
             softcapping.unwrap_or(1.0f64) as f32,
         )
     }
