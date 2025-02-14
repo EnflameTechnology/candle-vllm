@@ -94,3 +94,4 @@ use std::{
 };
 
 use crate::openai::responses::APIError;
+pub mod custom_ops;
