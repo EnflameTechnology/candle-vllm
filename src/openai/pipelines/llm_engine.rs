@@ -38,7 +38,7 @@ struct PreparedInputs {
     metadata: InputMetadata,
 }
 
-const _PAD_SLOT_ID: i64 = -1;
+const _PAD_SLOT_ID: i32 = -1;
 
 pub struct LLMEngine {
     pipelines: HashMap<usize, (Box<DefaultPipeline>, CacheEngine)>,
@@ -180,7 +180,10 @@ impl LLMEngine {
     pub fn bind_to_thread(&self) {
         let pipeline = self.get_pipeline(0).unwrap().0.as_ref();
         let device = pipeline.device();
-        device.as_gcu_device().unwrap().bind_to_thread();
+        match device {
+            Device::Gcu(dev) => dev.bind_to_thread(),
+            _ => Ok(()),
+        };
     }
 
     pub fn generate_once(
@@ -211,7 +214,7 @@ impl LLMEngine {
                 .map(|(rank, (pipeline, cache_engine))| {
                     let device = pipeline.device();
                     //Not stable
-                    //TODO: fix this with 'context' instead of 'device' change 
+                    //TODO: fix this with 'context' instead of 'device' change
                     device.as_gcu_device().unwrap().bind_to_thread();
                     // device.synchronize();
                     let PreparedInputs {
@@ -485,7 +488,7 @@ impl LLMEngine {
                         table.get(i / self.cache_config.block_size).unwrap()
                     };
                     let block_offset = i % self.cache_config.block_size;
-                    let slot = block_number * self.cache_config.block_size + block_offset;
+                    let slot = (block_number * self.cache_config.block_size + block_offset) as i32;
                     slot_mapping.push(slot.try_into().unwrap());
                 }
                 slot_mappings.push(slot_mapping);
@@ -563,7 +566,7 @@ impl LLMEngine {
                 };
                 let block_offset = position % self.cache_config.block_size;
                 let slot = block_number * self.cache_config.block_size + block_offset;
-                let slot = slot.try_into().unwrap();
+                let slot: i32 = slot.try_into().unwrap();
                 slot_mappings.push(vec![slot]);
 
                 if let Some(sliding_window) = self.config.sliding_window {

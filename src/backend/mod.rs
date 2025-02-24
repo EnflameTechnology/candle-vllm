@@ -2,7 +2,6 @@
 mod cache;
 #[cfg(not(feature = "gcu"))]
 pub mod gptq;
-#[cfg(not(feature = "gcu"))]
 mod paged_attention;
 #[cfg(feature = "cuda")]
 pub fn get_or_load_func(
@@ -80,11 +79,8 @@ use candle_core::{
 use candle_core::DType;
 #[cfg(not(feature = "gcu"))]
 pub use gptq::*;
-#[cfg(not(feature = "gcu"))]
-pub use paged_attention::*;
 
-#[cfg(feature = "gcu")]
-pub use candle_paged_attention::*;
+pub use paged_attention::*;
 
 pub use std::ops::Deref;
 #[cfg(feature = "cuda")]

@@ -1,6 +1,8 @@
 use candle::backend::BackendStorage;
 #[cfg(feature = "cuda")]
 use candle::CudaStorage;
+#[cfg(feature = "gcu")]
+use candle::GcuStorage;
 #[cfg(feature = "metal")]
 use candle::MetalStorage;
 use candle::{CpuStorage, DType, Layout, Result, Shape, Storage, Tensor};
@@ -492,6 +494,38 @@ impl candle::CustomOp1 for PagedAttention {
             dt => candle::bail!("paged-attention is only supported for f32/f16/bf16 ({dt:?})"),
         }
     }
+    #[cfg(feature = "gcu")]
+    fn gcu_fwd(&self, q: &GcuStorage, q_l: &Layout) -> Result<(GcuStorage, Shape)> {
+        match q.dtype() {
+            DType::F16 => candle_nn::ops::paged_attention::<f16>(
+                q,
+                q_l,
+                &self.key_cache,
+                &self.value_cache,
+                &self.block_tables,
+                &self.context_lens,
+                self.alibi_slopes.as_ref(),
+                self.max_context_len,
+                self.softmax_scale,
+                self.softcapping,
+            ),
+            DType::BF16 => candle_nn::ops::paged_attention::<bf16>(
+                q,
+                q_l,
+                &self.key_cache,
+                &self.value_cache,
+                &self.block_tables,
+                &self.context_lens,
+                self.alibi_slopes.as_ref(),
+                self.max_context_len,
+                self.softmax_scale,
+                self.softcapping,
+            ),
+            dt => {
+                candle::bail!("reshape_and_cache is only supported for f16 and bf16 ({dt:?})")
+            }
+        }
+    }
 }
 
 /// Paged Attention layer.
@@ -894,11 +928,15 @@ pub fn reshape_and_cache(
     value_cache: &Tensor,
     slot_mapping: &Tensor,
 ) -> Result<()> {
+    #[cfg(feature = "gcu")]
+    return candle_nn::ops::reshape_and_cache(key, value, key_cache, value_cache, slot_mapping);
+    #[cfg(not(feature = "gcu"))]
     let op = ReshapeCache {
         value: value.to_owned(),
         key_cache: key_cache.to_owned(),
         value_cache: value_cache.to_owned(),
         slot_mapping: slot_mapping.to_owned(),
     };
+    #[cfg(not(feature = "gcu"))]
     key.inplace_op1(&op)
 }

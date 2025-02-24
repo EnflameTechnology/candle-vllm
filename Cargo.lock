@@ -467,18 +467,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "candle-paged-attention"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "candle-core 0.8.1",
- "half",
- "num_cpus",
- "rayon",
- "ubridge",
-]
-
-[[package]]
 name = "candle-transformers"
 version = "0.8.1"
 dependencies = [
@@ -510,7 +498,6 @@ dependencies = [
  "candle-examples",
  "candle-flash-attn",
  "candle-nn",
- "candle-paged-attention",
  "candle-transformers",
  "clap",
  "cudarc",
@@ -530,6 +517,7 @@ dependencies = [
  "metal 0.27.0",
  "metal-kernels",
  "minijinja",
+ "once_cell",
  "rand",
  "range-checked",
  "rayon",

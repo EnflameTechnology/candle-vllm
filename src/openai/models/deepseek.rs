@@ -84,6 +84,7 @@ pub struct DeepSeekConfig {
 pub struct DeepSeekV2RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
+    cos_sin: Tensor,
 }
 
 impl DeepSeekConfig {
@@ -173,8 +174,9 @@ impl DeepSeekV2RotaryEmbedding {
 
         let sin = freqs.sin()?.to_dtype(dtype)?.to_device(dev)?;
         let cos = freqs.cos()?.to_dtype(dtype)?.to_device(dev)?;
+        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
 
-        Ok(Self { sin, cos })
+        Ok(Self { sin, cos, cos_sin })
     }
 
     fn yarn_find_correction_dim(
@@ -268,8 +270,9 @@ impl DeepSeekV2RotaryEmbedding {
         let cos = (freqs.cos()? * mscale as f64)?
             .to_dtype(dtype)?
             .to_device(dev)?;
+        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
 
-        Ok(Self { sin, cos })
+        Ok(Self { sin, cos, cos_sin })
     }
 
     pub fn new(cfg: &DeepSeekV2RopeConfig, dtype: DType, dev: &Device) -> Result<Self> {
@@ -308,19 +311,36 @@ impl DeepSeekV2RotaryEmbedding {
         input_positions: &[Vec<usize>],
     ) -> Result<(Tensor, Tensor)> {
         let (batch, _h, seq_len, _n_embd) = q.dims4()?;
-        let mut q_embeds = Vec::new();
-        let mut k_embeds = Vec::new();
-        for (b, seqlen_offset) in zip(0..batch, input_positions) {
-            let sin = self.sin.narrow(0, seqlen_offset[0], seq_len)?;
-            let cos = self.cos.narrow(0, seqlen_offset[0], seq_len)?;
-            let q_cur = q.narrow(0, b, 1)?;
-            let k_cur = k.narrow(0, b, 1)?;
-            let q_embed = candle_nn::rotary_emb::rope_i(&q_cur.contiguous()?, &cos, &sin)?;
-            let k_embed = candle_nn::rotary_emb::rope_i(&k_cur.contiguous()?, &cos, &sin)?;
-            q_embeds.push(q_embed);
-            k_embeds.push(k_embed);
+        if q.device().is_gcu() {
+            let mut _input_positions = Vec::<i32>::new();
+            for seqlen_offset in input_positions {
+                _input_positions.push(seqlen_offset[0] as i32);
+            }
+            candle_nn::apply_rotary_emb_qkv(
+                &q,
+                &k,
+                &self.cos_sin,
+                &self.sin,
+                &_input_positions,
+                0,
+                true,
+                false,
+            )
+        } else {
+            let mut q_embeds = Vec::new();
+            let mut k_embeds = Vec::new();
+            for (b, seqlen_offset) in zip(0..batch, input_positions) {
+                let sin = self.sin.narrow(0, seqlen_offset[0], seq_len)?;
+                let cos = self.cos.narrow(0, seqlen_offset[0], seq_len)?;
+                let q_cur = q.narrow(0, b, 1)?.contiguous()?;
+                let k_cur = k.narrow(0, b, 1)?.contiguous()?;
+                let q_embed = candle_nn::rotary_emb::rope_i(&q_cur, &cos, &sin)?;
+                let k_embed = candle_nn::rotary_emb::rope_i(&k_cur, &cos, &sin)?;
+                q_embeds.push(q_embed);
+                k_embeds.push(k_embed);
+            }
+            Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
         }
-        Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
     }
 }
 
