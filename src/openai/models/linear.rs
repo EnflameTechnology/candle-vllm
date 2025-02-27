@@ -29,7 +29,8 @@ use crate::candle::{
     DType, Device, Result, Tensor,
 };
 use candle_core::quantized;
-use candle_nn::init;
+pub use candle_nn::var_builder::Shard;
+pub use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
 use either::Either;
 use std::sync::Arc;
 
@@ -135,15 +136,9 @@ impl Module for Linear {
     #[cfg(feature = "gcu")]
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = match *x.dims() {
-            [b1, b2, _, _] => {
-                x.matmul(&self.weight.broadcast_left((b1, b2))?.t()?)?
-            }
-            [bsize, _, _] => {
-                x.matmul(&self.weight.broadcast_left(bsize)?.t()?)?
-            }
-            _ => {
-                x.matmul(&self.weight.t()?)?
-            }
+            [b1, b2, _, _] => x.matmul(&self.weight.broadcast_left((b1, b2))?.t()?)?,
+            [bsize, _, _] => x.matmul(&self.weight.broadcast_left(bsize)?.t()?)?,
+            _ => x.matmul(&self.weight.t()?)?,
         };
 
         match &self.bias {
@@ -153,45 +148,41 @@ impl Module for Linear {
     }
 }
 
-/// Create or initialize a new linear layer.
-///
-/// This uses some default names for weights and biases, namely `"weight"` and `"bias"`.
-pub fn linear(in_dim: usize, out_dim: usize, vb: candle_nn::VarBuilder) -> Result<Linear> {
-    let init_ws = init::DEFAULT_KAIMING_NORMAL;
-    let ws = vb.get_with_hints((out_dim, in_dim), "weight", init_ws)?;
-    let bound = 1. / (in_dim as f64).sqrt();
-    let init_bs = init::Init::Uniform {
-        lo: -bound,
-        up: bound,
-    };
-    let bs = vb.get_with_hints(out_dim, "bias", init_bs)?;
-    Ok(Linear::new(ws, Some(bs)))
+pub fn linear_no_bias(
+    in_dim: usize,
+    out_dim: usize,
+    vb: VarBuilder,
+    shard: Shard,
+) -> Result<Linear> {
+    let weight = vb.get_with_hints((out_dim, in_dim), "weight", shard)?;
+    Ok(Linear::new(weight, None))
 }
 
-/// Create or initialize a new linear layer without biases.
-pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: candle_nn::VarBuilder) -> Result<Linear> {
-    let init_ws = init::DEFAULT_KAIMING_NORMAL;
-    let ws = vb.get_with_hints((out_dim, in_dim), "weight", init_ws)?;
-    Ok(Linear::new(ws, None))
+pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder, shard: Shard) -> Result<Linear> {
+    let ws = vb.get_with_hints((out_dim, in_dim), "weight", shard)?;
+    let bs = vb.get((out_dim,), "bias")?;
+    Ok(Linear::new(ws, Some(bs)))
 }
 
 pub fn linear_b(
     in_dim: usize,
     out_dim: usize,
     bias: bool,
-    vb: candle_nn::VarBuilder,
+    vb: VarBuilder,
+    shard: Shard,
 ) -> Result<Linear> {
     if bias {
-        linear(in_dim, out_dim, vb)
+        linear(in_dim, out_dim, vb, shard)
     } else {
-        linear_no_bias(in_dim, out_dim, vb)
+        linear_no_bias(in_dim, out_dim, vb, shard)
     }
 }
 
 pub fn qlinear(
     in_dim: usize,
     out_dim: usize,
-    vb: candle_nn::VarBuilder,
+    vb: VarBuilder,
+    shard: Shard,
     quant_config: &Option<QuantConfig>,
     bias: bool,
     dtype: DType,
@@ -222,28 +213,31 @@ pub fn qlinear(
                 (DType::U32, 32 / cfg.bits)
             };
 
-            let (actual_in_dim, actual_out_dim, weight_name) = 
-            if cfg.bits == 4 {
-                (in_dim / pack_factor, 
-                out_dim, //enflame format (w4a16), transposed (kn format)
-                "qweight"
+            let (actual_in_dim, actual_out_dim, weight_name) = if cfg.bits == 4 {
+                (
+                    in_dim / pack_factor,
+                    out_dim, //enflame format (w4a16), transposed (kn format)
+                    "qweight",
                 )
             } else {
-                (out_dim * if marlin_format { 2 } else { 1 }, //enflame format (w8a16), nk format
-                in_dim / pack_factor / if marlin_format { 2 } else { 1 }, "qweight"
+                (
+                    out_dim * if marlin_format { 2 } else { 1 }, //enflame format (w8a16), nk format
+                    in_dim / pack_factor / if marlin_format { 2 } else { 1 },
+                    "qweight",
                 )
             };
 
             let ws = vb.get_with_hints_dtype(
-                (
-                    actual_in_dim,
-                    actual_out_dim,
-                ),
+                (actual_in_dim, actual_out_dim),
                 if marlin_format { "B" } else { weight_name },
                 Default::default(),
                 wtype,
             )?;
-            let ws = if cfg.bits == 4 { ws.t()?.contiguous()? } else { ws };
+            let ws = if cfg.bits == 4 {
+                ws.t()?.contiguous()?
+            } else {
+                ws
+            };
             let scale_and_zero_size = in_dim / (cfg.group_size as usize);
             let scales = vb.get_with_hints_dtype(
                 (scale_and_zero_size, out_dim),
@@ -285,7 +279,11 @@ pub fn qlinear(
                         (scale_and_zero_size, out_dim),
                         "qzeros",
                         Default::default(),
-                        if scales.device().is_gcu() { DType::F16 } else { DType::U32 },
+                        if scales.device().is_gcu() {
+                            DType::F16
+                        } else {
+                            DType::U32
+                        },
                     )?;
 
                     let qzeros = if qzeros.device().is_gcu() {
@@ -297,15 +295,22 @@ pub fn qlinear(
                 } else {
                     None
                 };
-                
-                let g_idx = if cfg.bits == 4 && !scales.device().is_gcu(){ //we removed g_idx in gcu platform since we repacked the weights
-                    let g_idx = vb.get_with_hints_dtype((in_dim,), "g_idx", Default::default(), DType::U32)?;
+
+                let g_idx = if cfg.bits == 4 && !scales.device().is_gcu() {
+                    //we removed g_idx in gcu platform since we repacked the weights
+                    let g_idx = vb.get_with_hints_dtype(
+                        (in_dim,),
+                        "g_idx",
+                        Default::default(),
+                        DType::U32,
+                    )?;
                     Some(g_idx)
                 } else {
                     None
                 };
 
-                if ws.device().is_gcu() || !cfg.sym
+                if ws.device().is_gcu()
+                    || !cfg.sym
                     || cfg.bits != 4
                     || (cfg.group_size != 128 && cfg.group_size != -1)
                     || (cfg.desc_act.is_some() && cfg.desc_act.unwrap() == true)
@@ -397,10 +402,11 @@ pub fn qlinear(
                 }
             }
         }
-        None => linear_b(in_dim, out_dim, bias, vb),
+        None => linear_b(in_dim, out_dim, bias, vb, shard),
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct QLinear {
     inner: QMatMul,
@@ -520,7 +526,11 @@ impl QLinear {
         match quant_config {
             Some(cfg) => {
                 assert!(
-                    cfg.quant_method == "gptq" || cfg.quant_method == "w8a16"  || quant == "w8a16" || cfg.quant_method == "marlin" || quant == "marlin"
+                    cfg.quant_method == "gptq"
+                        || cfg.quant_method == "w8a16"
+                        || quant == "w8a16"
+                        || cfg.quant_method == "marlin"
+                        || quant == "marlin"
                 );
                 QLinear::from_linear(linear, cfg.group_size as i32, cfg.bits as i32)
             }
@@ -735,15 +745,40 @@ impl Module for QLinear {
                 let x = match *x.dims() {
                     [b1, b2, _, _] => {
                         let qw = qw.broadcast_left((b1, b2))?.t()?;
-                        gptq_matmul(&x, &qw, scale, qzeros, g_idx, workspace, self.bits, self.group_size)?
+                        gptq_matmul(
+                            &x,
+                            &qw,
+                            scale,
+                            qzeros,
+                            g_idx,
+                            workspace,
+                            self.bits,
+                            self.group_size,
+                        )?
                     }
                     [bsize, _, _] => {
                         let qw = qw.broadcast_left(bsize)?.t()?;
-                        gptq_matmul(&x, &qw, scale, qzeros, g_idx, workspace, self.bits, self.group_size)?
+                        gptq_matmul(
+                            &x,
+                            &qw,
+                            scale,
+                            qzeros,
+                            g_idx,
+                            workspace,
+                            self.bits,
+                            self.group_size,
+                        )?
                     }
-                    _ => {
-                        gptq_matmul(&x, &qw.t()?, scale, qzeros, g_idx, workspace, self.bits, self.group_size)?
-                    }
+                    _ => gptq_matmul(
+                        &x,
+                        &qw.t()?,
+                        scale,
+                        qzeros,
+                        g_idx,
+                        workspace,
+                        self.bits,
+                        self.group_size,
+                    )?,
                 };
 
                 if let Some(bias) = &self.bias {
@@ -753,11 +788,8 @@ impl Module for QLinear {
                 }
             }
             _ => self.forward_no_dequant(x),
-
         }
-        
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -795,28 +827,21 @@ impl LinearX {
 pub fn linear_x(
     in_dim: usize,
     out_dim: usize,
-    vb: candle_nn::VarBuilder,
+    vb: VarBuilder,
+    shard: Shard,
     quant: &Option<String>,
     quant_config: &Option<QuantConfig>,
     dtype: DType,
 ) -> Result<LinearX> {
     if let Some(quatized_type) = quant {
-        let ln = qlinear(in_dim, out_dim, vb, quant_config, true, dtype).unwrap();
+        let ln = qlinear(in_dim, out_dim, vb, shard, quant_config, true, dtype).unwrap();
         Ok(LinearX(Either::Right(QLinear::from_linear_x(
             ln,
             quatized_type.clone(),
             quant_config,
         ))))
     } else {
-        let init_ws = init::DEFAULT_KAIMING_NORMAL;
-        let ws = vb.get_with_hints((out_dim, in_dim), "weight", init_ws)?;
-        let bound = 1. / (in_dim as f64).sqrt();
-        let init_bs = init::Init::Uniform {
-            lo: -bound,
-            up: bound,
-        };
-        let bs = vb.get_with_hints(out_dim, "bias", init_bs)?;
-        let ln = Linear::new(ws, Some(bs));
+        let ln = linear(in_dim, out_dim, vb, shard).unwrap();
         Ok(LinearX(Either::Left(ln)))
     }
 }
@@ -824,21 +849,21 @@ pub fn linear_x(
 pub fn linear_no_bias_x(
     in_dim: usize,
     out_dim: usize,
-    vb: candle_nn::VarBuilder,
+    vb: VarBuilder,
+    shard: Shard,
     quant: &Option<String>,
     quant_config: &Option<QuantConfig>,
     dtype: DType,
 ) -> Result<LinearX> {
     if let Some(quatized_type) = quant {
-        let ln = qlinear(in_dim, out_dim, vb, quant_config, false, dtype).unwrap();
+        let ln = qlinear(in_dim, out_dim, vb, shard, quant_config, false, dtype).unwrap();
         Ok(LinearX(Either::Right(QLinear::from_linear_x(
             ln,
             quatized_type.clone(),
             quant_config,
         ))))
     } else {
-        let init_ws = init::DEFAULT_KAIMING_NORMAL;
-        let ws = vb.get_with_hints((out_dim, in_dim), "weight", init_ws)?;
+        let ws = vb.get_with_hints((out_dim, in_dim), "weight", shard)?;
         let ln = Linear::new(ws, None);
         Ok(LinearX(Either::Left(ln)))
     }
@@ -848,14 +873,15 @@ pub fn linear_b_x(
     in_dim: usize,
     out_dim: usize,
     bias: bool,
-    vb: candle_nn::VarBuilder,
+    vb: VarBuilder,
+    shard: Shard,
     quant: &Option<String>,
     quant_config: &Option<QuantConfig>,
     dtype: DType,
 ) -> Result<LinearX> {
     if bias {
-        linear_x(in_dim, out_dim, vb, quant, quant_config, dtype)
+        linear_x(in_dim, out_dim, vb, shard, quant, quant_config, dtype)
     } else {
-        linear_no_bias_x(in_dim, out_dim, vb, quant, quant_config, dtype)
+        linear_no_bias_x(in_dim, out_dim, vb, shard, quant, quant_config, dtype)
     }
 }

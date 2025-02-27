@@ -22,6 +22,10 @@ use crate::{
 use candle_core::{Device, Tensor};
 use either::Either;
 use flume::Sender;
+#[cfg(feature = "eccl")]
+use rayon::iter::IntoParallelRefIterator;
+#[cfg(feature = "eccl")]
+use rayon::iter::ParallelIterator;
 use std::time::SystemTime;
 use std::{
     collections::{HashMap, VecDeque},
@@ -204,49 +208,18 @@ impl LLMEngine {
             let seqs = scheduled[0].get_seqs();
 
             #[cfg(feature = "eccl")]
-            use rayon::iter::IntoParallelRefIterator;
-            #[cfg(feature = "eccl")]
-            use rayon::iter::ParallelIterator;
-            #[cfg(feature = "eccl")]
-            let vec_logits: HashMap<usize, Tensor> = self
-                .pipelines
-                .par_iter()
+            let iterator = self.pipelines.par_iter();
+            #[cfg(not(feature = "eccl"))]
+            let iterator = self.pipelines.iter();
+
+            let vec_logits: HashMap<usize, Tensor> = iterator
                 .map(|(rank, (pipeline, cache_engine))| {
                     let device = pipeline.device();
                     //Not stable
                     //TODO: fix this with 'context' instead of 'device' change
+                    #[cfg(not(feature = "eccl"))]
                     device.as_gcu_device().unwrap().bind_to_thread();
-                    // device.synchronize();
-                    let PreparedInputs {
-                        tokens,
-                        positions,
-                        metadata,
-                    } = if seqs.values().nth(0).unwrap().deref().is_prompt() {
-                        self.prepare_prompt(scheduled, device)
-                    } else {
-                        self.prepare_decode(scheduled, device)
-                    }
-                    .unwrap();
-                    (
-                        *rank,
-                        pipeline
-                            .forward(
-                                tokens,
-                                &positions,
-                                Some(&*cache_engine.get_kv_cache()),
-                                &metadata,
-                            )
-                            .unwrap(),
-                    )
-                })
-                .collect();
 
-            #[cfg(not(feature = "eccl"))]
-            let vec_logits: HashMap<usize, Tensor> = self
-                .pipelines
-                .iter()
-                .map(|(rank, (pipeline, cache_engine))| {
-                    let device = pipeline.device();
                     let PreparedInputs {
                         tokens,
                         positions,

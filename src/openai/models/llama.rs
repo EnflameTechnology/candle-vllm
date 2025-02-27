@@ -1,13 +1,15 @@
 use super::{Config, QuantConfig};
-use crate::openai::models::linear::{linear_no_bias_x as linear, LinearX as Linear};
+use crate::openai::models::linear::{
+    linear_no_bias_x as linear, LinearX as Linear, Shard, VarBuilder,
+};
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
 use crate::SpecificConfig;
 use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_core as candle;
-use candle_nn::{embedding, Embedding, Module, VarBuilder};
-use candle_transformers::models::with_tracing::RmsNorm;
+use candle_nn::{Embedding, Module, RmsNorm};
 pub const MAX_SEQ_LEN: usize = 4096;
+use crate::openai::distributed::{embedding, rms_norm};
 use crate::openai::models::TokenID;
 use std::iter::zip;
 pub use std::rc::Rc;
@@ -221,6 +223,7 @@ impl CausalSelfAttention {
             size_in,
             size_q,
             vb.pp("q_proj"),
+            Shard::default(),
             &cfg.specific_config.quant,
             &cfg.quantization_config,
             dtype,
@@ -229,6 +232,7 @@ impl CausalSelfAttention {
             size_in,
             size_kv,
             vb.pp("k_proj"),
+            Shard::default(),
             &cfg.specific_config.quant,
             &cfg.quantization_config,
             dtype,
@@ -237,6 +241,7 @@ impl CausalSelfAttention {
             size_in,
             size_kv,
             vb.pp("v_proj"),
+            Shard::default(),
             &cfg.specific_config.quant,
             &cfg.quantization_config,
             dtype,
@@ -245,6 +250,7 @@ impl CausalSelfAttention {
             size_q,
             size_in,
             vb.pp("o_proj"),
+            Shard::default(),
             &cfg.specific_config.quant,
             &cfg.quantization_config,
             dtype,
@@ -293,6 +299,7 @@ impl Mlp {
             h_size,
             i_size,
             vb.pp("gate_proj"),
+            Shard::default(),
             &cfg.specific_config.quant,
             &cfg.quantization_config,
             dtype,
@@ -301,6 +308,7 @@ impl Mlp {
             h_size,
             i_size,
             vb.pp("up_proj"),
+            Shard::default(),
             &cfg.specific_config.quant,
             &cfg.quantization_config,
             dtype,
@@ -309,6 +317,7 @@ impl Mlp {
             i_size,
             h_size,
             vb.pp("down_proj"),
+            Shard::default(),
             &cfg.specific_config.quant,
             &cfg.quantization_config,
             dtype,
@@ -351,8 +360,8 @@ impl Block {
     fn load(vb: VarBuilder, cfg: &Config, dtype: DType, device: &Device) -> Result<Self> {
         let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg, dtype, device)?;
         let mlp = Mlp::load(vb.pp("mlp"), dtype, cfg)?;
-        let rms_1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let rms_2 = RmsNorm::new(
+        let rms_1 = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let rms_2 = rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
@@ -429,22 +438,18 @@ impl Llama {
         logits.to_dtype(DType::F32)
     }
 
-    pub fn load(
-        vb: VarBuilder,
-        cfg: &Config,
-        dtype: DType,
-        device: &Device,
-    ) -> Result<Self> {
+    pub fn load(vb: VarBuilder, cfg: &Config, dtype: DType, device: &Device) -> Result<Self> {
         let wte = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let lm_head = linear(
             cfg.hidden_size,
             cfg.vocab_size,
             vb.pp("lm_head"),
+            Shard::default(),
             &None, //no quant for lm_head
             &None,
             dtype,
         )?;
-        let ln_f = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
+        let ln_f = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let blocks: Vec<_> = (0..cfg.num_hidden_layers)
             .map(|i| Block::load(vb.pp(&format!("model.layers.{i}")), cfg, dtype, device).unwrap())
             .collect();
