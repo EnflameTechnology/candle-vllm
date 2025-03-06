@@ -304,7 +304,6 @@ impl Attention {
             cfg.hidden_size,
             op_size,
             vb.pp("qkv_proj"),
-            Shard::default(),
             &cfg.specific_config.quant,
             &cfg.quantization_config,
         )?;
@@ -312,7 +311,6 @@ impl Attention {
             num_heads * head_dim,
             cfg.hidden_size,
             vb.pp("o_proj"),
-            Shard::default(),
             &cfg.specific_config.quant,
             &cfg.quantization_config,
         )?;

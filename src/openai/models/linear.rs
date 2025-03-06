@@ -235,7 +235,7 @@ pub fn qlinear(
                 wtype,
             )?;
             let ws = if vb.device().is_gcu() && cfg.bits == 4 {
-                ws.t()?.contiguous()?
+                ws.t()?.contiguous()?//convert to nk format
             } else {
                 ws
             };
@@ -323,7 +323,7 @@ pub fn qlinear(
                         },
                     )?;
 
-                    let qzeros = if qzeros.device().is_gcu() {
+                    let mut qzeros = if qzeros.device().is_gcu() {
                         qzeros.to_dtype(dtype)?
                     } else {
                         qzeros
@@ -346,7 +346,7 @@ pub fn qlinear(
 
                 let g_idx = if cfg.bits == 4 && !scales.device().is_gcu() {
                     //we removed g_idx in gcu platform since we repacked the weights
-                    let g_idx = vb.get_with_hints_dtype(
+                    let mut g_idx = vb.get_with_hints_dtype(
                         (in_dim,),
                         "g_idx",
                         Default::default(),
@@ -942,12 +942,16 @@ pub fn linear_no_bias_x(
 ) -> Result<LinearX> {
     if let Some(quatized_type) = quant {
         //quantized weight in k x n (shift dim in original shards)
+        //quantized weight in n x k (enflame format), no need to shift dim
         let ln = qlinear(
             in_dim,
             out_dim,
             vb,
             shard(
+                #[cfg(not(feature = "gcu"))]
                 if shards.dim == 1 { 0 } else { 1 },
+                #[cfg(feature = "gcu")]
+                shards.dim,
                 shards.rank,
                 shards.world_size,
             ),

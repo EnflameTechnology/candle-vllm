@@ -408,13 +408,14 @@ pub struct Phi2 {
     lm_head: ReplicatedLinear,
     cfg: Config,
     device: Device,
+    dtype: DType,
 }
 
 impl Phi2 {
     pub fn new(
         vb: VarBuilder,
         cfg: &Config,
-        _dtype: DType,
+        dtype: DType,
         device: &Device,
         comm: Rc<Comm>,
     ) -> Result<Self> {
@@ -447,6 +448,7 @@ impl Phi2 {
             lm_head,
             cfg: cfg.clone(),
             device: device.clone(),
+            dtype,
         })
     }
 
