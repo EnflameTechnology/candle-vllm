@@ -9,7 +9,8 @@ pub enum Messages {
     Literal(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
 pub enum StopTokens {
     Multi(Vec<String>),
     Single(String),

@@ -1,10 +1,7 @@
-#[cfg(feature = "eccl")]
 pub mod deepseek;
 pub mod gemma;
 pub mod linear;
 pub mod llama;
-#[cfg(feature = "eccl")]
-pub mod llama_multi;
 pub mod mistral;
 pub mod phi2;
 pub mod phi3;

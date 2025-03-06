@@ -28,6 +28,7 @@ use crate::candle::{
     quantized::{gguf_file, QMatMul, QTensor},
     DType, Device, Result, Tensor,
 };
+use crate::openai::distributed::shard;
 use candle_core::quantized;
 pub use candle_nn::var_builder::Shard;
 pub use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
@@ -182,7 +183,7 @@ pub fn qlinear(
     in_dim: usize,
     out_dim: usize,
     vb: VarBuilder,
-    shard: Shard,
+    shards: Shard,
     quant_config: &Option<QuantConfig>,
     bias: bool,
     dtype: DType,
@@ -233,27 +234,29 @@ pub fn qlinear(
                 Default::default(),
                 wtype,
             )?;
-            let ws = if cfg.bits == 4 {
+            let ws = if vb.device().is_gcu() && cfg.bits == 4 {
                 ws.t()?.contiguous()?
             } else {
                 ws
             };
+
+            let ws = if shards.world_size > 1 {
+                let dim_size = ws.dims()[shards.dim];
+                let start = shards.rank * (dim_size / shards.world_size);
+                ws.narrow(shards.dim, start, dim_size / shards.world_size)?
+                    .contiguous()?
+            } else {
+                ws
+            };
+
             let scale_and_zero_size = in_dim / (cfg.group_size as usize);
             let scales = vb.get_with_hints_dtype(
                 (scale_and_zero_size, out_dim),
                 if marlin_format { "s" } else { "scales" },
-                Default::default(),
+                shards,
                 DType::F16,
             )?;
 
-            let bs = if bias {
-                Some(
-                    vb.get_with_hints_dtype((out_dim,), "bias", Default::default(), DType::F16)?
-                        .to_dtype(dtype)?,
-                )
-            } else {
-                None
-            };
 
             let scales = if dtype != scales.dtype() {
                 scales.to_dtype(dtype)?
@@ -261,8 +264,42 @@ pub fn qlinear(
                 scales
             };
 
+            let in_dim_partition = if shards.world_size > 1 && shards.dim == 0 {
+                in_dim / shards.world_size
+            } else {
+                in_dim
+            };
+
+            let scale_and_zero_size_partition = if shards.world_size > 1 && shards.dim == 0 {
+                scale_and_zero_size / shards.world_size
+            } else {
+                scale_and_zero_size
+            };
+
+            let out_dim_partition = if shards.world_size > 1 && shards.dim == 1 {
+                out_dim / shards.world_size
+            } else {
+                out_dim
+            };
+
+            let bs = if bias {
+                let mut bs = vb
+                    .get_with_hints_dtype((out_dim,), "bias", Default::default(), DType::F16)?
+                    .to_dtype(dtype)?;
+                bs = if out_dim_partition < out_dim {
+                    bs.narrow(0, shards.rank * out_dim_partition, out_dim_partition)?
+                        .contiguous()?
+                } else {
+                    bs
+                };
+                Some(bs)
+            } else {
+                None
+            };
+
             if marlin_format {
-                let workspace = Tensor::zeros(out_dim / (32 / cfg.bits), DType::U32, vb.device())?;
+                let workspace =
+                    Tensor::zeros(out_dim_partition / (32 / cfg.bits), DType::U32, vb.device())?;
                 //marlin weight file
                 Ok(Linear {
                     weight: ws,
@@ -291,6 +328,17 @@ pub fn qlinear(
                     } else {
                         qzeros
                     };
+                    qzeros = if scale_and_zero_size_partition < scale_and_zero_size
+                        || out_dim_partition < out_dim
+                    {
+                        let dim_size = qzeros.dims()[shards.dim];
+                        let start = shards.rank * (dim_size / shards.world_size);
+                        qzeros
+                            .narrow(shards.dim, start, dim_size / shards.world_size)?
+                            .contiguous()?
+                    } else {
+                        qzeros
+                    };
                     Some(qzeros)
                 } else {
                     None
@@ -304,6 +352,13 @@ pub fn qlinear(
                         Default::default(),
                         DType::U32,
                     )?;
+                    g_idx = if in_dim_partition < in_dim {
+                        g_idx
+                            .narrow(0, shards.rank * in_dim_partition, in_dim_partition)?
+                            .contiguous()?
+                    } else {
+                        g_idx
+                    };
                     Some(g_idx)
                 } else {
                     None
@@ -380,8 +435,8 @@ pub fn qlinear(
                     let scales = if marlin_compatible {
                         marlin_permute_scales(
                             &scales,
-                            in_dim as usize,
-                            out_dim as usize,
+                            in_dim_partition as usize,
+                            out_dim_partition as usize,
                             cfg.group_size,
                             cfg.bits as u32,
                         )?
@@ -389,8 +444,11 @@ pub fn qlinear(
                         scales
                     };
 
-                    let workspace =
-                        Tensor::zeros(out_dim / (32 / cfg.bits), DType::U32, vb.device())?;
+                    let workspace = Tensor::zeros(
+                        out_dim_partition / (32 / cfg.bits),
+                        DType::U32,
+                        vb.device(),
+                    )?;
                     Ok(Linear {
                         weight: ws,
                         bias: bs,
@@ -402,7 +460,7 @@ pub fn qlinear(
                 }
             }
         }
-        None => linear_b(in_dim, out_dim, bias, vb, shard),
+        None => linear_b(in_dim, out_dim, bias, vb, shards),
     }
 }
 
@@ -710,13 +768,40 @@ impl Module for QLinear {
                 let x = match *x.dims() {
                     [bsize, seq_len, dim1, dim2] => {
                         let x = x.reshape((bsize * seq_len, dim1, dim2))?;
-                        let o = gptq_matmul(&x, qw, scale, qzeros, g_idx, workspace, self.bits)?;
+                        let o = gptq_matmul(
+                            &x,
+                            qw,
+                            scale,
+                            qzeros,
+                            g_idx,
+                            workspace,
+                            self.bits,
+                            self.group_size,
+                        )?;
                         o.reshape((bsize, seq_len, dim1, ()))?
                     }
-                    [_, _, _] => gptq_matmul(&x, qw, scale, qzeros, g_idx, workspace, self.bits)?,
+                    [_, _, _] => gptq_matmul(
+                        &x,
+                        qw,
+                        scale,
+                        qzeros,
+                        g_idx,
+                        workspace,
+                        self.bits,
+                        self.group_size,
+                    )?,
                     [seq_len, dim] => {
                         let x = x.reshape((1, seq_len, dim))?;
-                        let o = gptq_matmul(&x, qw, scale, qzeros, g_idx, workspace, self.bits)?;
+                        let o = gptq_matmul(
+                            &x,
+                            qw,
+                            scale,
+                            qzeros,
+                            g_idx,
+                            workspace,
+                            self.bits,
+                            self.group_size,
+                        )?;
                         o.reshape((seq_len, ()))?
                     }
                     _ => panic!("Invalid input format!"),
@@ -850,20 +935,35 @@ pub fn linear_no_bias_x(
     in_dim: usize,
     out_dim: usize,
     vb: VarBuilder,
-    shard: Shard,
+    shards: Shard,
     quant: &Option<String>,
     quant_config: &Option<QuantConfig>,
     dtype: DType,
 ) -> Result<LinearX> {
     if let Some(quatized_type) = quant {
-        let ln = qlinear(in_dim, out_dim, vb, shard, quant_config, false, dtype).unwrap();
+        //quantized weight in k x n (shift dim in original shards)
+        let ln = qlinear(
+            in_dim,
+            out_dim,
+            vb,
+            shard(
+                if shards.dim == 1 { 0 } else { 1 },
+                shards.rank,
+                shards.world_size,
+            ),
+            quant_config,
+            false,
+            dtype,
+        )
+        .unwrap();
         Ok(LinearX(Either::Right(QLinear::from_linear_x(
             ln,
             quatized_type.clone(),
             quant_config,
         ))))
     } else {
-        let ws = vb.get_with_hints((out_dim, in_dim), "weight", shard)?;
+        //weight in n x k (use original shards)
+        let ws = vb.get_with_hints((out_dim, in_dim), "weight", shards)?;
         let ln = Linear::new(ws, None);
         Ok(LinearX(Either::Left(ln)))
     }
