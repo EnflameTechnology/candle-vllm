@@ -10,7 +10,6 @@ use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_core as candle;
 use candle_nn::{Embedding, Module, RmsNorm};
 pub const MAX_SEQ_LEN: usize = 4096;
-use crate::openai::distributed::{embedding, rms_norm};
 use crate::openai::models::TokenID;
 use std::iter::zip;
 pub use std::rc::Rc;
