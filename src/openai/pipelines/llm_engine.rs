@@ -184,7 +184,7 @@ impl LLMEngine {
     pub fn bind_to_thread(&self) {
         let pipeline = self.get_pipeline(0).unwrap().0.as_ref();
         let device = pipeline.device();
-        match device {
+        let _ = match device {
             Device::Gcu(dev) => dev.bind_to_thread(),
             _ => Ok(()),
         };
@@ -217,7 +217,7 @@ impl LLMEngine {
                     let device = pipeline.device();
                     //Not stable
                     //TODO: fix this with 'context' instead of 'device' change
-                    #[cfg(not(feature = "eccl"))]
+                    #[cfg(feature = "eccl")]
                     device.as_gcu_device().unwrap().bind_to_thread();
 
                     let PreparedInputs {

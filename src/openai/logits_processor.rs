@@ -2,6 +2,7 @@
 use crate::backend::custom_ops::sort::ArgSortOp; //Use our custom sort kernel, fix kernel crash on A100
 use crate::candle::D;
 use crate::candle::{DType, Error, IndexOp, Result, Tensor};
+use candle_core::Device;
 use rand::{distributions::Distribution, SeedableRng};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -61,6 +62,8 @@ impl LogitsProcessor {
     /// probability top_p. This way we never sample tokens that have very low probabilities and are
     /// less likely to go "off the rails".
     fn sample_topp(&self, logits: &Tensor, top_p: f32) -> Result<u32> {
+        #[cfg(feature = "gcu")]
+        let logits = logits.to_device(&Device::Cpu)?;
         let mut prs: Vec<f32> = logits.to_vec1()?;
         #[cfg(feature = "cuda")]
         let argsort_indices: Vec<u32> = logits.arg_sort(false)?.to_vec1()?;
@@ -81,18 +84,24 @@ impl LogitsProcessor {
 
     // top-k sampling samples from the k tokens with the largest probabilities.
     fn sample_topk(&self, logits: &Tensor, top_k: usize) -> Result<u32> {
+        #[cfg(feature = "gcu")]
+        let (sorted, asort) = candle_nn::ops::topk(logits, top_k)?;
         #[cfg(feature = "cuda")]
         let (sorted, asort) = logits.sort(false)?;
-        #[cfg(not(feature = "cuda"))]
-        let (sorted, asort) = logits.sort_last_dim(false)?;
 
         if top_k >= *logits.layout().dims().last().unwrap() {
             let prs: Vec<f32> = sorted.to_vec1()?;
             self.sample_multinomial(&prs)
         } else {
-            let prs: Vec<f32> = sorted.to_vec1()?[0..top_k].to_vec();
+            let prs: Vec<f32> = sorted.to_vec1()?;
+            let indices: Vec<u32> = asort.to_vec1()?;
+
+            #[cfg(not(feature = "gcu"))]
+            let prs = prs[0..top_k].to_vec();
+            #[cfg(not(feature = "gcu"))]
+            let indices = indices[0..top_k].to_vec();
+
             let index = self.sample_multinomial(&prs)?;
-            let indices: Vec<u32> = asort.to_vec1()?[0..top_k].to_vec();
             Ok(indices[index as usize] as u32)
         }
     }
@@ -100,16 +109,22 @@ impl LogitsProcessor {
     // top-k sampling samples from the k tokens with the largest probabilities.
     // then top-p sampling.
     fn sample_topk_topp(&self, logits: &Tensor, top_k: usize, top_p: f32) -> Result<u32> {
+        #[cfg(feature = "gcu")]
+        let (sorted, asort) = candle_nn::ops::topk(logits, top_k)?;
         #[cfg(feature = "cuda")]
         let (sorted, asort) = logits.sort(false)?;
-        #[cfg(not(feature = "cuda"))]
-        let (sorted, asort) = logits.sort_last_dim(false)?;
         if top_k >= *logits.layout().dims().last().unwrap() {
             let prs: Vec<f32> = sorted.to_vec1()?;
             self.sample_multinomial(&prs)
         } else {
-            let indices: Vec<u32> = asort.to_vec1()?[0..top_k].to_vec();
-            let mut prs: Vec<f32> = sorted.to_vec1()?[0..top_k].to_vec();
+            let indices: Vec<u32> = asort.to_vec1()?;
+            let mut prs: Vec<f32> = sorted.to_vec1()?;
+
+            #[cfg(not(feature = "gcu"))]
+            let indices = indices[0..top_k].to_vec();
+            #[cfg(not(feature = "gcu"))]
+            let mut prs = prs[0..top_k].to_vec();
+
             let sum_p = prs.iter().sum::<f32>();
             let index = if top_p <= 0.0 || top_p >= sum_p {
                 self.sample_multinomial(&prs)?

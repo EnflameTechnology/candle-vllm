@@ -756,7 +756,7 @@ impl MoeGate {
             }
         };
 
-        if self.top_k > 1 && moe_cfg.norm_topk_prob {
+        if matches!(moe_cfg.scoring_func, ScoringFunc::Sigmoid) {
             let denominator = (topk_weight.sum_keepdim(D::Minus1)? + 1e-20)?;
             topk_weight = topk_weight.broadcast_div(&denominator)?;
         }

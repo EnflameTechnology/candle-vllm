@@ -2,7 +2,7 @@
 use super::sort::ArgSortOp; //use custom argsort which fixed the bugs on A100
 use candle::shape::Dim;
 use candle::{CpuStorage, CustomOp1, Error, Layout, Shape, WithDType};
-use candle::{Result, Tensor, D};
+use candle::{Result, Tensor, D, DType};
 use candle_core as candle;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 struct NonZero {}
@@ -92,12 +92,18 @@ pub trait TopKLastDimOp {
 impl TopKLastDimOp for Tensor {
     fn topk(&self, topk: usize) -> Result<TopKOutput> {
         // Sorted descending
-        #[cfg(feature = "cuda")]
-        let (values, sorted_indices) = self.sort(false)?;
-        #[cfg(not(feature = "cuda"))]
-        let (values, sorted_indices) = self.sort_last_dim(false)?;
-        let topk_indices = sorted_indices.narrow(D::Minus1, 0, topk)?.contiguous()?;
-        let topk_values = values.narrow(D::Minus1, 0, topk)?.contiguous()?;
+        let (topk_indices, topk_values) = if self.device().is_gcu() {
+            let (topk_values, topk_indices) = candle_nn::ops::topk(self, topk)?;
+            (topk_indices.contiguous()?, topk_values.contiguous()?)
+        } else {
+            #[cfg(feature = "cuda")]
+            let (values, sorted_indices) = self.sort(false)?;
+            #[cfg(not(feature = "cuda"))]
+            let (values, sorted_indices) = self.sort_last_dim(false)?;
+            let topk_indices = sorted_indices.narrow(D::Minus1, 0, topk)?.contiguous()?;
+            let topk_values = values.narrow(D::Minus1, 0, topk)?.contiguous()?;
+            (topk_indices, topk_values)
+        };
         Ok(TopKOutput {
             values: topk_values,
             indices: topk_indices,

@@ -1219,17 +1219,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gcu-kernels"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "glob",
- "num_cpus",
- "rayon",
- "reqwest 0.12.5",
-]
-
-[[package]]
 name = "gemm"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3464,13 +3453,17 @@ checksum = "42ff0bf0c66b8238c6f3b578df37d0b7848e55df8577b3f74f92a69acceeb825"
 name = "ubridge"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "cust_core",
  "float_eq 0.7.0",
- "gcu-kernels",
+ "glob",
  "half",
  "lazy_static",
  "num-traits",
+ "num_cpus",
  "once_cell",
+ "rayon",
+ "reqwest 0.12.5",
  "tops_backend",
  "uhal",
 ]
