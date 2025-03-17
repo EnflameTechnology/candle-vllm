@@ -215,17 +215,23 @@ pub fn qlinear(
             };
 
 
+            //enflame nk format
             let ws = vb.get_with_hints_dtype(
-                (in_dim / pack_factor, out_dim),
+                (out_dim, in_dim / pack_factor),
                 if marlin_format { "B" } else { "qweight" },
                 Default::default(),
                 wtype,
             )?;
 
             let ws = if shards.world_size > 1 {
-                let dim_size = ws.dims()[shards.dim];
+                let dim = if shards.dim == 1 {
+                    0
+                } else {
+                    1
+                };
+                let dim_size = ws.dims()[dim];
                 let start = shards.rank * (dim_size / shards.world_size);
-                ws.narrow(shards.dim, start, dim_size / shards.world_size)?
+                ws.narrow(dim, start, dim_size / shards.world_size)?
                     .contiguous()?
             } else {
                 ws
@@ -749,7 +755,7 @@ impl Module for QLinear {
                 let x = match *x.dims() {
                     [bsize, seq_len, dim1, dim2] => {
                         #[cfg(feature = "gcu")]
-                        let qw = &qw.broadcast_left((bsize, seq_len))?;
+                        let qw = &qw.broadcast_left((bsize, seq_len))?.t()?;
                         #[cfg(not(feature = "gcu"))]
                         let x = x.reshape((bsize * seq_len, dim1, dim2))?;
                         let o = gptq_matmul(
@@ -768,7 +774,7 @@ impl Module for QLinear {
                     }
                     [bsize, _, _] => {
                         #[cfg(feature = "gcu")]
-                        let qw = &qw.broadcast_left(bsize)?;
+                        let qw = &qw.broadcast_left(bsize)?.t()?;
                         gptq_matmul(
                             &x,
                             qw,
@@ -781,6 +787,8 @@ impl Module for QLinear {
                         )?
                     }
                     [seq_len, dim] => {
+                        #[cfg(feature = "gcu")]
+                        let qw = &qw.t()?;
                         #[cfg(not(feature = "gcu"))]
                         let x = x.reshape((1, seq_len, dim))?;
                         let o = gptq_matmul(

@@ -3,5 +3,5 @@ rustflags = ["-C", "target-cpu=native"]
 
 [env]
 ATOMIC_URL = "http://artifact.enflame.cn:80/artifactory/module_package/acore"
-ATOMIC_VERSION = "0a0342e"
-ATOMIC_TAG = "20250217"
+ATOMIC_VERSION = "01d7f5d"
+ATOMIC_TAG = "3.3.20250314"
