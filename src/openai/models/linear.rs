@@ -352,8 +352,8 @@ pub fn qlinear(
                     None
                 };
 
-                if ws.device().is_gcu()
-                    || !cfg.sym
+                if ws.device().is_gcu() 
+                    || (cfg.sym.is_some() && !cfg.sym.unwrap())
                     || cfg.bits != 4
                     || (cfg.group_size != 128 && cfg.group_size != -1)
                     || (cfg.desc_act.is_some() && cfg.desc_act.unwrap() == true)

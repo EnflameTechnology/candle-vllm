@@ -293,6 +293,9 @@ impl DefaultLoader {
                     let paths: Vec<PathBuf> = paths.get_weight_filenames();
                     let device = crate::new_device(*dev_id).unwrap();
                     #[cfg(feature = "eccl")]
+                    let _ = device.as_cuda_device().unwrap().bind_to_thread();
+
+                    #[cfg(feature = "eccl")]
                     let comm = Rc::new(
                         Comm::from_rank(
                             device.as_gcu_device().unwrap().gcu_device(),
@@ -720,6 +723,10 @@ impl DefaultPipeline {
             self.conversation.clear_message();
         }
         &mut self.conversation
+    }
+
+    pub fn get_past_conversation(&self) -> &dyn Conversation {
+        &self.conversation
     }
 
     pub fn get_model_config(&self) -> Config {

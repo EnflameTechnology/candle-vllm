@@ -215,6 +215,11 @@ impl TensorParallelRowLinear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let xs = self.linear.forward(x)?;
         #[cfg(feature = "eccl")]
+        {
+            let device = x.device();
+            let _ = device.as_gcu_device().unwrap().bind_to_thread();
+        }
+        #[cfg(feature = "eccl")]
         let xs = xs.apply_op1_no_bwd(&self.all_reduce)?;
 
         if let Some(bias) = &self.bias {
