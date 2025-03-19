@@ -2,7 +2,7 @@
 use super::sort::ArgSortOp; //use custom argsort which fixed the bugs on A100
 use candle::shape::Dim;
 use candle::{CpuStorage, CustomOp1, Error, Layout, Shape, WithDType};
-use candle::{Result, Tensor, D, DType};
+use candle::{DType, Result, Tensor, D};
 use candle_core as candle;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 struct NonZero {}

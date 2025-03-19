@@ -214,7 +214,6 @@ pub fn qlinear(
                 (DType::U32, 32 / cfg.bits)
             };
 
-
             //enflame nk format
             let ws = vb.get_with_hints_dtype(
                 (out_dim, in_dim / pack_factor),
@@ -224,11 +223,7 @@ pub fn qlinear(
             )?;
 
             let ws = if shards.world_size > 1 {
-                let dim = if shards.dim == 1 {
-                    0
-                } else {
-                    1
-                };
+                let dim = if shards.dim == 1 { 0 } else { 1 };
                 let dim_size = ws.dims()[dim];
                 let start = shards.rank * (dim_size / shards.world_size);
                 ws.narrow(dim, start, dim_size / shards.world_size)?
@@ -244,7 +239,6 @@ pub fn qlinear(
                 shards,
                 DType::F16,
             )?;
-
 
             let scales = if dtype != scales.dtype() {
                 scales.to_dtype(dtype)?
@@ -352,7 +346,7 @@ pub fn qlinear(
                     None
                 };
 
-                if ws.device().is_gcu() 
+                if ws.device().is_gcu()
                     || (cfg.sym.is_some() && !cfg.sym.unwrap())
                     || cfg.bits != 4
                     || (cfg.group_size != 128 && cfg.group_size != -1)

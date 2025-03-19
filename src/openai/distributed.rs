@@ -1,11 +1,11 @@
 use crate::openai::models::linear::{linear_no_bias_x as linear, LinearX as Linear};
+#[cfg(feature = "eccl")]
+pub use candle_core::gcu_backend::ubridge::eccl::Comm;
 use candle_core::CustomOp1;
 use candle_core::{CpuStorage, Layout, Module, Result, Shape, Tensor};
 use candle_nn::var_builder::Shard;
 pub use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
 use candle_nn::{Embedding, LayerNorm, RmsNorm};
-#[cfg(feature = "eccl")]
-pub use candle_core::gcu_backend::ubridge::eccl::Comm;
 #[cfg(not(feature = "eccl"))]
 pub struct Comm {}
 #[cfg(not(feature = "eccl"))]
@@ -133,11 +133,15 @@ impl CustomOp1 for AllReduce {
     }
 
     #[cfg(all(feature = "gcu", feature = "eccl"))]
-    fn gcu_fwd(&self, s: &candle_core::GcuStorage, l: &Layout) -> Result<(candle_core::GcuStorage, Shape)> {
-        use candle_core as candle;
+    fn gcu_fwd(
+        &self,
+        s: &candle_core::GcuStorage,
+        l: &Layout,
+    ) -> Result<(candle_core::GcuStorage, Shape)> {
         use candle::gcu_backend::ubridge::device_ptr::DeviceSlice;
         use candle::gcu_backend::ubridge::eccl::ReduceOp;
         use candle::gcu_backend::WrapErr;
+        use candle_core as candle;
         use candle_core::backend::BackendStorage;
         use candle_core::DType;
         use half::{bf16, f16};

@@ -273,6 +273,9 @@ impl DefaultLoader {
             };
 
             println!("Model {:?}", config);
+            let paths: Vec<PathBuf> = paths.get_weight_filenames();
+            let shared_vb =
+                unsafe { candle_nn::var_builder::ShardedSafeTensors::var_backend(&paths).unwrap() };
 
             println!("Loading {} model.", self.name);
             use crate::openai::distributed::Comm;
@@ -290,10 +293,9 @@ impl DefaultLoader {
                         );
                     }
 
-                    let paths: Vec<PathBuf> = paths.get_weight_filenames();
                     let device = crate::new_device(*dev_id).unwrap();
                     #[cfg(feature = "eccl")]
-                    let _ = device.as_cuda_device().unwrap().bind_to_thread();
+                    let _ = device.as_gcu_device().unwrap().bind_to_thread();
 
                     #[cfg(feature = "eccl")]
                     let comm = Rc::new(
@@ -310,8 +312,10 @@ impl DefaultLoader {
                     let comm = Rc::new(Comm::default());
 
                     let vb = unsafe {
-                        candle_nn::var_builder::ShardedSafeTensors::var_builder(
-                            &paths, dtype, &device,
+                        candle_nn::var_builder::ShardedSafeTensors::from_backend(
+                            shared_vb.clone(),
+                            dtype,
+                            &device,
                         )
                         .unwrap()
                     };

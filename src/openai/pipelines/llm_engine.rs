@@ -207,15 +207,6 @@ impl LLMEngine {
         }
     }
 
-    pub fn bind_to_thread(&self) {
-        let pipeline = self.get_pipeline(0).unwrap().0.as_ref();
-        let device = pipeline.device();
-        let _ = match device {
-            Device::Gcu(dev) => dev.bind_to_thread(),
-            _ => Ok(()),
-        };
-    }
-
     pub fn generate_once(
         engine: Arc<RwLock<Self>>,
         rank: usize,
