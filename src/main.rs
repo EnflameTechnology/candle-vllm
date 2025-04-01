@@ -14,6 +14,7 @@ use candle_vllm::scheduler::SchedulerConfig;
 use candle_vllm::{get_model_loader, hub_load_local_safetensors, ModelSelected};
 use clap::Parser;
 use std::{path::PathBuf, sync::Arc};
+use tracing::info;
 const SIZE_IN_MB: usize = 1024 * 1024;
 use candle_vllm::openai::models::Config;
 use std::path::Path;
@@ -88,6 +89,10 @@ struct Args {
     /// A larger value means the engine can hold more requests and process them in a single generation call.
     #[arg(long, default_value_t = 200)]
     holding_time: usize,
+
+    //Wheather the program running in multiprocess or multithread model for parallel inference
+    #[arg(long, default_value_t = false)]
+    multi_process: bool,
 }
 
 fn get_cache_config(
@@ -124,6 +129,8 @@ fn get_cache_config(
 #[tokio::main]
 async fn main() -> Result<(), APIError> {
     let args = Args::parse();
+    use ftail::Ftail;
+
     let (loader, model_id, quant) = get_model_loader(args.command, args.model_id.clone());
     if args.model_id.is_none() {
         println!("No model id specified, using the default model or specified in the weight_path!");
@@ -208,11 +215,74 @@ async fn main() -> Result<(), APIError> {
         Some(ids) => ids,
         _ => vec![0usize],
     };
-    let num_shards = device_ids.len();
     use candle_vllm::scheduler::cache_engine::CacheEngine;
-    let (default_pipelines, pipeline_config) =
-        loader.load_model(paths, dtype, &quant, device_ids).await?;
+    let num_shards = device_ids.len();
+    #[cfg(not(feature = "eccl"))]
+    assert!(
+        num_shards == 1,
+        "ECCL is not enabled for parallel inference!"
+    );
 
+    let mut port = args.port;
+    #[cfg(feature = "eccl")]
+    let logger = Ftail::new();
+    #[cfg(feature = "eccl")]
+    let ((default_pipelines, pipeline_config), daemon_manager) = if args.multi_process {
+        use candle_vllm::openai::communicator::init_subprocess;
+        let (id, rank, daemon_manager) = init_subprocess(device_ids.clone()).unwrap();
+        if rank != 0 {
+            port = port + 1; //process other than rank 1 use fake server port since they do not perform response
+        }
+
+        logger
+            .console(tracing::log::LevelFilter::Info)
+            .single_file(
+                format!("candle-vllm-rank-{}.log", rank).as_str(),
+                true,
+                tracing::log::LevelFilter::Info,
+            )
+            .init()
+            .unwrap();
+
+        info!("subprocess rank {} started!", rank);
+
+        (
+            loader
+                .load_model(
+                    paths,
+                    dtype,
+                    &quant,
+                    vec![device_ids[rank]],
+                    Some(id),
+                    Some(rank),
+                    Some(num_shards),
+                )
+                .await?,
+            Some(daemon_manager),
+        )
+    } else {
+        (
+            loader
+                .load_model(paths, dtype, &quant, device_ids, None, None, None)
+                .await?,
+            None,
+        )
+    };
+
+    #[cfg(feature = "eccl")]
+    info!(
+        "parallel model: {}!",
+        if args.multi_process {
+            "multiprocess"
+        } else {
+            "multithread"
+        }
+    );
+
+    #[cfg(not(feature = "eccl"))]
+    let (default_pipelines, pipeline_config) = loader
+        .load_model(paths, dtype, &quant, device_ids, None, None)
+        .await?;
     let mut config: Option<Config> = None;
     let mut cache_config: Option<CacheConfig> = None;
 
@@ -259,6 +329,10 @@ async fn main() -> Result<(), APIError> {
         Arc::new(Notify::new()),
         finish_notify.clone(),
         args.holding_time,
+        num_shards,
+        args.multi_process,
+        #[cfg(feature = "eccl")]
+        daemon_manager,
     )?;
 
     let server_data = OpenAIServerData {
@@ -269,7 +343,7 @@ async fn main() -> Result<(), APIError> {
         finish_notify: finish_notify.clone(),
     };
 
-    println!("Server started at http://127.0.0.1:{}.", args.port);
+    println!("Server started at http://127.0.0.1:{}.", port);
 
     let allow_origin = AllowOrigin::any();
     let cors_layer = CorsLayer::new()
@@ -282,7 +356,7 @@ async fn main() -> Result<(), APIError> {
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(Arc::new(server_data));
 
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", args.port))
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
         .await
         .map_err(|e| APIError::new(e.to_string()))?;
     axum::serve(listener, app)

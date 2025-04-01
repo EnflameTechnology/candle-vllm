@@ -1,6 +1,6 @@
 use crate::openai::models::linear::{linear_no_bias_x as linear, LinearX as Linear};
 #[cfg(feature = "eccl")]
-pub use candle_core::gcu_backend::ubridge::eccl::Comm;
+pub use candle_core::gcu_backend::ubridge::eccl::{Comm, Id};
 use candle_core::CustomOp1;
 use candle_core::{CpuStorage, Layout, Module, Result, Shape, Tensor};
 use candle_nn::var_builder::Shard;
@@ -25,6 +25,9 @@ impl Comm {
         1
     }
 }
+
+#[cfg(not(feature = "eccl"))]
+pub struct Id {}
 
 pub use std::rc::Rc;
 
@@ -218,11 +221,11 @@ impl TensorParallelRowLinear {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let xs = self.linear.forward(x)?;
-        #[cfg(feature = "eccl")]
-        {
-            let device = x.device();
-            let _ = device.as_gcu_device().unwrap().bind_to_thread();
-        }
+        // #[cfg(feature = "eccl")]
+        // {
+        //     let device = x.device();
+        //     let _ = device.as_gcu_device().unwrap().bind_to_thread();
+        // }
         #[cfg(feature = "eccl")]
         let xs = xs.apply_op1_no_bwd(&self.all_reduce)?;
 
