@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "candle-vllm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "accelerate-src",
  "anyhow",

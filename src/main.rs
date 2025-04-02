@@ -130,7 +130,6 @@ fn get_cache_config(
 #[tokio::main]
 async fn main() -> Result<(), APIError> {
     let args = Args::parse();
-    use ftail::Ftail;
 
     let (loader, model_id, quant) = get_model_loader(args.command, args.model_id.clone());
     if args.model_id.is_none() {
@@ -236,10 +235,10 @@ async fn main() -> Result<(), APIError> {
         }
 
         logger
-            .console(tracing::log::LevelFilter::Info)
+            .console(tracing::log::LevelFilter::Warn)
             .single_file(
                 format!("candle-vllm-rank-{}.log", rank).as_str(),
-                true,
+                false,
                 tracing::log::LevelFilter::Info,
             )
             .init()

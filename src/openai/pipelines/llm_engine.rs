@@ -298,7 +298,6 @@ impl LLMEngine {
     #[cfg(feature = "eccl")]
     pub fn sync_process(daemon_manager: &mut DaemonManager, msg_send: MessageType) -> bool {
         if DaemonManager::is_daemon() {
-            info!("waiting sync message!");
             let message = { daemon_manager.receive_message() };
             match message {
                 Ok(MessageType::Finish) | Ok(MessageType::Close) => {
@@ -306,7 +305,7 @@ impl LLMEngine {
                     return false;
                 }
                 Ok(MessageType::Continue) => {
-                    info!("continue message!");
+                    // info!("continue message!");
                 }
                 Ok(MessageType::Start) | Ok(MessageType::Data(_)) | Ok(MessageType::Sample(_)) => {
                     info!("other message!");
@@ -468,7 +467,7 @@ impl LLMEngine {
                                     }
                                 }
                             }
-                            info!("generate_once: received sample");
+                            // info!("generate_once: received sample");
                             Some(logprobs)
                         }
                         _ => {
