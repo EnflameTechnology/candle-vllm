@@ -310,7 +310,7 @@ impl DefaultLoader {
                         device_ids.len()
                     };
                     if num_shards > 1 {
-                        info!(
+                        println!(
                             "Loading partial model on device rank {} (ordinal {})",
                             rank, *dev_id
                         );

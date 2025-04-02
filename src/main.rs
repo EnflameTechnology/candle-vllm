@@ -14,7 +14,8 @@ use candle_vllm::scheduler::SchedulerConfig;
 use candle_vllm::{get_model_loader, hub_load_local_safetensors, ModelSelected};
 use clap::Parser;
 use std::{path::PathBuf, sync::Arc};
-use tracing::info;
+#[cfg(feature = "eccl")]
+use tracing::{info, warn};
 const SIZE_IN_MB: usize = 1024 * 1024;
 use candle_vllm::openai::models::Config;
 use std::path::Path;
@@ -87,10 +88,10 @@ struct Args {
 
     /// Maximum waiting time for processing parallel requests (in milliseconds).
     /// A larger value means the engine can hold more requests and process them in a single generation call.
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, default_value_t = 500)]
     holding_time: usize,
 
-    //Wheather the program running in multiprocess or multithread model for parallel inference
+    //Whether the program running in multiprocess or multithread model for parallel inference
     #[arg(long, default_value_t = false)]
     multi_process: bool,
 }
@@ -225,13 +226,13 @@ async fn main() -> Result<(), APIError> {
 
     let mut port = args.port;
     #[cfg(feature = "eccl")]
-    let logger = Ftail::new();
+    let logger = ftail::Ftail::new();
     #[cfg(feature = "eccl")]
     let ((default_pipelines, pipeline_config), daemon_manager) = if args.multi_process {
         use candle_vllm::openai::communicator::init_subprocess;
         let (id, rank, daemon_manager) = init_subprocess(device_ids.clone()).unwrap();
         if rank != 0 {
-            port = port + 1; //process other than rank 1 use fake server port since they do not perform response
+            port = port + 1; //processes other than rank 0 use fake server port since they do not perform response
         }
 
         logger
@@ -244,7 +245,7 @@ async fn main() -> Result<(), APIError> {
             .init()
             .unwrap();
 
-        info!("subprocess rank {} started!", rank);
+        warn!("subprocess rank {} started!", rank);
 
         (
             loader
@@ -283,6 +284,7 @@ async fn main() -> Result<(), APIError> {
     let (default_pipelines, pipeline_config) = loader
         .load_model(paths, dtype, &quant, device_ids, None, None)
         .await?;
+
     let mut config: Option<Config> = None;
     let mut cache_config: Option<CacheConfig> = None;
 

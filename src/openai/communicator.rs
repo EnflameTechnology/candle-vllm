@@ -1,3 +1,4 @@
+#[allow(unused_imports)]
 use crate::openai::distributed::{Comm, Id};
 use crate::openai::sampling_params::{Logprobs, SamplingParams};
 use bincode;
@@ -120,15 +121,12 @@ impl DaemonManager {
         );
         assert!(self.daemon_streams.is_some(), "No daomon process found!");
         let serialized = bincode::serialize(message).expect("Serialization failed");
-        let mut streams = self.daemon_streams.as_mut().unwrap();
-        for mut stream in streams.iter() {
+        let streams = self.daemon_streams.as_mut().unwrap();
+        for stream in streams.iter_mut() {
             stream.write_all(&(serialized.len() as u32).to_le_bytes())?;
             stream.write_all(&serialized)?;
             stream.flush()?; // Ensure data is sent immediately
-
-            // info!("send_message: reading acknowledgment");
-
-            // Wait for acknowledgment
+                             // Wait for acknowledgment
             let mut ack_buf = [0u8; 1];
             if let Err(e) = stream.read_exact(&mut ack_buf) {
                 info!(
@@ -139,7 +137,6 @@ impl DaemonManager {
                 info!("Unexpected acknowledgment value from subprocess");
             }
         }
-
         Ok(())
     }
 
@@ -162,8 +159,6 @@ impl DaemonManager {
         let message: MessageType =
             bincode::deserialize(&serialized).expect("Deserialization failed");
         // Send acknowledgment
-        // info!("receive_message: sending acknowledgment");
-
         stream.write_all(&[1])?;
         stream.flush()?;
         Ok(message)
@@ -188,7 +183,7 @@ pub fn init_subprocess(device_ids: Vec<usize>) -> anyhow::Result<(Id, usize, Dae
         use rayon::iter::IntoParallelRefIterator;
         use rayon::iter::ParallelIterator;
 
-        let children: Vec<std::process::Child> = device_ids[1..]
+        let _: Vec<std::process::Child> = device_ids[1..]
             .par_iter()
             .enumerate()
             .map(|(rank, dev_id)| {
