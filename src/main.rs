@@ -222,9 +222,8 @@ async fn main() -> Result<(), APIError> {
     #[cfg(not(feature = "eccl"))]
     assert!(
         num_shards == 1,
-        "ECCL is not enabled for parallel inference!"
+        "More than one shard was given, but ECCL is not enabled for parallel inference!"
     );
-
     let mut port = args.port;
     #[cfg(feature = "eccl")]
     let logger = ftail::Ftail::new();
