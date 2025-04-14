@@ -94,7 +94,7 @@ impl TopKLastDimOp for Tensor {
         // Sorted descending
         let (topk_indices, topk_values) = if self.device().is_gcu() {
             let (topk_values, topk_indices) = candle_nn::ops::topk(self, topk)?;
-            (topk_indices.contiguous()?, topk_values.contiguous()?)
+            (topk_indices, topk_values)
         } else {
             #[cfg(feature = "cuda")]
             let (values, sorted_indices) = self.sort(false)?;
@@ -111,6 +111,9 @@ impl TopKLastDimOp for Tensor {
     }
 
     fn topk_unsorted(&self, topk: usize) -> Result<TopKOutput> {
+        if self.device().is_gcu() {
+            return self.topk(topk);
+        }
         // Sorted descending
         let TopKOutput { values, indices } = self.topk(topk)?;
         // Reorder the indices ascending
