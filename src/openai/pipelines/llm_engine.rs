@@ -390,14 +390,6 @@ impl LLMEngine {
                     e.prepare_decode(&scheduled, device)
                 }?;
 
-                #[cfg(feature = "eccl")]
-                if multi_process {
-                    let mut daemon_manager = e.daemon_manager.write().unwrap();
-                    if !Self::sync_process(daemon_manager.as_mut().unwrap(), MessageType::Continue)
-                    {
-                        break;
-                    }
-                };
 
                 let x = pipeline.forward(
                     tokens,
