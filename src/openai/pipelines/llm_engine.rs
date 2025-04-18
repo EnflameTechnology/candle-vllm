@@ -124,6 +124,7 @@ impl LLMEngine {
         for rank in 0..num_threads {
             ranks.push(rank);
         }
+
         let _ = tokio::task::spawn_blocking(move || {
             tokio::runtime::Handle::current().block_on(async move {
                 loop {
@@ -296,6 +297,7 @@ impl LLMEngine {
         msg_send: MessageType,
     ) -> Option<Vec<usize>> {
         if DaemonManager::is_daemon() {
+            debug!("waiting sync message!");
             let message = { daemon_manager.receive_message() };
             match message {
                 Ok(MessageType::Abort(ids)) => {
@@ -306,7 +308,7 @@ impl LLMEngine {
                     return Some(Vec::<usize>::new());
                 }
                 Ok(MessageType::Continue) => {
-                    // info!("continue message!");
+                    debug!("continue message!");
                 }
                 Ok(MessageType::Start) | Ok(MessageType::Data(_)) | Ok(MessageType::Sample(_)) => {
                     info!("other message!");
@@ -390,7 +392,6 @@ impl LLMEngine {
                     e.prepare_decode(&scheduled, device)
                 }?;
 
-
                 let x = pipeline.forward(
                     tokens,
                     &positions,
@@ -461,7 +462,7 @@ impl LLMEngine {
                                     }
                                 }
                             }
-                            // info!("generate_once: received sample");
+                            debug!("generate_once: received sample");
                             Some(logprobs)
                         }
                         _ => {

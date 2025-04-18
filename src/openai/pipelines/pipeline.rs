@@ -1,4 +1,5 @@
 use super::{get_token, TokenOrFinishReason};
+use crate::backend::progress::{progress_worker, ProgressReporter};
 use crate::openai::logits_processor::{LogitsProcessor, Sampling};
 use crate::openai::models::TokenID;
 use crate::openai::requests::StopTokens;
@@ -44,6 +45,7 @@ use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::path::Path;
 pub use std::rc::Rc;
+use std::sync::RwLock;
 use std::{path::PathBuf, sync::Arc};
 use tokenizers::Tokenizer;
 use tracing::info;
@@ -168,6 +170,12 @@ impl DefaultLoader {
         num_devices: Option<usize>, //must pass the number of devices used in multiprocess mode
     ) -> Result<(Vec<Box<DefaultPipeline>>, PipelineConfig), APIError> {
         let specific_args = self.config.clone();
+        let reporter = Arc::new(RwLock::new(ProgressReporter::new(local_rank.unwrap_or(0))));
+        let num_subprogress = if num_devices.is_none() {
+            0
+        } else {
+            num_devices.unwrap() - 1
+        };
 
         let (models, devices, config, sep_style) = if quant.is_some()
             && matches!(quant.as_ref().unwrap().as_str(), "ggml" | "gguf")
@@ -179,35 +187,75 @@ impl DefaultLoader {
                 self.name,
                 path.display()
             );
-            let mut file = try_api!(std::fs::File::open(&path));
-            let content =
-                try_api!(gguf_file::Content::read(&mut file).map_err(|e| e.with_path(path)));
+            let mut file = try_api!(std::fs::File::open(&path.clone()));
             let s_cfg = specific_args.clone();
+            {
+                let content = try_api!(
+                    gguf_file::Content::read(&mut file).map_err(|e| e.with_path(path.clone()))
+                );
+                let nlayers = match self.name.as_str() {
+                    "llama" | "llama3" => GGUFLLaMa::get_num_of_layers(content),
+                    "phi3" => GGUFPhi3::get_num_of_layers(content),
+                    "qwen2" => GGUFQWen2::get_num_of_layers(content),
+                    _ => panic!("Model not supported!"),
+                };
+                if nlayers.is_ok() {
+                    progress_worker(
+                        Some(num_subprogress as usize),
+                        nlayers.unwrap(),
+                        Arc::clone(&reporter),
+                    )
+                    .await;
+                }
+            };
+            let content = try_api!(
+                gguf_file::Content::read(&mut file).map_err(|e| e.with_path(path.clone()))
+            );
             let (model, config, sep_style) = match self.name.as_str() {
                 "llama" => {
                     let model = try_api!(GGUFLLaMa::from_gguf(
-                        content, &mut file, &device, dtype, s_cfg
+                        content,
+                        &mut file,
+                        &device,
+                        dtype,
+                        s_cfg,
+                        Arc::clone(&reporter),
                     ));
                     let cfg = model.get_config().clone();
                     (LLMModel::LlamaGGUF(model), cfg, SeparatorStyle::Llama)
                 }
                 "llama3" => {
                     let model = try_api!(GGUFLLaMa::from_gguf(
-                        content, &mut file, &device, dtype, s_cfg
+                        content,
+                        &mut file,
+                        &device,
+                        dtype,
+                        s_cfg,
+                        Arc::clone(&reporter),
                     ));
                     let cfg = model.get_config().clone();
                     (LLMModel::LlamaGGUF(model), cfg, SeparatorStyle::Llama3)
                 }
                 "phi3" => {
                     let model = try_api!(GGUFPhi3::from_gguf(
-                        content, &mut file, &device, dtype, s_cfg
+                        content,
+                        &mut file,
+                        &device,
+                        dtype,
+                        s_cfg,
+                        Arc::clone(&reporter),
                     ));
                     let cfg = model.get_config().clone();
                     (LLMModel::Phi3GGUF(model), cfg, SeparatorStyle::Phi)
                 }
                 "qwen2" => {
                     let model = try_api!(GGUFQWen2::from_gguf(
-                        content, &mut file, &device, dtype, s_cfg
+                        content,
+                        &mut file,
+                        &device,
+                        dtype,
+                        s_cfg,
+                        Arc::clone(&reporter),
                     ));
                     let cfg = model.get_config().clone();
                     (LLMModel::QWen2GGUF(model), cfg, SeparatorStyle::Qwen2)
@@ -280,8 +328,15 @@ impl DefaultLoader {
             let paths: Vec<PathBuf> = paths.get_weight_filenames();
             let shared_vb =
                 unsafe { candle_nn::var_builder::ShardedSafeTensors::var_backend(&paths).unwrap() };
-
             println!("Loading {} model.", self.name);
+
+            progress_worker(
+                Some(num_subprogress as usize),
+                config.num_hidden_layers,
+                Arc::clone(&reporter),
+            )
+            .await;
+
             use crate::openai::distributed::Comm;
             #[cfg(feature = "eccl")]
             let id = if comm_id.is_some() {
@@ -289,7 +344,6 @@ impl DefaultLoader {
             } else {
                 crate::openai::distributed::Id::new().unwrap()
             };
-
             #[cfg(feature = "eccl")]
             assert!(
                 (comm_id.is_some() && device_ids.len() == 1)
@@ -299,22 +353,18 @@ impl DefaultLoader {
                 .par_iter()
                 .enumerate()
                 .map(|(rank, dev_id)| {
+                    #[cfg(feature = "eccl")]
                     let rank = if local_rank.is_some() {
                         local_rank.unwrap()
                     } else {
                         rank
                     };
+                    #[cfg(feature = "eccl")]
                     let num_shards = if num_devices.is_some() {
                         num_devices.unwrap()
                     } else {
                         device_ids.len()
                     };
-                    if num_shards > 1 {
-                        println!(
-                            "Loading partial model on device rank {} (ordinal {})",
-                            rank, *dev_id
-                        );
-                    }
 
                     let device = crate::new_device(*dev_id).unwrap();
                     #[cfg(feature = "eccl")]
@@ -346,55 +396,111 @@ impl DefaultLoader {
                     let (model, sep) = match self.name.as_str() {
                         "llama" => (
                             LLMModel::Llama(try_api!(Llama::load(
-                                vb, &config, dtype, &device, comm
+                                vb,
+                                &config,
+                                dtype,
+                                &device,
+                                comm,
+                                Arc::clone(&reporter),
                             ))),
                             SeparatorStyle::Llama,
                         ),
                         "llama3" => (
                             LLMModel::Llama(try_api!(Llama::load(
-                                vb, &config, dtype, &device, comm
+                                vb,
+                                &config,
+                                dtype,
+                                &device,
+                                comm,
+                                Arc::clone(&reporter),
                             ))),
                             SeparatorStyle::Llama3,
                         ),
                         "phi2" => (
-                            LLMModel::Phi2(try_api!(Phi2::new(vb, &config, dtype, &device, comm))),
+                            LLMModel::Phi2(try_api!(Phi2::new(
+                                vb,
+                                &config,
+                                dtype,
+                                &device,
+                                comm,
+                                Arc::clone(&reporter),
+                            ))),
                             SeparatorStyle::Phi,
                         ),
                         "phi3" => (
-                            LLMModel::Phi3(try_api!(Phi::new(vb, &config, dtype, &device, comm))),
+                            LLMModel::Phi3(try_api!(Phi::new(
+                                vb,
+                                &config,
+                                dtype,
+                                &device,
+                                comm,
+                                Arc::clone(&reporter),
+                            ))),
                             SeparatorStyle::Phi,
                         ),
                         "qwen2" => (
                             LLMModel::Qwen2(try_api!(Qwen2::new(
-                                vb, &config, dtype, &device, comm
+                                vb,
+                                &config,
+                                dtype,
+                                &device,
+                                comm,
+                                Arc::clone(&reporter),
                             ))),
                             SeparatorStyle::Qwen2,
                         ),
                         "gemma" => (
                             LLMModel::Gemma(try_api!(Gemma::new(
-                                vb, &config, dtype, &device, comm
+                                vb,
+                                &config,
+                                dtype,
+                                &device,
+                                comm,
+                                Arc::clone(&reporter),
                             ))),
                             SeparatorStyle::Gemma,
                         ),
                         "mistral" => (
                             LLMModel::Mistral(try_api!(Mistral::new(
-                                vb, &config, dtype, &device, comm
+                                vb,
+                                &config,
+                                dtype,
+                                &device,
+                                comm,
+                                Arc::clone(&reporter),
                             ))),
                             SeparatorStyle::Mistral,
                         ),
                         "yi" => (
-                            LLMModel::Yi(try_api!(Yi::new(vb, &config, dtype, &device, comm))),
+                            LLMModel::Yi(try_api!(Yi::new(
+                                vb,
+                                &config,
+                                dtype,
+                                &device,
+                                comm,
+                                Arc::clone(&reporter),
+                            ))),
                             SeparatorStyle::Yi,
                         ),
                         "stablelm" => (
                             LLMModel::StableLM(try_api!(StableLM::new(
-                                vb, &config, dtype, &device, comm
+                                vb,
+                                &config,
+                                dtype,
+                                &device,
+                                comm,
+                                Arc::clone(&reporter),
                             ))),
                             SeparatorStyle::StableLM,
                         ),
                         "deepseek" => (
                             LLMModel::DeepSeek(try_api!(DeepSeek::load(
-                                vb, &config, dtype, &device, comm
+                                vb,
+                                &config,
+                                dtype,
+                                &device,
+                                comm,
+                                Arc::clone(&reporter),
                             ))),
                             SeparatorStyle::Llama3,
                         ),

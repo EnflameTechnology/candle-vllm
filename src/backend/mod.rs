@@ -93,3 +93,4 @@ use crate::openai::responses::APIError;
 pub mod custom_ops;
 #[cfg(feature = "eccl")]
 pub mod heartbeat;
+pub mod progress;
