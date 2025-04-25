@@ -179,6 +179,15 @@ pub fn linear_b(
     }
 }
 
+pub fn check_k_dim(k_dim: usize, pack_factor: usize, bits: usize, quant_method: &String) -> usize {
+    let out_dim = if bits == 4 && quant_method == "awq" && k_dim % 128 != 0 {
+        ((k_dim + 128 - 1) / 128) * 128 //align up k-dim to 128 in awq on gcu
+    } else {
+        k_dim
+    };
+    out_dim / pack_factor
+}
+
 pub fn qlinear(
     in_dim: usize,
     out_dim: usize,
@@ -216,7 +225,10 @@ pub fn qlinear(
 
             //enflame nk format
             let ws = vb.get_with_hints_dtype(
-                (out_dim, in_dim / pack_factor),
+                (
+                    out_dim,
+                    check_k_dim(in_dim, pack_factor, cfg.bits, &cfg.quant_method),
+                ),
                 if marlin_format { "B" } else { "qweight" },
                 Default::default(),
                 wtype,
@@ -554,6 +566,7 @@ impl QLinear {
             Some(cfg) => {
                 assert!(
                     cfg.quant_method == "gptq"
+                        || cfg.quant_method == "awq"
                         || cfg.quant_method == "w8a16"
                         || quant == "w8a16"
                         || cfg.quant_method == "marlin"

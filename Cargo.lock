@@ -379,7 +379,7 @@ dependencies = [
  "rand_distr 0.5.1",
  "rayon",
  "safetensors",
- "thiserror",
+ "thiserror 1.0.61",
  "ubridge",
  "ug",
  "ug-cuda",
@@ -404,7 +404,7 @@ dependencies = [
  "rand_distr 0.4.3",
  "rayon",
  "safetensors",
- "thiserror",
+ "thiserror 1.0.61",
  "ug",
  "yoke",
  "zip",
@@ -454,7 +454,7 @@ version = "0.8.1"
 dependencies = [
  "metal 0.27.0",
  "once_cell",
- "thiserror",
+ "thiserror 1.0.61",
  "tracing",
 ]
 
@@ -472,7 +472,7 @@ dependencies = [
  "rayon",
  "safetensors",
  "serde",
- "thiserror",
+ "thiserror 1.0.61",
 ]
 
 [[package]]
@@ -537,7 +537,7 @@ dependencies = [
  "serde",
  "serde-big-array",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.61",
  "tokenizers",
  "tokio",
  "tower-http",
@@ -1526,7 +1526,7 @@ dependencies = [
  "reqwest 0.11.27",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.61",
  "tokio",
  "ureq",
 ]
@@ -1862,9 +1862,9 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.12.1"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
+checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
 dependencies = [
  "either",
 ]
@@ -1911,7 +1911,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4979f22fdb869068da03c9f7528f8297c6fd2606bc3a4affe42e6a823fdb8da4"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.52.5",
 ]
 
 [[package]]
@@ -2037,7 +2037,7 @@ dependencies = [
  "candle-core 0.8.1 (git+https://github.com/huggingface/candle.git)",
  "metal 0.27.0",
  "once_cell",
- "thiserror",
+ "thiserror 1.0.61",
 ]
 
 [[package]]
@@ -2295,7 +2295,7 @@ dependencies = [
  "getset",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.61",
 ]
 
 [[package]]
@@ -2317,7 +2317,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
- "thiserror",
+ "thiserror 1.0.61",
  "toml",
  "ureq",
  "url",
@@ -2701,7 +2701,7 @@ checksum = "bd283d9651eeda4b2a83a43c1c91b266c40fd76ecd39a50a8c630ae69dc72891"
 dependencies = [
  "getrandom 0.2.15",
  "libredox",
- "thiserror",
+ "thiserror 1.0.61",
 ]
 
 [[package]]
@@ -3220,7 +3220,7 @@ dependencies = [
  "byteorder",
  "enum-as-inner",
  "libc",
- "thiserror",
+ "thiserror 1.0.61",
  "walkdir",
 ]
 
@@ -3283,7 +3283,16 @@ version = "1.0.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c546c80d6be4bc6a00c0f01730c08df82eaa7a7a61f11d656526506112cc1709"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 1.0.61",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "567b8a2dae586314f7be2a752ec7474332959c6460e02bde30d702a66d488708"
+dependencies = [
+ "thiserror-impl 2.0.12",
 ]
 
 [[package]]
@@ -3291,6 +3300,17 @@ name = "thiserror-impl"
 version = "1.0.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46c3384250002a6d5af4d114f2845d37b57521033f30d5c3f46c4d70e1197533"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.94",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f7cf42b4507d8ea322120659672cf1b9dbb93f8f2d4ecfd6e51350ff5b17a1d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3314,16 +3334,16 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokenizers"
-version = "0.19.1"
+version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e500fad1dd3af3d626327e6a3fe5050e664a6eaa4708b8ca92f1794aaf73e6fd"
+checksum = "3169b3195f925496c895caee7978a335d49218488ef22375267fba5a46a40bd7"
 dependencies = [
  "aho-corasick",
  "derive_builder",
  "esaxx-rs",
  "getrandom 0.2.15",
  "indicatif",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "lazy_static",
  "log",
  "macro_rules_attribute",
@@ -3338,7 +3358,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spm_precompiled",
- "thiserror",
+ "thiserror 2.0.12",
  "unicode-normalization-alignments",
  "unicode-segmentation",
  "unicode_categories",
@@ -3585,7 +3605,7 @@ dependencies = [
  "num",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.61",
 ]
 
 [[package]]
@@ -3598,7 +3618,7 @@ dependencies = [
  "half",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.61",
  "ug",
 ]
 
@@ -3613,7 +3633,7 @@ dependencies = [
  "objc",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.61",
  "ug",
 ]
 
@@ -4215,7 +4235,7 @@ dependencies = [
  "displaydoc",
  "indexmap",
  "num_enum",
- "thiserror",
+ "thiserror 1.0.61",
 ]
 
 [[package]]

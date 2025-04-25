@@ -20,7 +20,7 @@ candle-examples = { path = "../candle-gcu/candle-gcu/candle-examples/", version 
 candle-nn = { path = "../candle-gcu/candle-gcu/candle-nn/", version = "0.8.1" }
 dyn-fmt = "0.4.0"
 serde = { version = "1.0.190", features = ["serde_derive"] }
-tokenizers = "0.19.1"
+tokenizers = "0.21.0"
 uuid = { version = "1.5.0", features = ["v4"] }
 candle-transformers = { path = "../candle-gcu/candle-gcu/candle-transformers/", version = "0.8.1" }
 hf-hub = "0.3.2"
