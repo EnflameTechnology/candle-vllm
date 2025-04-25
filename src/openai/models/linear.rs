@@ -57,6 +57,16 @@ impl Linear {
         }
     }
 
+    pub fn reload(&mut self) -> Result<()> {
+        self.weight = self.weight.reload()?;
+        Ok(())
+    }
+
+    pub fn offload(&mut self) -> Result<()> {
+        self.weight = self.weight.offload()?;
+        Ok(())
+    }
+
     pub fn weight(&self) -> &Tensor {
         &self.weight
     }
@@ -497,6 +507,29 @@ impl QLinear {
         }
     }
 
+    pub fn offload(&mut self) -> Result<()> {
+        let qw = match &self.inner {
+            QMatMul::Tensor(qw) => qw.offload()?,
+            _ => {
+                unreachable!()
+            }
+        };
+        self.inner = QMatMul::Tensor(qw);
+        Ok(())
+    }
+
+    pub fn reload(&mut self) -> Result<()> {
+        let qw = match &self.inner {
+            QMatMul::Tensor(qw) => qw.reload()?,
+            _ => {
+                unreachable!()
+            }
+        };
+        self.inner = QMatMul::Tensor(qw);
+
+        Ok(())
+    }
+
     pub fn from_parts(w: Tensor, b: Option<Tensor>) -> Self {
         let dtype = w.dtype();
         Self {
@@ -841,6 +874,20 @@ impl LinearX {
             )))
         } else {
             LinearX(Either::Left(ln))
+        }
+    }
+
+    pub fn offload(&mut self) -> Result<()> {
+        match &mut self.0 {
+            Either::Left(ln) => ln.offload(),
+            Either::Right(ln) => ln.offload(),
+        }
+    }
+
+    pub fn reload(&mut self) -> Result<()> {
+        match &mut self.0 {
+            Either::Left(ln) => ln.reload(),
+            Either::Right(ln) => ln.reload(),
         }
     }
 }

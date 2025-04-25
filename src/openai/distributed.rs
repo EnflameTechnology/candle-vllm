@@ -1,8 +1,10 @@
+use super::models::linear::{qlinear, QLinear};
 use crate::openai::models::linear::{linear_no_bias_x as linear, LinearX as Linear};
+use crate::openai::models::QuantConfig;
 #[cfg(feature = "eccl")]
 pub use candle_core::gcu_backend::ubridge::eccl::{Comm, Id};
-use candle_core::CustomOp1;
 use candle_core::{CpuStorage, Layout, Module, Result, Shape, Tensor};
+use candle_core::{CustomOp1, DType, Device};
 use candle_nn::var_builder::Shard;
 pub use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
 use candle_nn::{Embedding, LayerNorm, RmsNorm};
@@ -245,7 +247,6 @@ pub fn shard(dim: usize, rank: usize, world_size: usize) -> candle_nn::var_build
         world_size,
     }
 }
-use crate::openai::models::QuantConfig;
 impl TensorParallelColumnLinear {
     pub fn load_with_hints(
         in_dim: usize,
@@ -356,6 +357,52 @@ impl ReplicatedLinear {
     pub fn from_weight_bias(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
         let linear = Linear::new(weight, None, &None, &None);
         Ok(Self { linear, bias })
+    }
+
+    pub fn load_dequantized(
+        in_dim: usize,
+        out_dim: usize,
+        vb: VarBuilder,
+        quant_config: &Option<QuantConfig>,
+        dtype: DType,
+    ) -> Result<Self> {
+        assert!(quant_config.is_some(), "The given model is not quantized!");
+        let cfg = quant_config.as_ref().unwrap();
+        assert!(
+            cfg.bits == 4,
+            "Only 4bit quantized weight can be loaded as dequantized!"
+        );
+        let mut q_liner = qlinear(
+            in_dim,
+            out_dim,
+            vb,
+            shard(0, 0, 1),
+            quant_config,
+            false,
+            dtype,
+        )?;
+        let weight = q_liner.weight();
+        let scales = q_liner.scales();
+        let qzeros = q_liner.qzeros();
+        //quantized weight (nk -> kn)
+        let dequantized_weight = candle_nn::ops::dequant_4bit(
+            &weight.t()?.contiguous()?,
+            scales.as_ref().unwrap(),
+            qzeros.as_ref().unwrap(),
+            cfg.group_size as usize,
+        )?;
+        let dequantized_weight = dequantized_weight.t()?.contiguous()?; // kn -> nk
+        let dequantized_weight = dequantized_weight.to_device(&Device::Cpu)?;
+        let linear = Linear::new(dequantized_weight, None, &None, &None);
+        Ok(Self { linear, bias: None })
+    }
+
+    pub fn offload(&mut self) -> Result<()> {
+        self.linear.offload()
+    }
+
+    pub fn reload(&mut self) -> Result<()> {
+        self.linear.reload()
     }
 
     pub fn load_no_bias(

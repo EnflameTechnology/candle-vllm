@@ -15,11 +15,13 @@ use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_core as candle;
 use candle_nn::{Activation, Embedding, Module, RmsNorm};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::f32::consts::PI;
 use std::iter::{zip, FromIterator};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
+use tracing::warn;
 #[doc(hidden)]
 #[macro_export]
 macro_rules! serde_default_fn {
@@ -118,6 +120,7 @@ impl DeepSeekConfig {
             q_lora_rank: self.q_lora_rank,
             n_group: self.n_group,
             topk_group: self.topk_group,
+            num_experts_offload_per_rank: scfg.num_experts_offload_per_rank,
         };
 
         Config {
@@ -177,8 +180,8 @@ impl DeepSeekV2RotaryEmbedding {
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
 
-        let sin = freqs.sin()?.to_dtype(dtype)?.to_device(dev)?;
-        let cos = freqs.cos()?.to_dtype(dtype)?.to_device(dev)?;
+        let sin = freqs.sin()?.to_dtype(DType::F32)?.to_device(dev)?;
+        let cos = freqs.cos()?.to_dtype(DType::F32)?.to_device(dev)?;
         let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
 
         Ok(Self { sin, cos, cos_sin })
@@ -270,10 +273,10 @@ impl DeepSeekV2RotaryEmbedding {
         let mscale =
             Self::yarn_get_mscale(factor, mscale) / Self::yarn_get_mscale(factor, mscale_all_dim);
         let sin = (freqs.sin()? * mscale as f64)?
-            .to_dtype(dtype)?
+            .to_dtype(DType::F32)?
             .to_device(dev)?;
         let cos = (freqs.cos()? * mscale as f64)?
-            .to_dtype(dtype)?
+            .to_dtype(DType::F32)?
             .to_device(dev)?;
         let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
 
@@ -585,11 +588,14 @@ impl Attention {
     }
 }
 
+use std::cell::{Cell, RefCell};
 struct Mlp {
-    gate: ReplicatedLinear,
-    up: ReplicatedLinear,
-    down: ReplicatedLinear,
+    gate: RefCell<ReplicatedLinear>,
+    up: RefCell<ReplicatedLinear>,
+    down: RefCell<ReplicatedLinear>,
     act: Activation,
+    preloaded: Cell<bool>,
+    offloadable: bool,
 }
 
 impl Mlp {
@@ -598,40 +604,71 @@ impl Mlp {
         vb: VarBuilder,
         hidden_size: Option<usize>,
         intermediate_size: Option<usize>,
+        offload: bool,
     ) -> Result<Self> {
         let hidden_size = hidden_size.unwrap_or(cfg.hidden_size);
         let intermediate_size = intermediate_size.unwrap_or(cfg.intermediate_size);
+        let mut gate = ReplicatedLinear::load_no_bias(
+            hidden_size,
+            intermediate_size,
+            vb.pp("gate_proj"),
+            &cfg.specific_config.quant,
+            &cfg.quantization_config,
+        )?;
 
+        let mut up = ReplicatedLinear::load_no_bias(
+            hidden_size,
+            intermediate_size,
+            vb.pp("up_proj"),
+            &cfg.specific_config.quant,
+            &cfg.quantization_config,
+        )?;
+
+        let mut down = ReplicatedLinear::load_no_bias(
+            intermediate_size,
+            hidden_size,
+            vb.pp("down_proj"),
+            &cfg.specific_config.quant,
+            &cfg.quantization_config,
+        )?;
+
+        if offload {
+            gate.offload()?;
+            up.offload()?;
+            down.offload()?;
+        }
         Ok(Self {
-            gate: ReplicatedLinear::load_no_bias(
-                hidden_size,
-                intermediate_size,
-                vb.pp("gate_proj"),
-                &cfg.specific_config.quant,
-                &cfg.quantization_config,
-            )?,
-            up: ReplicatedLinear::load_no_bias(
-                hidden_size,
-                intermediate_size,
-                vb.pp("up_proj"),
-                &cfg.specific_config.quant,
-                &cfg.quantization_config,
-            )?,
-            down: ReplicatedLinear::load_no_bias(
-                intermediate_size,
-                hidden_size,
-                vb.pp("down_proj"),
-                &cfg.specific_config.quant,
-                &cfg.quantization_config,
-            )?,
+            gate: RefCell::new(gate),
+            up: RefCell::new(up),
+            down: RefCell::new(down),
+            preloaded: Cell::new(!offload),
+            offloadable: offload,
             act: cfg.hidden_act.unwrap(),
         })
     }
 
+    pub fn reload(&self) {
+        if !self.preloaded.get() {
+            let _ = self.gate.borrow_mut().reload();
+            let _ = self.up.borrow_mut().reload();
+            let _ = self.down.borrow_mut().reload();
+            self.preloaded.set(true);
+        }
+    }
+
+    pub fn offload(&self, force: bool) {
+        if (self.offloadable || force) && self.preloaded.get() {
+            let _ = self.gate.borrow_mut().offload();
+            let _ = self.up.borrow_mut().offload();
+            let _ = self.down.borrow_mut().offload();
+            self.preloaded.set(false);
+        }
+    }
+
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let lhs = self.gate.forward(xs)?.apply(&self.act)?;
-        let rhs = self.up.forward(xs)?;
-        self.down.forward(&(&lhs * &rhs)?)
+        let lhs = self.gate.borrow().forward(xs)?.apply(&self.act)?;
+        let rhs = self.up.borrow().forward(xs)?;
+        self.down.borrow().forward(&(&lhs * &rhs)?)
     }
 }
 
@@ -681,6 +718,12 @@ impl MoeGate {
         };
 
         // Select top-k experts
+        #[cfg(feature = "gcu")]
+        let TopKOutput {
+            values: mut topk_weight,
+            indices: topk_idx,
+        } = scores.topk(self.top_k)?;
+        #[cfg(not(feature = "gcu"))]
         let (mut topk_weight, topk_idx) = match moe_cfg.topk_method {
             TopkMethod::Greedy => {
                 let TopKOutput { values, indices } = scores.topk_unsorted(self.top_k)?;
@@ -789,15 +832,20 @@ impl Moe {
         let n_local_experts = n_routed_experts / comm.world_size();
         let experts_start_idx = comm.rank() * n_local_experts;
         let experts_end_idx = experts_start_idx + n_local_experts;
+        let n_local_experts_need_offload = moe_cfg.num_experts_offload_per_rank.unwrap_or(0);
+        let mut offloaded_count = 0;
         for i in 0..n_routed_experts {
             if i >= experts_start_idx && i < experts_end_idx {
                 let vb_e = vb.pp("experts").pp(i);
+                let offload = offloaded_count < n_local_experts_need_offload;
                 experts.push(Some(Mlp::new(
                     cfg,
                     vb_e,
                     None,
                     Some(moe_cfg.moe_intermediate_size),
+                    offload,
                 )?));
+                offloaded_count += 1;
             } else {
                 experts.push(None);
             }
@@ -810,6 +858,7 @@ impl Moe {
                 vb.pp("shared_experts"),
                 None,
                 Some(intermediate_size),
+                false,
             )?)
         } else {
             None
@@ -829,35 +878,61 @@ impl Moe {
 
     fn moe_infer(&self, xs: &Tensor, topk_ids: &Tensor, topk_weight: &Tensor) -> Result<Tensor> {
         let mut y = xs.zeros_like()?;
-        let topk_weight = if topk_weight.dtype() != xs.dtype() {
+        let topk_weight = if !xs.device().is_gcu() && topk_weight.dtype() != xs.dtype() {
             topk_weight.to_dtype(xs.dtype())?
         } else {
             topk_weight.to_owned()
         };
-        let unique_ids: HashSet<u32> =
-            HashSet::from_iter(topk_ids.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?);
+        let topk_ids = topk_ids.to_device(&Device::Cpu)?;
+        let unique_ids: HashSet<u32> = HashSet::from_iter(topk_ids.flatten_all()?.to_vec1()?);
+
+        let mut cur_used_experts = Vec::<u32>::new();
         for i in self.experts_start_idx..self.experts_end_idx {
-            if !unique_ids.contains(&(i as u32)) {
-                continue;
+            if unique_ids.contains(&(i as u32)) {
+                cur_used_experts.push(i as u32);
+                let expert = self.experts[i]
+                    .as_ref()
+                    .expect("Expert is not present for this rank.");
+                expert.reload(); //make sure the used expert is loaded on device
             }
-            let idx_top = topk_ids.eq(i as f64)?.nonzero()?.t()?.contiguous()?;
-            let idx = &idx_top.i(0)?.contiguous()?;
-            let top = &idx_top.i(1)?.contiguous()?;
-            let expert = self.experts[i]
+        }
+
+        for i in &cur_used_experts {
+            let idx_top = topk_ids.nonzero(*i as u32)?.t()?.contiguous()?;
+            let idx = &idx_top.i(0)?.contiguous()?.to_device(&xs.device())?;
+            let top = &idx_top.i(1)?.contiguous()?.to_device(&xs.device())?;
+            let expert = self.experts[*i as usize]
                 .as_ref()
                 .expect("Expert is not present for this rank.");
 
-            y = y.index_add(
-                idx,
-                &expert.forward(&xs.index_select(idx, 0)?)?.broadcast_mul(
-                    &topk_weight
-                        .index_select(idx, 0)?
-                        .gather(&top.unsqueeze(1)?, 1)?
-                        .squeeze(1)?
-                        .unsqueeze(D::Minus1)?,
-                )?,
-                0,
-            )?;
+            if xs.device().is_gcu() {
+                candle_nn::ops::moe(
+                    &y,
+                    &expert.forward(&xs.index_select(&idx, 0)?)?,
+                    &topk_weight,
+                    &idx,
+                    &top,
+                )?;
+            } else {
+                y = y.index_add(
+                    idx,
+                    &expert.forward(&xs.index_select(idx, 0)?)?.broadcast_mul(
+                        &topk_weight
+                            .index_select(idx, 0)?
+                            .gather(&top.unsqueeze(1)?, 1)?
+                            .squeeze(1)?
+                            .unsqueeze(D::Minus1)?,
+                    )?,
+                    0,
+                )?;
+            }
+        }
+
+        for i in &cur_used_experts {
+            let expert = self.experts[*i as usize]
+                .as_ref()
+                .expect("Expert is not present for this rank.");
+            expert.offload(false);
         }
 
         if self.world_size > 1 {
@@ -932,7 +1007,7 @@ impl DecoderLayer {
                 comm.clone(),
             )?)
         } else {
-            MoeOrMlp::Mlp(Mlp::new(cfg, vb.pp("mlp"), None, None)?)
+            MoeOrMlp::Mlp(Mlp::new(cfg, vb.pp("mlp"), None, None, false)?)
         };
 
         Ok(Self {

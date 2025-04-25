@@ -4,27 +4,56 @@ use candle::shape::Dim;
 use candle::{CpuStorage, CustomOp1, Error, Layout, Shape, WithDType};
 use candle::{DType, Result, Tensor, D};
 use candle_core as candle;
+use half::bf16;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-struct NonZero {}
+struct NonZero {
+    v: u32,
+}
 
 impl NonZero {
     // Sequential version
-    fn nonzero<T: WithDType>(&self, vs: &[T], layout: &Layout) -> Vec<u32> {
-        let n = layout.dims().len();
-        let mut result = Vec::new();
-        let mut indices = vec![0u32; n];
-        for (i, v) in vs.iter().enumerate() {
-            if !v.is_zero() {
-                let mut idx = i;
-                for (dim_index, dim) in layout.dims().iter().enumerate().rev() {
-                    let d = idx % dim;
-                    indices[dim_index] = u32::try_from(d).unwrap();
-                    idx /= dim;
-                }
-                result.extend_from_slice(&indices);
-            }
-        }
-        result
+    fn nonzero<T: WithDType>(&self, vs: &[T], layout: &Layout, v: T) -> Vec<u32> {
+        let dims = layout.dims();
+        let n = dims.len();
+        let chunk_size = if vs.len() > 4096 { 512 } else { 128 };
+        use rayon::iter::IndexedParallelIterator;
+        use rayon::prelude::ParallelSlice;
+        vs.par_chunks(chunk_size)
+            .enumerate()
+            .fold(
+                || Vec::with_capacity(chunk_size * n), // Pre-allocate per-thread
+                |mut acc, (chunk_idx, chunk)| {
+                    let start_index = chunk_idx * chunk_size;
+
+                    // Process each element in chunk
+                    chunk.iter().enumerate().for_each(|(i, value)| {
+                        if *value == v {
+                            let mut idx = start_index + i;
+                            let mut indices = Vec::with_capacity(n);
+
+                            // Calculate indices in reverse dimension order
+                            for &dim in dims.iter().rev() {
+                                let d = idx % dim;
+                                indices.push(u32::try_from(d).unwrap());
+                                idx /= dim;
+                            }
+
+                            // Store in original dimension order
+                            indices.reverse();
+                            acc.extend(indices);
+                        }
+                    });
+
+                    acc
+                },
+            )
+            .reduce(
+                || Vec::new(),
+                |mut a, mut b| {
+                    a.append(&mut b);
+                    a
+                },
+            )
     }
 }
 
@@ -38,15 +67,15 @@ impl CustomOp1 for NonZero {
             return Err(Error::RequiresContiguous { op: "nonzero" });
         }
         let result = match storage {
-            CpuStorage::U8(vs) => self.nonzero(vs, layout),
-            CpuStorage::U32(vs) => self.nonzero(vs, layout),
-            CpuStorage::I64(vs) => self.nonzero(vs, layout),
-            CpuStorage::BF16(vs) => self.nonzero(vs, layout),
-            CpuStorage::F16(vs) => self.nonzero(vs, layout),
-            CpuStorage::F32(vs) => self.nonzero(vs, layout),
-            CpuStorage::F64(vs) => self.nonzero(vs, layout),
-            CpuStorage::I8(vs) => self.nonzero(vs, layout),
-            CpuStorage::I32(vs) => self.nonzero(vs, layout),
+            CpuStorage::U8(vs) => self.nonzero(vs, layout, self.v as u8),
+            CpuStorage::U32(vs) => self.nonzero(vs, layout, self.v),
+            CpuStorage::I64(vs) => self.nonzero(vs, layout, self.v as i64),
+            CpuStorage::BF16(vs) => self.nonzero(vs, layout, half::bf16::from_f32(self.v as f32)),
+            CpuStorage::F16(vs) => self.nonzero(vs, layout, half::f16::from_f32(self.v as f32)),
+            CpuStorage::F32(vs) => self.nonzero(vs, layout, self.v as f32),
+            CpuStorage::F64(vs) => self.nonzero(vs, layout, self.v as f64),
+            CpuStorage::I8(vs) => self.nonzero(vs, layout, self.v as i8),
+            CpuStorage::I32(vs) => self.nonzero(vs, layout, self.v as i32),
         };
         let index_len = layout.dims().len();
         let result_len = result.len() / index_len;
@@ -57,18 +86,22 @@ impl CustomOp1 for NonZero {
 }
 
 pub trait NonZeroOp {
-    fn nonzero(&self) -> Result<Tensor>;
+    fn nonzero(&self, v: u32) -> Result<Tensor>;
 }
 
 impl NonZeroOp for Tensor {
-    fn nonzero(&self) -> Result<Tensor> {
+    fn nonzero(&self, v: u32) -> Result<Tensor> {
         if !self.is_contiguous() {
             return Err(candle_core::Error::RequiresContiguous { op: "nonzero" });
         }
         let original_device = self.device();
-        self.to_device(&candle_core::Device::Cpu)?
-            .apply_op1_no_bwd(&NonZero {})?
-            .to_device(original_device)
+        if original_device.is_cpu() {
+            self.apply_op1_no_bwd(&NonZero { v })
+        } else {
+            self.to_device(&candle_core::Device::Cpu)?
+                .apply_op1_no_bwd(&NonZero { v })?
+                .to_device(original_device)
+        }
     }
 }
 
@@ -115,7 +148,8 @@ impl TopKLastDimOp for Tensor {
             return self.topk(topk);
         }
         // Sorted descending
-        let TopKOutput { values, indices } = self.topk(topk)?;
+        // let TopKOutput { values, indices } = self.topk(topk)?;
+        let (values, indices) = self.sort_last_dim(false)?;
         // Reorder the indices ascending
         #[cfg(feature = "cuda")]
         let reorder_indices = indices.arg_sort(true)?;
