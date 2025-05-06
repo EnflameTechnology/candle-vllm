@@ -397,13 +397,6 @@ impl ReplicatedLinear {
         Ok(Self { linear, bias: None })
     }
 
-    pub fn offload(&mut self) -> Result<()> {
-        self.linear.offload()
-    }
-
-    pub fn reload(&mut self) -> Result<()> {
-        self.linear.reload()
-    }
 
     pub fn load_no_bias(
         in_dim: usize,
@@ -460,5 +453,21 @@ impl ReplicatedLinear {
             xs = xs.broadcast_add(bias)?;
         }
         Ok(xs)
+    }
+
+    pub fn offload(&mut self) -> Result<()> {
+        if cfg!(feature = "gcu") {
+            self.linear.offload()
+        } else {
+            panic!("tensor offload not available on this device!");
+        }
+    }
+
+    pub fn reload(&mut self) -> Result<()> {
+        if cfg!(feature = "gcu") {
+            self.linear.reload()
+        } else {
+            panic!("tensor offload not available on this device!");
+        }
     }
 }

@@ -595,7 +595,7 @@ struct Mlp {
     down: RefCell<ReplicatedLinear>,
     act: Activation,
     preloaded: Cell<bool>,
-    offloadable: bool,
+    can_be_offloaded: bool,
 }
 
 impl Mlp {
@@ -642,7 +642,7 @@ impl Mlp {
             up: RefCell::new(up),
             down: RefCell::new(down),
             preloaded: Cell::new(!offload),
-            offloadable: offload,
+            can_be_offloaded: offload,
             act: cfg.hidden_act.unwrap(),
         })
     }
@@ -656,8 +656,8 @@ impl Mlp {
         }
     }
 
-    pub fn offload(&self, force: bool) {
-        if (self.offloadable || force) && self.preloaded.get() {
+    pub fn offload(&self) {
+        if self.can_be_offloaded && self.preloaded.get() {
             let _ = self.gate.borrow_mut().offload();
             let _ = self.up.borrow_mut().offload();
             let _ = self.down.borrow_mut().offload();
@@ -893,7 +893,7 @@ impl Moe {
                 let expert = self.experts[i]
                     .as_ref()
                     .expect("Expert is not present for this rank.");
-                expert.reload(); //make sure the used expert is loaded on device
+                expert.reload(); //make sure the current used expert is loaded on device
             }
         }
 
@@ -928,15 +928,15 @@ impl Moe {
             }
         }
 
+        if self.world_size > 1 {
+            y = self.all_reduce.apply(&y)?;
+        }
+
         for i in &cur_used_experts {
             let expert = self.experts[*i as usize]
                 .as_ref()
                 .expect("Expert is not present for this rank.");
-            expert.offload(false);
-        }
-
-        if self.world_size > 1 {
-            y = self.all_reduce.apply(&y)?;
+            expert.offload();
         }
         Ok(y)
     }

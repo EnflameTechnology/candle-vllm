@@ -19,9 +19,9 @@
 //! ```
 use super::QuantConfig;
 #[cfg(not(feature = "gcu"))]
-use crate::backend::gptq::{gptq_matmul, gptq_weight_repack};
+use crate::backend::gptq::{gptq_matmul, marlin_weight_repack};
 #[cfg(feature = "gcu")]
-use candle_nn::{gptq_matmul, gptq_weight_repack};
+use candle_nn::{gptq_matmul, marlin_weight_repack};
 
 use crate::candle::Module;
 use crate::candle::{
@@ -57,16 +57,6 @@ impl Linear {
         }
     }
 
-    pub fn reload(&mut self) -> Result<()> {
-        self.weight = self.weight.reload()?;
-        Ok(())
-    }
-
-    pub fn offload(&mut self) -> Result<()> {
-        self.weight = self.weight.offload()?;
-        Ok(())
-    }
-
     pub fn weight(&self) -> &Tensor {
         &self.weight
     }
@@ -89,6 +79,18 @@ impl Linear {
 
     pub fn workspace(&self) -> Option<&Tensor> {
         self.workspace.as_ref()
+    }
+
+    #[cfg(feature = "gcu")]
+    pub fn reload(&mut self) -> Result<()> {
+        self.weight = self.weight.reload()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "gcu")]
+    pub fn offload(&mut self) -> Result<()> {
+        self.weight = self.weight.offload()?;
+        Ok(())
     }
 }
 
@@ -209,12 +211,13 @@ pub fn qlinear(
 ) -> Result<Linear> {
     match quant_config {
         Some(cfg) => {
-            let marlin_compatible =
-                if cfg.quant_method != "gptq" || (cfg.bits != 4 && cfg.bits != 8) {
-                    false
-                } else {
-                    true
-                };
+            let marlin_compatible = if (cfg.quant_method != "gptq" && cfg.quant_method != "awq")
+                || (cfg.bits != 4 && cfg.bits != 8)
+            {
+                false
+            } else {
+                true
+            };
             let marlin_format = if cfg.checkpoint_format.is_some()
                 && cfg.checkpoint_format.as_ref().unwrap() == "marlin"
             {
@@ -291,8 +294,7 @@ pub fn qlinear(
             };
 
             if marlin_format {
-                let workspace =
-                    Tensor::zeros(out_dim_partition / (32 / cfg.bits), DType::U32, vb.device())?;
+                let workspace = Tensor::zeros(out_dim_partition, DType::U32, vb.device())?;
                 //marlin weight file
                 Ok(Linear {
                     weight: ws,
@@ -344,8 +346,10 @@ pub fn qlinear(
                         DType::U32,
                     )?;
                     g_idx = if shards.world_size > 1 {
+                        let dim_size = g_idx.dims()[0];
+                        let start = shards.rank * (dim_size / shards.world_size);
                         g_idx
-                            .narrow(0, shards.rank * in_dim_partition, in_dim_partition)?
+                            .narrow(0, start, dim_size / shards.world_size)?
                             .contiguous()?
                     } else {
                         g_idx
@@ -358,8 +362,10 @@ pub fn qlinear(
                 if ws.device().is_gcu()
                     || (cfg.sym.is_some() && !cfg.sym.unwrap())
                     || cfg.bits != 4
-                    || (cfg.group_size != 128 && cfg.group_size != -1)
-                    || (cfg.desc_act.is_some() && cfg.desc_act.unwrap() == true)
+                    || (cfg.group_size != 64 && cfg.group_size != 128 && cfg.group_size != -1)
+                    || (cfg.desc_act.is_some()
+                        && cfg.desc_act.unwrap() == true
+                        && cfg.quant_method == "gptq")
                 {
                     //only model with 4-bit and desc_act==false can be repacked to marlin format
                     #[cfg(not(feature = "gcu"))]
@@ -418,7 +424,7 @@ pub fn qlinear(
                     }
 
                     let ws = if marlin_compatible {
-                        gptq_weight_repack(&ws)?
+                        marlin_weight_repack(&ws, cfg.bits as i32, cfg.quant_method != "gptq")?
                     } else {
                         ws
                     }; //repack to marlin format
@@ -435,11 +441,7 @@ pub fn qlinear(
                         scales
                     };
 
-                    let workspace = Tensor::zeros(
-                        out_dim_partition / (32 / cfg.bits),
-                        DType::U32,
-                        vb.device(),
-                    )?;
+                    let workspace = Tensor::zeros(out_dim_partition, DType::U32, vb.device())?;
                     Ok(Linear {
                         weight: ws,
                         bias: bs,
@@ -467,6 +469,7 @@ pub struct QLinear {
     group_size: i32,
     bits: i32,
     dtype: DType,
+    is_awq: bool,
 }
 
 impl QLinear {
@@ -490,10 +493,11 @@ impl QLinear {
             group_size: 0,
             bits: 0,
             dtype: DType::F32,
+            is_awq: false,
         })
     }
 
-    pub fn from_linear(linear: Linear, group_size: i32, bits: i32) -> Self {
+    pub fn from_linear(linear: Linear, group_size: i32, bits: i32, is_awq: bool) -> Self {
         Self {
             inner: QMatMul::Tensor(linear.weight().clone()),
             bias: linear.bias().cloned(),
@@ -504,30 +508,8 @@ impl QLinear {
             group_size,
             bits,
             dtype: linear.weight().dtype(),
+            is_awq,
         }
-    }
-
-    pub fn offload(&mut self) -> Result<()> {
-        let qw = match &self.inner {
-            QMatMul::Tensor(qw) => qw.offload()?,
-            _ => {
-                unreachable!()
-            }
-        };
-        self.inner = QMatMul::Tensor(qw);
-        Ok(())
-    }
-
-    pub fn reload(&mut self) -> Result<()> {
-        let qw = match &self.inner {
-            QMatMul::Tensor(qw) => qw.reload()?,
-            _ => {
-                unreachable!()
-            }
-        };
-        self.inner = QMatMul::Tensor(qw);
-
-        Ok(())
     }
 
     pub fn from_parts(w: Tensor, b: Option<Tensor>) -> Self {
@@ -542,6 +524,7 @@ impl QLinear {
             group_size: 0,
             bits: 0,
             dtype,
+            is_awq: false,
         }
     }
 
@@ -559,6 +542,7 @@ impl QLinear {
             group_size: 0,
             bits: 0,
             dtype: DType::F32,
+            is_awq: false,
         }
     }
 
@@ -584,6 +568,7 @@ impl QLinear {
             group_size: 0,
             bits: 0,
             dtype,
+            is_awq: false,
         }
     }
 
@@ -592,9 +577,6 @@ impl QLinear {
         quant: String,
         quant_config: &Option<QuantConfig>,
     ) -> Self {
-        let weight = linear.weight();
-        let qbias = linear.bias().cloned();
-        let dtype = weight.dtype();
         match quant_config {
             Some(cfg) => {
                 assert!(
@@ -605,7 +587,12 @@ impl QLinear {
                         || cfg.quant_method == "marlin"
                         || quant == "marlin"
                 );
-                QLinear::from_linear(linear, cfg.group_size as i32, cfg.bits as i32)
+                QLinear::from_linear(
+                    linear,
+                    cfg.group_size as i32,
+                    cfg.bits as i32,
+                    cfg.quant_method == "awq",
+                )
             }
             None => {
                 use quantized::GgmlDType;
@@ -622,6 +609,9 @@ impl QLinear {
                     "q6k" => GgmlDType::Q6K,
                     _ => panic!("Unsupported GGML data type!"),
                 };
+                let weight = linear.weight();
+                let qbias = linear.bias().cloned();
+                let dtype = weight.dtype();
                 let qtensor = QTensor::quantize(weight, ggml_dtype).unwrap();
                 QLinear::from_qparts_x(qtensor, qbias, dtype)
             }
@@ -639,6 +629,7 @@ impl QLinear {
             group_size: 0,
             bits: 0,
             dtype: old.dtype,
+            is_awq: false,
         }
     }
 
@@ -660,6 +651,30 @@ impl QLinear {
 
     pub fn bias_mut(&mut self) -> Option<&mut Tensor> {
         self.bias.as_mut()
+    }
+
+    #[cfg(feature = "gcu")]
+    pub fn offload(&mut self) -> Result<()> {
+        let w = match &self.inner {
+            QMatMul::Tensor(qw) => qw.offload()?,
+            _ => {
+                unreachable!()
+            }
+        };
+        self.inner = QMatMul::Tensor(w);
+        Ok(())
+    }
+
+    #[cfg(feature = "gcu")]
+    pub fn reload(&mut self) -> Result<()> {
+        let w = match &self.inner {
+            QMatMul::Tensor(qw) => qw.reload()?,
+            _ => {
+                unreachable!()
+            }
+        };
+        self.inner = QMatMul::Tensor(w);
+        Ok(())
     }
 }
 
@@ -794,6 +809,7 @@ impl Module for QLinear {
                             workspace,
                             self.bits,
                             self.group_size,
+                            self.is_awq,
                         )?;
                         #[cfg(not(feature = "gcu"))]
                         let o = o.reshape((bsize, seq_len, dim1, ()))?;
@@ -811,6 +827,7 @@ impl Module for QLinear {
                             workspace,
                             self.bits,
                             self.group_size,
+                            self.is_awq,
                         )?
                     }
                     [seq_len, dim] => {
@@ -827,6 +844,7 @@ impl Module for QLinear {
                             workspace,
                             self.bits,
                             self.group_size,
+                            self.is_awq,
                         )?;
                         #[cfg(not(feature = "gcu"))]
                         let o = o.reshape((seq_len, ()))?;
@@ -883,7 +901,6 @@ impl LinearX {
             Either::Right(ln) => ln.offload(),
         }
     }
-
     pub fn reload(&mut self) -> Result<()> {
         match &mut self.0 {
             Either::Left(ln) => ln.reload(),
