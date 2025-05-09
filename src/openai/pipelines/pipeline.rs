@@ -167,14 +167,16 @@ impl DefaultLoader {
         device_ids: Vec<usize>, //pass only 1 device_id in multiprocess mode, otherwise, multiple device_ids in multithread mode
         #[cfg(feature = "eccl")] comm_id: Option<crate::openai::distributed::Id>, //must pass comm id in multiprocess mode
         local_rank: Option<usize>, //must pass current rank in multiprocess mode
-        num_devices: Option<usize>, //must pass the number of devices used in multiprocess mode
+        local_world_size: Option<usize>, //must pass the number of local devices used in multiprocess mode
+        #[cfg(feature = "eccl")] global_rank: Option<usize>, //must pass current global rank in multi-node mode
+        #[cfg(feature = "eccl")] global_world_size: Option<usize>, //must pass total number of devices used in multi-node mode
     ) -> Result<(Vec<Box<DefaultPipeline>>, PipelineConfig), APIError> {
         let specific_args = self.config.clone();
         let reporter = Arc::new(RwLock::new(ProgressReporter::new(local_rank.unwrap_or(0))));
-        let num_subprogress = if num_devices.is_none() {
+        let num_subprogress = if local_world_size.is_none() {
             0
         } else {
-            num_devices.unwrap() - 1
+            local_world_size.unwrap() - 1
         };
 
         let (models, devices, config, sep_style) = if quant.is_some()
@@ -354,14 +356,14 @@ impl DefaultLoader {
                 .enumerate()
                 .map(|(rank, dev_id)| {
                     #[cfg(feature = "eccl")]
-                    let rank = if local_rank.is_some() {
-                        local_rank.unwrap()
+                    let rank = if global_rank.is_some() {
+                        global_rank.unwrap()
                     } else {
                         rank
                     };
                     #[cfg(feature = "eccl")]
-                    let num_shards = if num_devices.is_some() {
-                        num_devices.unwrap()
+                    let num_shards = if global_world_size.is_some() {
+                        global_world_size.unwrap()
                     } else {
                         device_ids.len()
                     };
@@ -369,6 +371,14 @@ impl DefaultLoader {
                     let device = crate::new_device(*dev_id).unwrap();
                     #[cfg(feature = "eccl")]
                     let _ = device.as_gcu_device().unwrap().bind_to_thread();
+
+                    #[cfg(feature = "eccl")]
+                    tracing::warn!(
+                        "create eccl comm channel rank {}, shards {}, id {:?}",
+                        rank,
+                        num_shards,
+                        id
+                    );
 
                     #[cfg(feature = "eccl")]
                     let comm = Rc::new(
@@ -380,6 +390,9 @@ impl DefaultLoader {
                         )
                         .unwrap(),
                     );
+
+                    #[cfg(feature = "eccl")]
+                    tracing::warn!("eccl comm created for rank {}", rank);
 
                     #[cfg(not(feature = "eccl"))]
                     let comm = Rc::new(Comm::default());

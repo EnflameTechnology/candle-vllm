@@ -397,7 +397,6 @@ impl ReplicatedLinear {
         Ok(Self { linear, bias: None })
     }
 
-
     pub fn load_no_bias(
         in_dim: usize,
         out_dim: usize,
