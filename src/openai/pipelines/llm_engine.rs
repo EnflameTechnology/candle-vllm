@@ -65,7 +65,7 @@ pub struct LLMEngine {
     #[cfg(feature = "eccl")]
     cur_tasks: RwLock<Vec<TaskData>>,
     #[cfg(feature = "eccl")]
-    daemon_manager: RwLock<Option<DaemonManager>>,
+    pub daemon_manager: RwLock<Option<DaemonManager>>,
 }
 
 impl LLMEngine {
