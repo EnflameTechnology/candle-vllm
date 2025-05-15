@@ -883,8 +883,18 @@ impl Moe {
         } else {
             topk_weight.to_owned()
         };
-        let topk_ids = topk_ids.to_device(&Device::Cpu)?;
-        let unique_ids: HashSet<u32> = HashSet::from_iter(topk_ids.flatten_all()?.to_vec1()?);
+        let (topk_ids, unique_ids): (Tensor, HashSet<u32>) = if !xs.device().is_gcu() {
+            let topk_ids = topk_ids.to_device(&Device::Cpu)?;
+            (
+                topk_ids.to_owned(),
+                HashSet::from_iter(topk_ids.flatten_all()?.to_vec1()?),
+            )
+        } else {
+            (
+                topk_ids.to_owned(),
+                HashSet::from_iter(topk_ids.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?),
+            )
+        };
 
         let mut cur_used_experts = Vec::<u32>::new();
         for i in self.experts_start_idx..self.experts_end_idx {
@@ -898,14 +908,13 @@ impl Moe {
         }
 
         for i in &cur_used_experts {
-            let idx_top = topk_ids.nonzero(*i as u32)?.t()?.contiguous()?;
-            let idx = &idx_top.i(0)?.contiguous()?.to_device(&xs.device())?;
-            let top = &idx_top.i(1)?.contiguous()?.to_device(&xs.device())?;
-            let expert = self.experts[*i as usize]
-                .as_ref()
-                .expect("Expert is not present for this rank.");
-
             if xs.device().is_gcu() {
+                let idx_top = candle_nn::ops::expert_mask(&topk_ids, *i as u32)?;
+                let idx = &idx_top.i(0)?;
+                let top = &idx_top.i(1)?;
+                let expert = self.experts[*i as usize]
+                    .as_ref()
+                    .expect("Expert is not present for this rank.");
                 candle_nn::ops::moe(
                     &y,
                     &expert.forward(&xs.index_select(&idx, 0)?)?,
@@ -914,6 +923,12 @@ impl Moe {
                     &top,
                 )?;
             } else {
+                let idx_top = topk_ids.nonzero(*i as u32)?.t()?.contiguous()?;
+                let idx = &idx_top.i(0)?.contiguous()?.to_device(&xs.device())?;
+                let top = &idx_top.i(1)?.contiguous()?.to_device(&xs.device())?;
+                let expert = self.experts[*i as usize]
+                    .as_ref()
+                    .expect("Expert is not present for this rank.");
                 y = y.index_add(
                     idx,
                     &expert.forward(&xs.index_select(idx, 0)?)?.broadcast_mul(
