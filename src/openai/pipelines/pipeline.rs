@@ -24,7 +24,7 @@ use crate::{
             quantized_llama::GGUFLLaMa,
             quantized_phi3::GGUFPhi3,
             quantized_qwen2::GGUFQWen2,
-            qwen2::{Qwen2, QwenConfig},
+            qwen::{Qwen, QwenConfig},
             stable_lm::{StableLM, StableLMConfig},
             yi::{Yi, YiConfig},
             Config,
@@ -57,7 +57,7 @@ enum LLMModel {
     Llama(Llama),
     Phi2(Phi2),
     Phi3(Phi),
-    Qwen2(Qwen2),
+    Qwen(Qwen),
     Gemma(Gemma),
     Mistral(Mistral),
     Yi(Yi),
@@ -259,7 +259,7 @@ impl DefaultLoader {
                         Arc::clone(&reporter),
                     ));
                     let cfg = model.get_config().clone();
-                    (LLMModel::QWen2GGUF(model), cfg, SeparatorStyle::Qwen2)
+                    (LLMModel::QWen2GGUF(model), cfg, SeparatorStyle::Qwen)
                 }
                 _ => panic!("Model not supported!"),
             };
@@ -286,7 +286,7 @@ impl DefaultLoader {
                     ),));
                     config.into_config(false, dtype, &specific_args)
                 }
-                "qwen2" => {
+                "qwen2" | "qwen3" => {
                     let config: QwenConfig = try_api!(serde_json::from_slice(&try_api!(
                         std::fs::read(paths.get_config_filename())
                     ),));
@@ -408,113 +408,123 @@ impl DefaultLoader {
 
                     let (model, sep) = match self.name.as_str() {
                         "llama" => (
-                            LLMModel::Llama(try_api!(Llama::load(
-                                vb,
-                                &config,
-                                dtype,
-                                &device,
-                                comm,
-                                Arc::clone(&reporter),
-                            ))),
+                            LLMModel::Llama(
+                                Llama::load(
+                                    vb,
+                                    &config,
+                                    dtype,
+                                    &device,
+                                    comm,
+                                    Arc::clone(&reporter),
+                                )
+                                .unwrap(),
+                            ),
                             SeparatorStyle::Llama,
                         ),
                         "llama3" => (
-                            LLMModel::Llama(try_api!(Llama::load(
-                                vb,
-                                &config,
-                                dtype,
-                                &device,
-                                comm,
-                                Arc::clone(&reporter),
-                            ))),
+                            LLMModel::Llama(
+                                Llama::load(
+                                    vb,
+                                    &config,
+                                    dtype,
+                                    &device,
+                                    comm,
+                                    Arc::clone(&reporter),
+                                )
+                                .unwrap(),
+                            ),
                             SeparatorStyle::Llama3,
                         ),
                         "phi2" => (
-                            LLMModel::Phi2(try_api!(Phi2::new(
-                                vb,
-                                &config,
-                                dtype,
-                                &device,
-                                comm,
-                                Arc::clone(&reporter),
-                            ))),
+                            LLMModel::Phi2(
+                                Phi2::new(vb, &config, dtype, &device, comm, Arc::clone(&reporter))
+                                    .unwrap(),
+                            ),
                             SeparatorStyle::Phi,
                         ),
                         "phi3" => (
-                            LLMModel::Phi3(try_api!(Phi::new(
-                                vb,
-                                &config,
-                                dtype,
-                                &device,
-                                comm,
-                                Arc::clone(&reporter),
-                            ))),
+                            LLMModel::Phi3(
+                                Phi::new(vb, &config, dtype, &device, comm, Arc::clone(&reporter))
+                                    .unwrap(),
+                            ),
                             SeparatorStyle::Phi,
                         ),
-                        "qwen2" => (
-                            LLMModel::Qwen2(try_api!(Qwen2::new(
-                                vb,
-                                &config,
-                                dtype,
-                                &device,
-                                comm,
-                                Arc::clone(&reporter),
-                            ))),
-                            SeparatorStyle::Qwen2,
+                        "qwen2" | "qwen3" => (
+                            LLMModel::Qwen(
+                                Qwen::new(
+                                    self.name.as_str() == "qwen3",
+                                    vb,
+                                    &config,
+                                    dtype,
+                                    &device,
+                                    comm,
+                                    Arc::clone(&reporter),
+                                )
+                                .unwrap(),
+                            ),
+                            SeparatorStyle::Qwen,
                         ),
                         "gemma" => (
-                            LLMModel::Gemma(try_api!(Gemma::new(
-                                vb,
-                                &config,
-                                dtype,
-                                &device,
-                                comm,
-                                Arc::clone(&reporter),
-                            ))),
+                            LLMModel::Gemma(
+                                Gemma::new(
+                                    vb,
+                                    &config,
+                                    dtype,
+                                    &device,
+                                    comm,
+                                    Arc::clone(&reporter),
+                                )
+                                .unwrap(),
+                            ),
                             SeparatorStyle::Gemma,
                         ),
                         "mistral" => (
-                            LLMModel::Mistral(try_api!(Mistral::new(
-                                vb,
-                                &config,
-                                dtype,
-                                &device,
-                                comm,
-                                Arc::clone(&reporter),
-                            ))),
+                            LLMModel::Mistral(
+                                Mistral::new(
+                                    vb,
+                                    &config,
+                                    dtype,
+                                    &device,
+                                    comm,
+                                    Arc::clone(&reporter),
+                                )
+                                .unwrap(),
+                            ),
                             SeparatorStyle::Mistral,
                         ),
                         "yi" => (
-                            LLMModel::Yi(try_api!(Yi::new(
-                                vb,
-                                &config,
-                                dtype,
-                                &device,
-                                comm,
-                                Arc::clone(&reporter),
-                            ))),
+                            LLMModel::Yi(
+                                Yi::new(vb, &config, dtype, &device, comm, Arc::clone(&reporter))
+                                    .unwrap(),
+                            ),
                             SeparatorStyle::Yi,
                         ),
                         "stablelm" => (
-                            LLMModel::StableLM(try_api!(StableLM::new(
-                                vb,
-                                &config,
-                                dtype,
-                                &device,
-                                comm,
-                                Arc::clone(&reporter),
-                            ))),
+                            LLMModel::StableLM(
+                                StableLM::new(
+                                    vb,
+                                    &config,
+                                    dtype,
+                                    &device,
+                                    comm,
+                                    Arc::clone(&reporter),
+                                )
+                                .unwrap(),
+                            ),
                             SeparatorStyle::StableLM,
                         ),
                         "deepseek" => (
-                            LLMModel::DeepSeek(try_api!(DeepSeek::load(
-                                vb,
-                                &config,
-                                dtype,
-                                &device,
-                                comm,
-                                Arc::clone(&reporter),
-                            ))),
+                            LLMModel::DeepSeek(
+                                DeepSeek::load(
+                                    vb,
+                                    &config,
+                                    dtype,
+                                    &device,
+                                    comm,
+                                    Arc::clone(&reporter),
+                                )
+                                .unwrap(),
+                            ),
                             SeparatorStyle::Llama3,
                         ),
                         _ => panic!("Model not supported!"),
@@ -536,7 +546,7 @@ impl DefaultLoader {
                         sep_style.push(sep)
                     }
                     Err(e) => {
-                        return Err(e.into());
+                        return Err(e);
                     }
                 }
             }
@@ -569,16 +579,25 @@ impl DefaultLoader {
             let cfg_tokenizer: TokenizerConfig = try_api!(serde_json::from_slice(try_api!(
                 &std::fs::read(tokenizer_cfg_file)
             )));
-            let bos = match cfg_tokenizer.bos_token {
-                BosEosToken(Either::Left(Some(id))) => Some(id),
-                BosEosToken(Either::Right(Some(content))) => content.content.clone(),
-                _ => None,
+            let bos = if cfg_tokenizer.bos_token.is_some() {
+                match cfg_tokenizer.bos_token.unwrap() {
+                    BosEosToken(Either::Left(Some(id))) => Some(id),
+                    BosEosToken(Either::Right(Some(content))) => content.content.clone(),
+                    _ => None,
+                }
+            } else {
+                None
             };
-            let eos = match cfg_tokenizer.eos_token {
-                BosEosToken(Either::Left(Some(id))) => Some(id),
-                BosEosToken(Either::Right(Some(content))) => content.content.clone(),
-                _ => None,
+            let eos = if cfg_tokenizer.eos_token.is_some() {
+                match cfg_tokenizer.eos_token.unwrap() {
+                    BosEosToken(Either::Left(Some(id))) => Some(id),
+                    BosEosToken(Either::Right(Some(content))) => content.content.clone(),
+                    _ => None,
+                }
+            } else {
+                None
             };
+
             (cfg_tokenizer.chat_template, bos, eos)
         } else {
             (None, None, None)
@@ -726,7 +745,7 @@ impl DefaultPipeline {
             LLMModel::Phi3(phi) => phi
                 .forward(&input_tokens, input_positions, kv_cache, &input_metadata)
                 .map_err(APIError::from),
-            LLMModel::Qwen2(qwen2) => qwen2
+            LLMModel::Qwen(qwen) => qwen
                 .forward(&input_tokens, input_positions, kv_cache, &input_metadata)
                 .map_err(APIError::from),
             LLMModel::Gemma(gemma) => gemma
@@ -899,7 +918,7 @@ impl DefaultPipeline {
             LLMModel::Llama(llama) => llama.get_config().clone(),
             LLMModel::Phi2(phi) => phi.get_config().clone(),
             LLMModel::Phi3(phi) => phi.get_config().clone(),
-            LLMModel::Qwen2(qwen2) => qwen2.get_config().clone(),
+            LLMModel::Qwen(qwen) => qwen.get_config().clone(),
             LLMModel::Gemma(gemma) => gemma.get_config().clone(),
             LLMModel::Mistral(mistral) => mistral.get_config().clone(),
             LLMModel::Yi(yi) => yi.get_config().clone(),
