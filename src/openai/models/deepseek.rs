@@ -82,6 +82,7 @@ pub struct DeepSeekConfig {
     pub(crate) qk_nope_head_dim: usize,
     pub(crate) n_group: usize,
     pub(crate) topk_group: usize,
+    pub(crate) sliding_window: Option<usize>,
     pub quantization_config: Option<QuantConfig>,
     pub bos_token_id: TokenID,
     pub eos_token_id: TokenID,
@@ -138,7 +139,7 @@ impl DeepSeekConfig {
             bos_token_id: self.bos_token_id,
             eos_token_id: self.eos_token_id,
             max_seq_len: self.max_position_embeddings,
-            sliding_window: None,
+            sliding_window: self.sliding_window,
             sliding_window_pattern: None,
             hidden_act: Some(self.hidden_act),
             tie_word_embeddings: false,
@@ -167,7 +168,7 @@ pub struct DeepSeekV2RopeConfig {
 }
 
 impl DeepSeekV2RotaryEmbedding {
-    fn new_unscaled(cfg: &DeepSeekV2RopeConfig, dtype: DType, dev: &Device) -> Result<Self> {
+    fn new_unscaled(cfg: &DeepSeekV2RopeConfig, _dtype: DType, dev: &Device) -> Result<Self> {
         let max_seq_len = cfg.max_position_embeddings;
         let dim = cfg.qk_rope_head_dim;
 
@@ -182,8 +183,8 @@ impl DeepSeekV2RotaryEmbedding {
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
 
-        let sin = freqs.sin()?.to_dtype(DType::F32)?.to_device(dev)?;
-        let cos = freqs.cos()?.to_dtype(DType::F32)?.to_device(dev)?;
+        let sin = freqs.sin()?.to_device(dev)?;
+        let cos = freqs.cos()?.to_device(dev)?;
         let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
 
         Ok(Self { sin, cos, cos_sin })
@@ -232,7 +233,7 @@ impl DeepSeekV2RotaryEmbedding {
     #[allow(clippy::too_many_arguments)]
     fn new_yarn(
         cfg: &DeepSeekV2RopeConfig,
-        dtype: DType,
+        _dtype: DType,
         dev: &Device,
         original_max_position_embeddings: usize,
         beta_fast: f32,
@@ -274,12 +275,8 @@ impl DeepSeekV2RotaryEmbedding {
 
         let mscale =
             Self::yarn_get_mscale(factor, mscale) / Self::yarn_get_mscale(factor, mscale_all_dim);
-        let sin = (freqs.sin()? * mscale as f64)?
-            .to_dtype(DType::F32)?
-            .to_device(dev)?;
-        let cos = (freqs.cos()? * mscale as f64)?
-            .to_dtype(DType::F32)?
-            .to_device(dev)?;
+        let sin = (freqs.sin()? * mscale as f64)?.to_device(dev)?;
+        let cos = (freqs.cos()? * mscale as f64)?.to_device(dev)?;
         let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
 
         Ok(Self { sin, cos, cos_sin })
@@ -498,7 +495,7 @@ impl Attention {
                 moe_cfg.v_head_dim,
                 moe_cfg.softmax_scale(),
                 Some(num_kv_heads),
-                None,
+                cfg.sliding_window,
                 vb.device().clone(),
                 None,
             )?,
@@ -1126,27 +1123,6 @@ impl DeepSeek {
         })
     }
 
-    fn prepare_decoder_attention_mask(
-        &self,
-        b_size: usize,
-        tgt_len: usize,
-        input_positions: &[Vec<usize>],
-    ) -> Result<Tensor> {
-        let seqlen_offset = input_positions[0][0];
-        let mask: Vec<_> = (0..tgt_len)
-            .flat_map(|i| (0..tgt_len).map(move |j| if i < j { f32::NEG_INFINITY } else { 0. }))
-            .collect();
-        let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?;
-        let mask = if seqlen_offset > 0 {
-            let mask0 = Tensor::zeros((tgt_len, seqlen_offset), DType::F32, &self.device)?;
-            Tensor::cat(&[&mask0, &mask], D::Minus1)?
-        } else {
-            mask
-        };
-        mask.expand((b_size, 1, tgt_len, tgt_len + seqlen_offset))?
-            .to_dtype(self.dtype)
-    }
-
     pub fn forward(
         &self,
         x: &Tensor,
@@ -1159,7 +1135,14 @@ impl DeepSeek {
         let attention_mask = if seq_len == 1 {
             None
         } else {
-            let mask = self.prepare_decoder_attention_mask(bs, seq_len, input_positions)?;
+            let mask = super::get_attention_casual_mask(
+                &self.device,
+                self.dtype,
+                bs,
+                seq_len,
+                input_positions[0][0],
+                self.cfg.sliding_window,
+            )?;
             Some(mask)
         };
         if let Some(kv_caches) = kv_caches {
