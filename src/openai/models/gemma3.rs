@@ -232,7 +232,7 @@ impl RotaryEmbedding {
             .to_dtype(DType::F32)?
             .reshape((t_len as usize, 1))?;
         let t = (t / factor)?;
-        let freqs = t.matmul(&inv_freq)?.to_dtype(dtype)?;
+        let freqs = t.matmul(&inv_freq)?;
         Ok((freqs.sin()?, freqs.cos()?))
     }
 
@@ -274,7 +274,7 @@ impl RotaryEmbedding {
             {
                 self.cos_sin_sliding.as_ref().unwrap().to_owned()
             } else {
-                self.cos_sin
+                self.cos_sin.to_owned()
             };
             candle_nn::apply_rotary_emb_qkv(
                 &q,
@@ -533,6 +533,7 @@ struct DecoderLayer {
     post_feedforward_layernorm: RmsNorm,
     pre_feedforward_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
+    sliding_window: Option<usize>,
 }
 
 impl DecoderLayer {
@@ -578,6 +579,7 @@ impl DecoderLayer {
             pre_feedforward_layernorm,
             post_feedforward_layernorm,
             post_attention_layernorm,
+            sliding_window,
         })
     }
 
@@ -676,6 +678,7 @@ impl Gemma3 {
         if seq_len <= 1 {
             return Ok((None, None));
         }
+        //normal mask
         let mask = super::get_attention_casual_mask(
             &self.device,
             self.dtype,
