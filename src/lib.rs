@@ -23,10 +23,10 @@ pub enum ModelSelected {
         temperature: Option<f32>,
 
         #[arg(long)]
-        top_p: Option<f64>,
+        top_p: Option<f32>,
 
         #[arg(long)]
-        top_k: Option<usize>,
+        top_k: Option<isize>,
 
         #[arg(long)]
         penalty: Option<f32>,
@@ -48,10 +48,10 @@ pub enum ModelSelected {
         temperature: Option<f32>,
 
         #[arg(long)]
-        top_p: Option<f64>,
+        top_p: Option<f32>,
 
         #[arg(long)]
-        top_k: Option<usize>,
+        top_k: Option<isize>,
 
         #[arg(long)]
         penalty: Option<f32>,
@@ -61,6 +61,9 @@ pub enum ModelSelected {
 
         #[arg(long)]
         quant: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        thinking: bool,
     },
 
     /// Select the phi2 model (default 2.7b).
@@ -73,10 +76,10 @@ pub enum ModelSelected {
         temperature: Option<f32>,
 
         #[arg(long)]
-        top_p: Option<f64>,
+        top_p: Option<f32>,
 
         #[arg(long)]
-        top_k: Option<usize>,
+        top_k: Option<isize>,
 
         #[arg(long)]
         penalty: Option<f32>,
@@ -98,10 +101,10 @@ pub enum ModelSelected {
         temperature: Option<f32>,
 
         #[arg(long)]
-        top_p: Option<f64>,
+        top_p: Option<f32>,
 
         #[arg(long)]
-        top_k: Option<usize>,
+        top_k: Option<isize>,
 
         #[arg(long)]
         penalty: Option<f32>,
@@ -123,10 +126,10 @@ pub enum ModelSelected {
         temperature: Option<f32>,
 
         #[arg(long)]
-        top_p: Option<f64>,
+        top_p: Option<f32>,
 
         #[arg(long)]
-        top_k: Option<usize>,
+        top_k: Option<isize>,
 
         #[arg(long)]
         penalty: Option<f32>,
@@ -147,10 +150,10 @@ pub enum ModelSelected {
         temperature: Option<f32>,
 
         #[arg(long)]
-        top_p: Option<f64>,
+        top_p: Option<f32>,
 
         #[arg(long)]
-        top_k: Option<usize>,
+        top_k: Option<isize>,
 
         #[arg(long)]
         penalty: Option<f32>,
@@ -160,6 +163,9 @@ pub enum ModelSelected {
 
         #[arg(long)]
         quant: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        thinking: bool,
     },
 
     /// Select the gemma model (default 2b).
@@ -172,10 +178,10 @@ pub enum ModelSelected {
         temperature: Option<f32>,
 
         #[arg(long)]
-        top_p: Option<f64>,
+        top_p: Option<f32>,
 
         #[arg(long)]
-        top_k: Option<usize>,
+        top_k: Option<isize>,
 
         #[arg(long)]
         penalty: Option<f32>,
@@ -196,10 +202,10 @@ pub enum ModelSelected {
         temperature: Option<f32>,
 
         #[arg(long)]
-        top_p: Option<f64>,
+        top_p: Option<f32>,
 
         #[arg(long)]
-        top_k: Option<usize>,
+        top_k: Option<isize>,
 
         #[arg(long)]
         penalty: Option<f32>,
@@ -209,6 +215,9 @@ pub enum ModelSelected {
 
         #[arg(long)]
         quant: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        thinking: bool,
     },
 
     /// Select the mistral model (default 7b).
@@ -221,10 +230,10 @@ pub enum ModelSelected {
         temperature: Option<f32>,
 
         #[arg(long)]
-        top_p: Option<f64>,
+        top_p: Option<f32>,
 
         #[arg(long)]
-        top_k: Option<usize>,
+        top_k: Option<isize>,
 
         #[arg(long)]
         penalty: Option<f32>,
@@ -246,10 +255,10 @@ pub enum ModelSelected {
         temperature: Option<f32>,
 
         #[arg(long)]
-        top_p: Option<f64>,
+        top_p: Option<f32>,
 
         #[arg(long)]
-        top_k: Option<usize>,
+        top_k: Option<isize>,
 
         #[arg(long)]
         penalty: Option<f32>,
@@ -290,10 +299,10 @@ pub enum ModelSelected {
         temperature: Option<f32>,
 
         #[arg(long)]
-        top_p: Option<f64>,
+        top_p: Option<f32>,
 
         #[arg(long)]
-        top_k: Option<usize>,
+        top_k: Option<isize>,
 
         #[arg(long)]
         penalty: Option<f32>,
@@ -310,6 +319,9 @@ pub enum ModelSelected {
         //half of the experts can be offloaded to cpu memory
         #[arg(long)]
         num_experts_offload_per_rank: Option<usize>,
+
+        #[arg(long, default_value_t = false)]
+        thinking: bool,
     },
 }
 
@@ -345,6 +357,7 @@ impl Display for ModelSelected {
                 penalty: _,
                 max_gen_tokens: _,
                 quant: _,
+                thinking: _,
             } => write!(f, "qwen3"),
             ModelSelected::Gemma { .. } => write!(f, "gemma"),
             ModelSelected::Gemma3 { .. } => write!(f, "gemma3"),
@@ -360,24 +373,26 @@ impl Display for ModelSelected {
 pub struct SpecificConfig {
     repeat_last_n: Option<usize>,
     temperature: Option<f32>,
-    top_k: Option<usize>,
-    top_p: Option<f64>,
+    top_k: Option<isize>,
+    top_p: Option<f32>,
     penalty: Option<f32>,
     max_gen_tokens: Option<usize>,
     quant: Option<String>,
     num_experts_offload_per_rank: Option<usize>,
+    thinking: bool,
 }
 
 impl SpecificConfig {
     pub fn new(
         repeat_last_n: Option<usize>,
         temperature: Option<f32>,
-        top_k: Option<usize>,
-        top_p: Option<f64>,
+        top_k: Option<isize>,
+        top_p: Option<f32>,
         penalty: Option<f32>,
         max_gen_tokens: Option<usize>,
         quant: Option<String>,
         num_experts_offload_per_rank: Option<usize>,
+        thinking: bool,
     ) -> Self {
         Self {
             repeat_last_n,
@@ -388,6 +403,7 @@ impl SpecificConfig {
             max_gen_tokens,
             quant,
             num_experts_offload_per_rank,
+            thinking,
         }
     }
 }
@@ -395,7 +411,7 @@ impl SpecificConfig {
 pub fn get_model_loader(
     selected_model: ModelSelected,
     model_id: Option<String>,
-) -> (Box<DefaultLoader>, String, Option<String>) {
+) -> (Box<DefaultLoader>, String, String, Option<String>) {
     match selected_model {
         ModelSelected::Llama {
             repeat_last_n,
@@ -416,6 +432,7 @@ pub fn get_model_loader(
                     max_gen_tokens,
                     quant.clone(),
                     None,
+                    false,
                 ),
                 "llama".to_string(),
             )),
@@ -424,6 +441,7 @@ pub fn get_model_loader(
             } else {
                 "meta-llama/Llama-2-7b-chat-hf".to_string()
             },
+            "meta-llama/Llama-2-7b-chat-hf".to_string(),
             quant,
         ),
         ModelSelected::Llama3 {
@@ -434,6 +452,7 @@ pub fn get_model_loader(
             penalty,
             max_gen_tokens,
             quant,
+            thinking,
         } => (
             Box::new(DefaultLoader::new(
                 SpecificConfig::new(
@@ -445,6 +464,7 @@ pub fn get_model_loader(
                     max_gen_tokens,
                     quant.clone(),
                     None,
+                    thinking,
                 ),
                 "llama3".to_string(),
             )),
@@ -453,6 +473,7 @@ pub fn get_model_loader(
             } else {
                 "meta-llama/Meta-Llama-3.1-8B-Instruct".to_string()
             },
+            "meta-llama/Meta-Llama-3.1-8B-Instruct".to_string(),
             quant,
         ),
         ModelSelected::Phi2 {
@@ -474,14 +495,16 @@ pub fn get_model_loader(
                     max_gen_tokens,
                     quant.clone(),
                     None,
+                    false,
                 ),
                 "phi2".to_string(),
             )),
             if let Some(model_id) = model_id {
                 model_id
             } else {
-                "microsoft/microsoft/phi-2".to_string()
+                "microsoft/phi-2".to_string()
             },
+            "microsoft/phi-2".to_string(),
             quant,
         ),
         ModelSelected::Phi3 {
@@ -503,6 +526,7 @@ pub fn get_model_loader(
                     max_gen_tokens,
                     quant.clone(),
                     None,
+                    false,
                 ),
                 "phi3".to_string(),
             )),
@@ -511,6 +535,7 @@ pub fn get_model_loader(
             } else {
                 "microsoft/Phi-3-mini-4k-instruct".to_string()
             },
+            "microsoft/Phi-3-mini-4k-instruct".to_string(),
             quant,
         ),
         ModelSelected::Qwen2 {
@@ -532,6 +557,7 @@ pub fn get_model_loader(
                     max_gen_tokens,
                     quant.clone(),
                     None,
+                    false,
                 ),
                 "qwen2".to_string(),
             )),
@@ -540,6 +566,7 @@ pub fn get_model_loader(
             } else {
                 "Qwen/Qwen1.5-1.8B-Chat".to_string()
             },
+            "Qwen/Qwen1.5-1.8B-Chat".to_string(),
             quant,
         ),
         ModelSelected::Qwen3 {
@@ -550,6 +577,7 @@ pub fn get_model_loader(
             penalty,
             max_gen_tokens,
             quant,
+            thinking,
         } => (
             Box::new(DefaultLoader::new(
                 SpecificConfig::new(
@@ -561,6 +589,7 @@ pub fn get_model_loader(
                     max_gen_tokens,
                     quant.clone(),
                     None,
+                    thinking,
                 ),
                 "qwen3".to_string(),
             )),
@@ -569,6 +598,7 @@ pub fn get_model_loader(
             } else {
                 "Qwen/Qwen3-8B".to_string()
             },
+            "Qwen/Qwen3-8B".to_string(),
             quant,
         ),
         ModelSelected::Gemma {
@@ -590,6 +620,7 @@ pub fn get_model_loader(
                     max_gen_tokens,
                     quant.clone(),
                     None,
+                    false,
                 ),
                 "gemma".to_string(),
             )),
@@ -598,6 +629,7 @@ pub fn get_model_loader(
             } else {
                 "google/gemma-2b-it".to_string()
             },
+            "google/gemma-2b-it".to_string(),
             quant,
         ),
         ModelSelected::Gemma3 {
@@ -608,6 +640,7 @@ pub fn get_model_loader(
             penalty,
             max_gen_tokens,
             quant,
+            thinking,
         } => (
             Box::new(DefaultLoader::new(
                 SpecificConfig::new(
@@ -619,6 +652,7 @@ pub fn get_model_loader(
                     max_gen_tokens,
                     quant.clone(),
                     None,
+                    thinking,
                 ),
                 "gemma3".to_string(),
             )),
@@ -627,6 +661,7 @@ pub fn get_model_loader(
             } else {
                 "google/gemma-3-4b-it".to_string()
             },
+            "google/gemma-3-4b-it".to_string(),
             quant,
         ),
         ModelSelected::Mistral {
@@ -648,6 +683,7 @@ pub fn get_model_loader(
                     max_gen_tokens,
                     quant.clone(),
                     None,
+                    false,
                 ),
                 "mistral".to_string(),
             )),
@@ -656,6 +692,7 @@ pub fn get_model_loader(
             } else {
                 "mistralai/Mistral-7B-Instruct-v0.3".to_string()
             },
+            "mistralai/Mistral-7B-Instruct-v0.3".to_string(),
             quant,
         ),
 
@@ -678,6 +715,7 @@ pub fn get_model_loader(
                     max_gen_tokens,
                     quant.clone(),
                     None,
+                    false,
                 ),
                 "yi".to_string(),
             )),
@@ -686,6 +724,7 @@ pub fn get_model_loader(
             } else {
                 "01-ai/Yi-6B-Chat".to_string()
             },
+            "01-ai/Yi-6B-Chat".to_string(),
             quant,
         ),
 
@@ -706,6 +745,7 @@ pub fn get_model_loader(
                     max_gen_tokens,
                     quant.clone(),
                     None,
+                    false,
                 ),
                 "stablelm".to_string(),
             )),
@@ -714,6 +754,7 @@ pub fn get_model_loader(
             } else {
                 "stabilityai/stablelm-zephyr-3b".to_string()
             },
+            "stabilityai/stablelm-zephyr-3b".to_string(),
             quant,
         ),
         ModelSelected::DeepSeek {
@@ -725,6 +766,7 @@ pub fn get_model_loader(
             max_gen_tokens,
             quant,
             num_experts_offload_per_rank,
+            thinking,
         } => (
             Box::new(DefaultLoader::new(
                 SpecificConfig::new(
@@ -736,6 +778,7 @@ pub fn get_model_loader(
                     max_gen_tokens,
                     quant.clone(),
                     num_experts_offload_per_rank,
+                    thinking,
                 ),
                 "deepseek".to_string(),
             )),
@@ -744,6 +787,7 @@ pub fn get_model_loader(
             } else {
                 "deepseek-ai/DeepSeek-V2-Lite-Chat".to_string()
             },
+            "deepseek-ai/DeepSeek-V2-Lite-Chat".to_string(),
             quant,
         ),
     }

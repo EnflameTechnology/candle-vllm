@@ -455,18 +455,16 @@ impl ReplicatedLinear {
     }
 
     pub fn offload(&mut self) -> Result<()> {
-        if cfg!(feature = "gcu") {
-            self.linear.offload()
-        } else {
-            panic!("tensor offload not available on this device!");
-        }
+        #[cfg(not(feature = "gcu"))]
+        panic!("tensor offload not available on this device!");
+        #[cfg(feature = "gcu")]
+        self.linear.offload()
     }
 
     pub fn reload(&mut self) -> Result<()> {
-        if cfg!(feature = "gcu") {
-            self.linear.reload()
-        } else {
-            panic!("tensor offload not available on this device!");
-        }
+        #[cfg(not(feature = "gcu"))]
+        panic!("tensor offload not available on this device!");
+        #[cfg(feature = "gcu")]
+        self.linear.reload()
     }
 }

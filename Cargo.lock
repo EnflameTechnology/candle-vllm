@@ -423,32 +423,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "candle-core"
-version = "0.8.1"
-source = "git+https://github.com/huggingface/candle.git#cbaa0ad46f0eda2f3d9bcf8a42d6271e6760e578"
-dependencies = [
- "byteorder",
- "gemm",
- "half",
- "memmap2",
- "num-traits",
- "num_cpus",
- "rand 0.8.5",
- "rand_distr 0.4.3",
- "rayon",
- "safetensors",
- "thiserror 1.0.61",
- "ug",
- "yoke",
- "zip",
-]
-
-[[package]]
 name = "candle-examples"
 version = "0.8.1"
 dependencies = [
  "anyhow",
- "candle-core 0.8.1",
+ "candle-core",
  "candle-nn",
  "candle-transformers",
  "csv",
@@ -470,7 +449,7 @@ version = "0.8.1"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.5",
- "candle-core 0.8.1",
+ "candle-core",
  "half",
 ]
 
@@ -496,7 +475,7 @@ name = "candle-nn"
 version = "0.8.1"
 dependencies = [
  "accelerate-src",
- "candle-core 0.8.1",
+ "candle-core",
  "candle-metal-kernels",
  "half",
  "intel-mkl-src",
@@ -514,7 +493,7 @@ version = "0.8.1"
 dependencies = [
  "accelerate-src",
  "byteorder",
- "candle-core 0.8.1",
+ "candle-core",
  "candle-flash-attn",
  "candle-nn",
  "either",
@@ -537,7 +516,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bincode",
- "candle-core 0.8.1",
+ "candle-core",
  "candle-examples",
  "candle-flash-attn",
  "candle-nn",
@@ -563,6 +542,7 @@ dependencies = [
  "metal 0.27.0",
  "metal-kernels",
  "minijinja",
+ "minijinja-contrib",
  "mpi",
  "once_cell",
  "rand 0.9.0",
@@ -2147,7 +2127,7 @@ name = "metal-kernels"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "candle-core 0.8.1 (git+https://github.com/huggingface/candle.git)",
+ "candle-core",
  "metal 0.27.0",
  "once_cell",
  "thiserror 1.0.61",
@@ -2161,10 +2141,21 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "minijinja"
-version = "1.0.21"
+version = "2.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55e877d961d4f96ce13615862322df7c0b6d169d40cab71a7ef3f9b9e594451e"
+checksum = "dd72e8b4e42274540edabec853f607c015c73436159b06c39c7af85a20433155"
 dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "minijinja-contrib"
+version = "2.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "457f85f9c4c5b17d11fcf9bbe7c0dbba64843c5ee040005956f1a510b6679fe2"
+dependencies = [
+ "minijinja",
  "serde",
 ]
 

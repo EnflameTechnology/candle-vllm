@@ -1,6 +1,6 @@
 use super::{get_token, TokenOrFinishReason};
 use crate::backend::progress::{progress_worker, ProgressReporter};
-use crate::openai::logits_processor::{LogitsProcessor, Sampling};
+use crate::openai::logits_processor::LogitsProcessor;
 use crate::openai::models::TokenID;
 use crate::openai::requests::StopTokens;
 use crate::openai::sampling_params::{Logprobs, TopLogprob};
@@ -24,7 +24,7 @@ use crate::{
             phi3::{Phi, PhiConfig},
             quantized_llama::GGUFLLaMa,
             quantized_phi3::GGUFPhi3,
-            quantized_qwen2::GGUFQWen2,
+            quantized_qwen::GGUFQWen,
             qwen::{Qwen, QwenConfig},
             stable_lm::{StableLM, StableLMConfig},
             yi::{Yi, YiConfig},
@@ -67,7 +67,7 @@ enum LLMModel {
     DeepSeek(DeepSeek),
     LlamaGGUF(GGUFLLaMa),
     Phi3GGUF(GGUFPhi3),
-    QWen2GGUF(GGUFQWen2),
+    QWenGGUF(GGUFQWen),
 }
 /// top-p, multinomial, and argmax sampling are implemented. Beam search is not implemented.
 pub struct DefaultPipeline {
@@ -122,16 +122,39 @@ impl DefaultLoader {
     pub fn download_model(
         &self,
         model_id: String,
+        default_model_id: String,
+        weight_file: Option<String>,
+        quant: Option<String>,
         revision: Option<String>,
         hf_token: Option<String>,
         hf_token_path: Option<String>,
     ) -> Result<DefaultModelPaths, APIError> {
+        if quant.is_some() && quant.as_ref().unwrap() == "gguf" && weight_file.is_some() {
+            println!(
+                "Downloading GGUF file {} from repo {}, config files will retrieved form repo {}",
+                weight_file.as_ref().unwrap(),
+                model_id,
+                default_model_id
+            );
+            return self.download_gguf_model(
+                model_id,
+                default_model_id,
+                None,
+                weight_file.clone().unwrap(),
+                hf_token,
+                hf_token_path,
+            );
+        };
         let api = try_api!(ApiBuilder::new()
             .with_progress(true)
             .with_token(Some(get_token(hf_token, hf_token_path)?))
             .build());
         let revision = revision.unwrap_or("main".to_string());
-        let api = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
+        let api = api.repo(Repo::with_revision(
+            model_id,
+            RepoType::Model,
+            revision.clone(),
+        ));
 
         let tokenizer_filename = try_api!(api.get("tokenizer.json"));
 
@@ -157,6 +180,47 @@ impl DefaultLoader {
             tokenizer_filename,
             tokenizer_config_filename,
             config_filename,
+            filenames,
+        })
+    }
+
+    pub fn download_gguf_model(
+        &self,
+        model_id: String,
+        default_model_id: String,
+        revision: Option<String>,
+        filename: String,
+        hf_token: Option<String>,
+        hf_token_path: Option<String>,
+    ) -> Result<DefaultModelPaths, APIError> {
+        let api = hf_hub::api::sync::Api::new().unwrap();
+        let revision = revision.unwrap_or("main".to_string());
+        let mut filenames = vec![];
+        let filename = try_api!(api
+            .repo(hf_hub::Repo::with_revision(
+                model_id,
+                hf_hub::RepoType::Model,
+                revision.to_string(),
+            ))
+            .get(filename.as_str()));
+        filenames.push(filename);
+
+        let api = api.repo(Repo::with_revision(
+            default_model_id,
+            RepoType::Model,
+            revision,
+        ));
+        let tokenizer_filename = try_api!(api.get("tokenizer.json"));
+
+        let tokenizer_config_filename = match api.get("tokenizer_config.json") {
+            Ok(f) => f,
+            _ => "".into(),
+        };
+
+        Ok(DefaultModelPaths {
+            tokenizer_filename,
+            tokenizer_config_filename,
+            config_filename: "".into(),
             filenames,
         })
     }
@@ -192,16 +256,18 @@ impl DefaultLoader {
                 self.name,
                 path.display()
             );
-            let mut file = try_api!(std::fs::File::open(&path.clone()));
             let s_cfg = specific_args.clone();
             let nlayers = {
+                let mut file = try_api!(std::fs::File::open(&path.clone()));
                 let content = try_api!(
                     gguf_file::Content::read(&mut file).map_err(|e| e.with_path(path.clone()))
                 );
                 let nlayers = match self.name.as_str() {
                     "llama" | "llama3" => GGUFLLaMa::get_num_of_layers(content),
                     "phi3" => GGUFPhi3::get_num_of_layers(content),
-                    "qwen2" => GGUFQWen2::get_num_of_layers(content),
+                    "qwen2" | "qwen3" => {
+                        GGUFQWen::get_num_of_layers(self.name.as_str() == "qwen3", content)
+                    }
                     _ => panic!("Model not supported!"),
                 };
                 nlayers.unwrap()
@@ -212,6 +278,7 @@ impl DefaultLoader {
                 Arc::clone(&reporter),
             )
             .await;
+            let mut file = try_api!(std::fs::File::open(&path.clone()));
             let content = try_api!(
                 gguf_file::Content::read(&mut file).map_err(|e| e.with_path(path.clone()))
             );
@@ -252,8 +319,9 @@ impl DefaultLoader {
                     let cfg = model.get_config().clone();
                     (LLMModel::Phi3GGUF(model), cfg, SeparatorStyle::Phi)
                 }
-                "qwen2" => {
-                    let model = try_api!(GGUFQWen2::from_gguf(
+                "qwen2" | "qwen3" => {
+                    let model = try_api!(GGUFQWen::from_gguf(
+                        self.name.as_str() == "qwen3",
                         content,
                         &mut file,
                         &device,
@@ -262,7 +330,7 @@ impl DefaultLoader {
                         Arc::clone(&reporter),
                     ));
                     let cfg = model.get_config().clone();
-                    (LLMModel::QWen2GGUF(model), cfg, SeparatorStyle::Qwen)
+                    (LLMModel::QWenGGUF(model), cfg, SeparatorStyle::Qwen)
                 }
                 _ => panic!("Model not supported!"),
             };
@@ -590,7 +658,10 @@ impl DefaultLoader {
             default_max_tokens,
             penalty: specific_args.penalty.unwrap_or(1.),
             repeat_last_n: specific_args.repeat_last_n.unwrap_or(64),
-            temperature: specific_args.temperature.unwrap_or(0.7),
+            temperature: specific_args.temperature,
+            top_k: specific_args.top_k,
+            top_p: specific_args.top_p,
+            thinking: Some(specific_args.thinking),
         };
 
         let tokenizer_cfg_file = paths.get_tokenizer_config_filename();
@@ -646,18 +717,12 @@ impl DefaultLoader {
             .enumerate()
             .map(|(rank, model)| {
                 let logits_processor = {
-                    let temperature = f64::from(pipeline_config.temperature);
-                    let sampling = if temperature <= 0. {
-                        Sampling::ArgMax
-                    } else {
-                        match (specific_args.top_k, specific_args.top_p) {
-                            (None, None) => Sampling::All { temperature },
-                            (Some(k), None) => Sampling::TopK { k, temperature },
-                            (None, Some(p)) => Sampling::TopP { p, temperature },
-                            (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature },
-                        }
-                    };
-                    LogitsProcessor::from_sampling(SAMPLING_SEED, sampling)
+                    LogitsProcessor::new(
+                        SAMPLING_SEED,
+                        pipeline_config.temperature,
+                        specific_args.top_k,
+                        specific_args.top_p,
+                    )
                 };
                 let tokenizer = Tokenizer::from_file(paths.get_tokenizer_filename())
                     .map_err(|x| APIError::new(x.to_string()))
@@ -694,6 +759,12 @@ impl DefaultLoader {
                     if chat_template.as_ref().unwrap().find("<|eot_id|>").is_some() {
                         tracing::warn!("custom stop token <|eot_id|> in chat template");
                         stop_token_ids.push(128009)
+                    }
+                    if chat_template.as_ref().unwrap().find("<|end|>").is_some() {
+                        tracing::warn!("custom stop token <|end|> in chat template");
+                        if let Some(token) = tokenizer.get_vocab(true).get("<|end|>").copied() {
+                            stop_token_ids.push(token)
+                        };
                     }
                 }
                 if stop_token_ids.is_empty() {
@@ -794,7 +865,7 @@ impl DefaultPipeline {
             LLMModel::LlamaGGUF(llama) => llama
                 .forward(&input_tokens, input_positions, kv_cache, &input_metadata)
                 .map_err(APIError::from),
-            LLMModel::QWen2GGUF(qwen2) => qwen2
+            LLMModel::QWenGGUF(qwen) => qwen
                 .forward(&input_tokens, input_positions, kv_cache, &input_metadata)
                 .map_err(APIError::from),
         }
@@ -874,8 +945,18 @@ impl DefaultPipeline {
         };
 
         let group_ids: Vec<usize> = groups.into_iter().map(|group| group.group_id).collect();
+        let param = &groups[0].sampling_params;
+        let sampling_params =
+            if param.temperature.is_some() && (param.top_k.is_some() || param.top_p.is_some()) {
+                Some(param.to_owned())
+            } else {
+                None
+            };
 
-        let next_tokens = self.logits_processor.sample(&logits).unwrap();
+        let next_tokens = self
+            .logits_processor
+            .sample(&logits, &sampling_params)
+            .unwrap();
         let result: Vec<TokenOrFinishReason> = next_tokens
             .into_par_iter()
             .enumerate()
@@ -966,7 +1047,7 @@ impl DefaultPipeline {
             LLMModel::DeepSeek(deepseek) => deepseek.get_config().clone(),
             LLMModel::Phi3GGUF(phi3) => phi3.get_config().clone(),
             LLMModel::LlamaGGUF(llama) => llama.get_config().clone(),
-            LLMModel::QWen2GGUF(qwen2) => qwen2.get_config().clone(),
+            LLMModel::QWenGGUF(qwen) => qwen.get_config().clone(),
         }
     }
 
