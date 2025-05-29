@@ -141,8 +141,6 @@ impl DefaultLoader {
                 default_model_id,
                 None,
                 weight_file.clone().unwrap(),
-                hf_token,
-                hf_token_path,
             );
         };
         let api = try_api!(ApiBuilder::new()
@@ -190,8 +188,6 @@ impl DefaultLoader {
         default_model_id: String,
         revision: Option<String>,
         filename: String,
-        hf_token: Option<String>,
-        hf_token_path: Option<String>,
     ) -> Result<DefaultModelPaths, APIError> {
         let api = hf_hub::api::sync::Api::new().unwrap();
         let revision = revision.unwrap_or("main".to_string());
