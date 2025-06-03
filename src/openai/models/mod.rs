@@ -1,6 +1,7 @@
 pub mod deepseek;
 pub mod gemma;
 pub mod gemma3;
+pub mod glm4;
 pub mod linear;
 pub mod llama;
 pub mod mistral;
@@ -184,14 +185,63 @@ impl Config {
     }
 }
 
+//chat template embedded in the gguf file
+pub fn get_tokenizer_cfg(ct: &candle_core::quantized::gguf_file::Content) -> Option<String> {
+    use serde_json::json;
+    let md_get = |s: &str| match ct.metadata.get(s) {
+        None => candle_core::bail!("cannot find {s} in metadata"),
+        Some(v) => Ok(v),
+    };
+
+    if ct.metadata.contains_key("tokenizer.chat_template")
+        && ct.metadata.contains_key("tokenizer.ggml.bos_token_id")
+        && ct.metadata.contains_key("tokenizer.ggml.eos_token_id")
+    {
+        match ct.metadata.get("tokenizer.chat_template") {
+            Some(v) => {
+                let chat_template = v.to_string().unwrap().clone();
+                let bos_token_id = md_get("tokenizer.ggml.bos_token_id")
+                    .unwrap()
+                    .to_u32()
+                    .unwrap();
+                let eos_token_id = md_get("tokenizer.ggml.eos_token_id")
+                    .unwrap()
+                    .to_u32()
+                    .unwrap();
+
+                let mut context_length = 4096;
+                for key in ct.metadata.keys() {
+                    if key.find(".context_length").is_some() {
+                        context_length = md_get(key).unwrap().to_u32().unwrap();
+                        println!("{key} : {}", context_length);
+                        break;
+                    }
+                }
+
+                let json_value = json!({
+                    "bos_token": bos_token_id.to_string(),
+                    "eos_token": eos_token_id.to_string(),
+                    "model_max_length": context_length as usize,
+                    "chat_template": chat_template,
+                });
+                Some(json_value.to_string())
+            }
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
 pub fn get_attention_casual_mask(
     device: &Device,
     dtype: DType,
     b_size: usize,
     tgt_len: usize,
-    seqlen_offset: usize,
+    positions: &[Vec<usize>],
     sliding_window: Option<usize>,
 ) -> Result<Tensor> {
+    let seqlen_offset = positions[0][0]; //TODO(guoqingbao): position for each request
     let mask: Vec<_> = if let Some(sliding_window) = sliding_window {
         (0..tgt_len)
             .flat_map(|i| {
@@ -312,8 +362,9 @@ impl AttentionSelect {
         sliding_window: Option<usize>,
         comm: Rc<Comm>,
         device: &Device,
+        paged: bool,
     ) -> Self {
-        if false && cfg.sliding_window.is_some() {
+        if !paged {
             AttentionSelect::Naive(NaiveAttention::new(cfg, sliding_window))
         } else {
             let head_dim = cfg.head_dim.unwrap();

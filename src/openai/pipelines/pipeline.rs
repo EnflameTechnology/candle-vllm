@@ -18,6 +18,8 @@ use crate::{
             deepseek::{DeepSeek, DeepSeekConfig},
             gemma::{Gemma, GemmaConfig},
             gemma3::{Gemma3, Gemma3Config},
+            get_tokenizer_cfg,
+            glm4::{GLMConfig, GLM4},
             llama::{Llama, LlamaConfig},
             mistral::{Mistral, MistralConfig},
             phi2::{Phi2, Phi2Config},
@@ -64,6 +66,7 @@ enum LLMModel {
     Mistral(Mistral),
     Yi(Yi),
     StableLM(StableLM),
+    GLM4(GLM4),
     DeepSeek(DeepSeek),
     LlamaGGUF(GGUFLLaMa),
     Phi3GGUF(GGUFPhi3),
@@ -242,7 +245,7 @@ impl DefaultLoader {
             local_world_size.unwrap() - 1
         };
 
-        let (models, devices, config, sep_style) = if quant.is_some()
+        let (models, devices, config, tokenizer_cfg, sep_style) = if quant.is_some()
             && matches!(quant.as_ref().unwrap().as_str(), "ggml" | "gguf")
         {
             let device = crate::new_device(device_ids[0]).unwrap();
@@ -278,10 +281,10 @@ impl DefaultLoader {
             let content = try_api!(
                 gguf_file::Content::read(&mut file).map_err(|e| e.with_path(path.clone()))
             );
-            let (model, config, sep_style) = match self.name.as_str() {
+            let (model, config, tokenizer_cfg, sep_style) = match self.name.as_str() {
                 "llama" => {
                     let model = try_api!(GGUFLLaMa::from_gguf(
-                        content,
+                        &content,
                         &mut file,
                         &device,
                         dtype,
@@ -289,11 +292,16 @@ impl DefaultLoader {
                         Arc::clone(&reporter),
                     ));
                     let cfg = model.get_config().clone();
-                    (LLMModel::LlamaGGUF(model), cfg, SeparatorStyle::Llama)
+                    (
+                        LLMModel::LlamaGGUF(model),
+                        cfg,
+                        get_tokenizer_cfg(&content),
+                        SeparatorStyle::Llama,
+                    )
                 }
                 "llama3" => {
                     let model = try_api!(GGUFLLaMa::from_gguf(
-                        content,
+                        &content,
                         &mut file,
                         &device,
                         dtype,
@@ -301,11 +309,16 @@ impl DefaultLoader {
                         Arc::clone(&reporter),
                     ));
                     let cfg = model.get_config().clone();
-                    (LLMModel::LlamaGGUF(model), cfg, SeparatorStyle::Llama3)
+                    (
+                        LLMModel::LlamaGGUF(model),
+                        cfg,
+                        get_tokenizer_cfg(&content),
+                        SeparatorStyle::Llama3,
+                    )
                 }
                 "phi3" => {
                     let model = try_api!(GGUFPhi3::from_gguf(
-                        content,
+                        &content,
                         &mut file,
                         &device,
                         dtype,
@@ -313,12 +326,17 @@ impl DefaultLoader {
                         Arc::clone(&reporter),
                     ));
                     let cfg = model.get_config().clone();
-                    (LLMModel::Phi3GGUF(model), cfg, SeparatorStyle::Phi)
+                    (
+                        LLMModel::Phi3GGUF(model),
+                        cfg,
+                        get_tokenizer_cfg(&content),
+                        SeparatorStyle::Phi,
+                    )
                 }
                 "qwen2" | "qwen3" => {
                     let model = try_api!(GGUFQWen::from_gguf(
                         self.name.as_str() == "qwen3",
-                        content,
+                        &content,
                         &mut file,
                         &device,
                         dtype,
@@ -326,12 +344,23 @@ impl DefaultLoader {
                         Arc::clone(&reporter),
                     ));
                     let cfg = model.get_config().clone();
-                    (LLMModel::QWenGGUF(model), cfg, SeparatorStyle::Qwen)
+                    (
+                        LLMModel::QWenGGUF(model),
+                        cfg,
+                        get_tokenizer_cfg(&content),
+                        SeparatorStyle::Qwen,
+                    )
                 }
                 _ => panic!("Model not supported!"),
             };
             handle.join().unwrap();
-            (vec![model], vec![device], config.to_owned(), sep_style)
+            (
+                vec![model],
+                vec![device],
+                config.to_owned(),
+                tokenizer_cfg,
+                sep_style,
+            )
         } else {
             let config = match self.name.as_str() {
                 "llama" | "llama3" => {
@@ -389,7 +418,12 @@ impl DefaultLoader {
                     ),));
                     config.into_config(false, dtype, &specific_args)
                 }
-                #[cfg(feature = "eccl")]
+                "glm4" => {
+                    let config: GLMConfig = try_api!(serde_json::from_slice(&try_api!(
+                        std::fs::read(paths.get_config_filename())
+                    ),));
+                    config.into_config(false, dtype, &specific_args)
+                }
                 "deepseek" => {
                     let config: DeepSeekConfig = try_api!(serde_json::from_slice(&try_api!(
                         std::fs::read(paths.get_config_filename())
@@ -600,6 +634,13 @@ impl DefaultLoader {
                             ),
                             SeparatorStyle::StableLM,
                         ),
+                        "glm4" => (
+                            LLMModel::GLM4(
+                                GLM4::new(vb, &config, dtype, &device, comm, Arc::clone(&reporter))
+                                    .unwrap(),
+                            ),
+                            SeparatorStyle::Llama,
+                        ),
                         "deepseek" => (
                             LLMModel::DeepSeek(
                                 DeepSeek::load(
@@ -638,7 +679,7 @@ impl DefaultLoader {
                 }
             }
 
-            (models, devices, config, sep_style[0].clone())
+            (models, devices, config, None, sep_style[0].clone())
         };
 
         println!("Done loading.");
@@ -660,15 +701,25 @@ impl DefaultLoader {
             thinking: Some(specific_args.thinking),
         };
 
+        //the embedded chat_template in gguf file may not be functional
+        //TODO(guoqingbao): solve problems for embedded chat_template
         let tokenizer_cfg_file = paths.get_tokenizer_config_filename();
+        let tokenizer_cfg = if tokenizer_cfg_file.display().to_string() != ""
+            && Path::exists(&tokenizer_cfg_file)
+        {
+            let tokenizer_cfg: Option<String> = std::fs::read_to_string(tokenizer_cfg_file).ok();
+            tokenizer_cfg
+        } else {
+            tokenizer_cfg
+        };
+
         let (chat_template, bos_token, eos_token): (
             Option<String>,
             Option<String>,
             Option<String>,
-        ) = if tokenizer_cfg_file.display().to_string() != "" && Path::exists(&tokenizer_cfg_file) {
-            let cfg_tokenizer: TokenizerConfig = try_api!(serde_json::from_slice(try_api!(
-                &std::fs::read(tokenizer_cfg_file)
-            )));
+        ) = if tokenizer_cfg.is_some() {
+            let cfg_tokenizer: TokenizerConfig =
+                try_api!(serde_json::from_str(&tokenizer_cfg.unwrap().as_str()));
             let bos = if cfg_tokenizer.bos_token.is_some() {
                 match cfg_tokenizer.bos_token.unwrap() {
                     BosEosToken(Either::Left(Some(id))) => Some(id),
@@ -850,6 +901,9 @@ impl DefaultPipeline {
                 .forward(&input_tokens, input_positions, kv_cache, &input_metadata)
                 .map_err(APIError::from),
             LLMModel::StableLM(stablelm) => stablelm
+                .forward(&input_tokens, input_positions, kv_cache, &input_metadata)
+                .map_err(APIError::from),
+            LLMModel::GLM4(glm4) => glm4
                 .forward(&input_tokens, input_positions, kv_cache, &input_metadata)
                 .map_err(APIError::from),
             LLMModel::DeepSeek(deepseek) => deepseek
@@ -1040,6 +1094,7 @@ impl DefaultPipeline {
             LLMModel::Mistral(mistral) => mistral.get_config().clone(),
             LLMModel::Yi(yi) => yi.get_config().clone(),
             LLMModel::StableLM(stablelm) => stablelm.get_config().clone(),
+            LLMModel::GLM4(glm4) => glm4.get_config().clone(),
             LLMModel::DeepSeek(deepseek) => deepseek.get_config().clone(),
             LLMModel::Phi3GGUF(phi3) => phi3.get_config().clone(),
             LLMModel::LlamaGGUF(llama) => llama.get_config().clone(),

@@ -78,7 +78,7 @@ struct Args {
     kvcache_mem_gpu: usize,
 
     /// Available CPU memory for kvcache (MB)
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 128)]
     kvcache_mem_cpu: usize,
 
     /// Record conversation (default false, the client need to record chat history)
@@ -389,7 +389,7 @@ async fn main() -> Result<(), APIError> {
             let cfg = pipeline.get_model_config();
             let cache_cfg = get_cache_config(
                 args.kvcache_mem_gpu,
-                args.kvcache_mem_cpu,
+                args.kvcache_mem_cpu, //dummy 512MB for cpu
                 args.block_size,
                 &cfg,
                 num_shards,
@@ -446,8 +446,8 @@ async fn main() -> Result<(), APIError> {
 
     #[cfg(feature = "eccl")]
     if args.multi_process {
-        let e = server_data.model.read().unwrap();
-        let mut daemon_manager = e.daemon_manager.write().unwrap();
+        let e = server_data.model.read();
+        let mut daemon_manager = e.daemon_manager.write();
         daemon_manager.as_mut().unwrap().mpi_sync();
     }
 
@@ -455,7 +455,7 @@ async fn main() -> Result<(), APIError> {
         println!(
             "\nMaximum Model Length (affected by `--kvcache-mem-gpu` and the number of ranks):"
         );
-        for batch in [1, 8, 16, 32, 64, 128] {
+        for batch in [1, 8, 16, 32] {
             println!(
                 "-> Batch {}: {}",
                 batch,
@@ -476,7 +476,7 @@ async fn main() -> Result<(), APIError> {
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(Arc::new(server_data));
 
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
         .map_err(|e| APIError::new(e.to_string()))?;
     axum::serve(listener, app)

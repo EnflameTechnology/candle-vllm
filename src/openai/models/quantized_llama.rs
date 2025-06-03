@@ -3,8 +3,7 @@ use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
 use crate::SpecificConfig;
-use candle_core::quantized::QTensor;
-use candle_core::quantized::{ggml_file, gguf_file};
+use candle_core::quantized::{ggml_file, gguf_file, QMatMul};
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module};
 use candle_transformers::quantized_nn::RmsNorm;
@@ -12,23 +11,6 @@ use either::Either;
 use std::iter::zip;
 use std::sync::{Arc, RwLock};
 pub const MAX_SEQ_LEN: usize = 4096;
-
-// QMatMul wrapper adding some tracing.
-#[derive(Debug, Clone)]
-struct QMatMul {
-    inner: candle_core::quantized::QMatMul,
-}
-
-impl QMatMul {
-    fn from_qtensor(qtensor: QTensor) -> Result<Self> {
-        let inner = candle_core::quantized::QMatMul::from_qtensor(qtensor)?;
-        Ok(Self { inner })
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        self.inner.forward(xs)
-    }
-}
 
 #[derive(Debug, Clone)]
 struct Mlp {
@@ -158,8 +140,8 @@ impl LayerWeights {
             let sin = self.sin.narrow(0, seqlen_offset[0], seq_len)?;
             let x_q = q.narrow(0, b, 1)?;
             let x_k = k.narrow(0, b, 1)?;
-            let q_embed = candle_nn::rotary_emb::rope(&x_q, &cos, &sin)?;
-            let k_embed = candle_nn::rotary_emb::rope(&x_k, &cos, &sin)?;
+            let q_embed = candle_nn::rotary_emb::rope_i(&x_q, &cos, &sin)?;
+            let k_embed = candle_nn::rotary_emb::rope_i(&x_k, &cos, &sin)?;
             q_embeds.push(q_embed);
             k_embeds.push(k_embed);
         }
@@ -177,10 +159,10 @@ impl LayerWeights {
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        let (b_sz, seq_len, n_embd) = x.dims3()?;
-        let q = self.attention_wq.forward(x)?.to_dtype(self.dtype)?;
-        let k = self.attention_wk.forward(x)?.to_dtype(self.dtype)?;
-        let v = self.attention_wv.forward(x)?.to_dtype(self.dtype)?;
+        let (b_sz, seq_len, _) = x.dims3()?;
+        let q = self.attention_wq.forward(x)?;
+        let k = self.attention_wk.forward(x)?;
+        let v = self.attention_wv.forward(x)?;
 
         let (q, k, v) = if seq_len == 1 {
             //no need transpose for seq_len == 1, change reshape dim
@@ -202,6 +184,11 @@ impl LayerWeights {
         };
 
         let (q, k) = self.apply_rotary_emb(&q, &k, input_positions)?;
+        let (q, k, v) = (
+            q.to_dtype(self.dtype)?,
+            k.to_dtype(self.dtype)?,
+            v.to_dtype(self.dtype)?,
+        );
 
         let y = self.attn.forward(
             &q,
@@ -215,9 +202,9 @@ impl LayerWeights {
         )?;
 
         let y = if mask.is_some() {
-            y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?
+            y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
         } else {
-            y.reshape(&[b_sz, seq_len, n_embd])?
+            y.reshape((b_sz, seq_len, ()))?
         };
 
         let y = self.attention_wo.forward(&y.to_dtype(x.dtype())?)?;
@@ -232,11 +219,13 @@ pub struct GGUFLLaMa {
     output: QMatMul,
     cfg: Config,
     dtype: DType,
+    device: Device,
 }
 
 fn precomput_freqs_cis(
     head_dim: usize,
     freq_base: f32,
+    context_length: usize,
     device: &Device,
     dtype: DType,
 ) -> Result<(Tensor, Tensor)> {
@@ -245,9 +234,9 @@ fn precomput_freqs_cis(
         .map(|i| 1f32 / freq_base.powf(i as f32 / head_dim as f32))
         .collect();
     let theta = Tensor::new(theta.as_slice(), device)?;
-    let idx_theta = Tensor::arange(0, MAX_SEQ_LEN as u32, device)?
+    let idx_theta = Tensor::arange(0, context_length as u32, device)?
         .to_dtype(DType::F32)?
-        .reshape((MAX_SEQ_LEN, 1))?
+        .reshape((context_length, 1))?
         .matmul(&theta.reshape((1, theta.elem_count()))?)?;
     let cos = idx_theta.cos()?.to_dtype(dtype)?;
     let sin = idx_theta.sin()?.to_dtype(dtype)?;
@@ -257,6 +246,7 @@ fn precomput_freqs_cis(
 impl GGUFLLaMa {
     pub fn into_config(
         embedding_length: usize,
+        head_dim: usize,
         i_size: usize,
         block_count: usize,
         head_count: usize,
@@ -268,7 +258,7 @@ impl GGUFLLaMa {
     ) -> Config {
         Config {
             hidden_size: embedding_length,
-            head_dim: Some(embedding_length / head_count),
+            head_dim: Some(head_dim),
             intermediate_size: i_size,
             vocab_size: 0,
             num_hidden_layers: block_count,
@@ -292,7 +282,7 @@ impl GGUFLLaMa {
             qk_layer_rms_norm: None,
             kv_cache_dtype,
             use_qkv_bias: None,
-            custom_stop_tokens: None,
+            custom_stop_tokens: Some(vec!["<|end_of_text|>".to_string()]),
             specific_config: s_cfg,
             attn_logit_softcapping: None,
             final_logit_softcapping: None,
@@ -308,7 +298,13 @@ impl GGUFLLaMa {
         s_cfg: SpecificConfig,
     ) -> Result<Self> {
         let head_dim = (ct.hparams.n_embd / ct.hparams.n_head) as usize;
-        let (cos, sin) = precomput_freqs_cis(head_dim, 10000., &ct.device, dtype)?;
+        let (cos, sin) = precomput_freqs_cis(
+            head_dim,
+            10000.,
+            MAX_SEQ_LEN as usize,
+            &ct.device,
+            DType::F32,
+        )?;
         let tok_embeddings = ct.remove("tok_embeddings.weight")?;
         let tok_embeddings = tok_embeddings.dequantize(&ct.device)?;
         let norm = RmsNorm::from_qtensor(ct.remove("norm.weight")?, 1e-5)?;
@@ -364,6 +360,7 @@ impl GGUFLLaMa {
             output: QMatMul::from_qtensor(output)?,
             cfg: GGUFLLaMa::into_config(
                 ct.hparams.n_embd as usize,
+                head_dim,
                 0,
                 ct.hparams.n_layer as usize,
                 ct.hparams.n_head as usize,
@@ -374,6 +371,7 @@ impl GGUFLLaMa {
                 s_cfg,
             ),
             dtype,
+            device: ct.device.clone(),
         })
     }
 
@@ -386,7 +384,7 @@ impl GGUFLLaMa {
     }
 
     pub fn from_gguf<R: std::io::Seek + std::io::Read>(
-        ct: gguf_file::Content,
+        ct: &gguf_file::Content,
         reader: &mut R,
         device: &Device,
         dtype: DType,
@@ -410,14 +408,28 @@ impl GGUFLLaMa {
         let head_count_kv = md_get("llama.attention.head_count_kv")?.to_u32()? as usize;
         let block_count = md_get("llama.block_count")?.to_u32()? as usize;
         let embedding_length = md_get("llama.embedding_length")?.to_u32()? as usize;
-        let rope_dim = md_get("llama.rope.dimension_count")?.to_u32()? as usize;
+        // let rope_dim = md_get("llama.rope.dimension_count")?.to_u32()? as usize;
+        let context_length = md_get("llama.context_length")?.to_u32();
+        let context_length = if context_length.is_ok() {
+            context_length.unwrap() as usize
+        } else {
+            MAX_SEQ_LEN as usize
+        };
+        let head_dim = md_get("llama.attention.key_length");
+        let head_dim = if head_dim.is_ok() {
+            head_dim.unwrap().to_u32()? as usize
+        } else {
+            (embedding_length / head_count) as usize
+        };
+
         // Strangely this value is generally 1e-6 in GGUF file but used to be 1e-5 by default.
         let rms_norm_eps = md_get("llama.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
 
         let rope_freq_base = md_get("llama.rope.freq_base")
             .and_then(|m| m.to_f32())
             .unwrap_or(10000f32);
-        let (cos, sin) = precomput_freqs_cis(rope_dim, rope_freq_base, device, dtype)?;
+        let (cos, sin) =
+            precomput_freqs_cis(head_dim, rope_freq_base, context_length, device, DType::F32)?;
 
         let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", device)?;
         let tok_embeddings = tok_embeddings_q.dequantize(device)?;
@@ -485,13 +497,13 @@ impl GGUFLLaMa {
                 ffn_norm: RmsNorm::from_qtensor(ffn_norm, rms_norm_eps)?,
                 n_head: head_count,
                 n_kv_head: head_count_kv,
-                head_dim: embedding_length / head_count,
+                head_dim,
                 cos: cos.clone(),
                 sin: sin.clone(),
                 attn: PagedAttention::new(
                     head_count,
-                    embedding_length / head_count,
-                    1. / ((embedding_length / head_count) as f32).sqrt(),
+                    head_dim,
+                    1. / (head_dim as f32).sqrt(),
                     Some(head_count_kv),
                     None,
                     device.clone(),
@@ -508,31 +520,19 @@ impl GGUFLLaMa {
             output: QMatMul::from_qtensor(output)?,
             cfg: GGUFLLaMa::into_config(
                 embedding_length,
+                head_dim,
                 0,
                 block_count,
                 head_count,
                 head_count_kv,
                 rms_norm_eps,
-                MAX_SEQ_LEN,
+                context_length,
                 dtype,
                 s_cfg,
             ),
             dtype,
+            device: device.clone(),
         })
-    }
-
-    fn prepare_decoder_attention_mask(
-        &self,
-        b_size: usize,
-        tgt_len: usize,
-        device: &Device,
-    ) -> Result<Tensor> {
-        let mask: Vec<_> = (0..tgt_len)
-            .flat_map(|i| (0..tgt_len).map(move |j| if i < j { f32::NEG_INFINITY } else { 0. }))
-            .collect();
-        let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), device)?;
-        mask.expand((b_size, 1, tgt_len, tgt_len))?
-            .to_dtype(self.dtype)
     }
 
     pub fn forward(
@@ -543,10 +543,22 @@ impl GGUFLLaMa {
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
         let (b_sz, seq_len) = x.dims2()?;
-        let mask = if seq_len == 1 {
+        assert!(
+            seq_len < self.cfg.max_seq_len,
+            "Input token length exceed maximum context allowed for this model."
+        );
+        let mask = if seq_len <= 1 {
             None
         } else {
-            Some(self.prepare_decoder_attention_mask(b_sz, seq_len, x.device())?)
+            let mask = super::get_attention_casual_mask(
+                &self.device,
+                self.dtype,
+                b_sz,
+                seq_len,
+                input_positions,
+                self.cfg.sliding_window,
+            )?;
+            Some(mask)
         };
         let mut layer_in = self.tok_embeddings.forward(x)?;
 
@@ -588,8 +600,10 @@ impl GGUFLLaMa {
                 layer_in = x
             }
         }
-        let x = self.norm.forward(&layer_in)?;
-        let x = x.i((.., seq_len - 1, ..))?;
+        let x = layer_in
+            .i((.., seq_len - 1, ..))?
+            .contiguous()?
+            .apply(&self.norm)?;
         self.output.forward(&x)
     }
 

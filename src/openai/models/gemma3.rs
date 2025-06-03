@@ -463,7 +463,13 @@ impl Attention {
             head_dim,
             rotary_emb: rotary_emb.clone(),
             local_sliding_window,
-            attn: super::AttentionSelect::new(cfg, local_sliding_window, comm.clone(), vb.device()),
+            attn: super::AttentionSelect::new(
+                cfg,
+                local_sliding_window,
+                comm.clone(),
+                vb.device(),
+                true,
+            ),
         })
     }
 
@@ -673,7 +679,7 @@ impl Gemma3 {
         &self,
         batch_size: usize,
         seq_len: usize,
-        seqlen_offset: usize,
+        input_positions: &[Vec<usize>],
     ) -> Result<(Option<Tensor>, Option<Tensor>)> {
         if seq_len <= 1 {
             return Ok((None, None));
@@ -684,7 +690,7 @@ impl Gemma3 {
             self.dtype,
             batch_size,
             seq_len,
-            seqlen_offset,
+            input_positions,
             None,
         )?;
 
@@ -693,7 +699,7 @@ impl Gemma3 {
             self.dtype,
             batch_size,
             seq_len,
-            seqlen_offset,
+            input_positions,
             self.cfg.sliding_window,
         )?;
 
@@ -709,7 +715,7 @@ impl Gemma3 {
     ) -> Result<Tensor> {
         let (b_size, seq_len) = input_ids.dims2()?;
         let (attention_mask, sliding_attention_mask) =
-            self.create_attention_masks(b_size, seq_len, input_positions[0][0])?;
+            self.create_attention_masks(b_size, seq_len, input_positions)?;
 
         let xs = self.embed_tokens.forward(input_ids)?;
         let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
@@ -748,7 +754,10 @@ impl Gemma3 {
             }
         }
 
-        let logits = xs.i((.., seq_len - 1, ..))?.apply(&self.norm)?;
+        let logits = xs
+            .i((.., seq_len - 1, ..))?
+            .contiguous()?
+            .apply(&self.norm)?;
         let logits = self.lm_head.forward(&logits)?;
 
         let logits = match self.cfg.final_logit_softcapping {

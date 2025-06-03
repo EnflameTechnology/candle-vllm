@@ -1,55 +1,47 @@
 use super::{Config, QuantConfig};
-use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::openai::distributed::{
-    embedding, rms_norm, Comm, ReplicatedLinear, TensorParallelColumnLinear,
-    TensorParallelRowLinear, VarBuilder,
+    embedding, rms_norm, Comm, MergedParallelColumnLinear, ReplicatedLinear,
+    TensorParallelColumnLinear, TensorParallelRowLinear, VarBuilder,
 };
-use crate::openai::models::TokenID;
 use crate::paged_attention::input_metadata::InputMetadata;
-use crate::paged_attention::PagedAttention;
 use crate::SpecificConfig;
-use candle::{DType, Device, IndexOp, Module, Result, Tensor};
+use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_core as candle;
-use candle_nn::RmsNorm;
+use candle_nn::{Embedding, Module, RmsNorm};
+pub const MAX_SEQ_LEN: usize = 4096;
+use crate::backend::progress::{ProgressLike, ProgressReporter};
+use crate::openai::models::TokenID;
+use either::Either;
 use std::iter::zip;
-use std::rc::Rc;
+pub use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 #[derive(Debug, Clone, serde::Deserialize)]
-pub struct QwenConfig {
+pub struct GLMConfig {
+    pub num_hidden_layers: Option<usize>,
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub head_dim: Option<usize>,
-    pub intermediate_size: usize,
-    pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
-    pub max_position_embeddings: usize,
-    pub sliding_window: Option<usize>,
-    pub max_window_layers: usize,
-    pub tie_word_embeddings: bool, //shared weights between input/output embeddings
-    pub attention_bias: Option<bool>,
-    pub rope_theta: f64,
+    pub intermediate_size: usize,
     pub rms_norm_eps: f64,
-    pub use_sliding_window: Option<bool>,
+    pub rope_theta: Option<f64>,
+    pub partial_rotary_factor: Option<f32>,
     pub hidden_act: candle_nn::Activation,
-    pub bos_token_id: TokenID,
+    pub attention_bias: Option<bool>,
+    pub sliding_window: Option<usize>,
     pub eos_token_id: TokenID,
+    pub max_position_embeddings: Option<usize>,
     pub quantization_config: Option<QuantConfig>,
 }
 
-impl QwenConfig {
+impl GLMConfig {
     pub fn into_config(
         self,
         use_flash_attn: bool,
         kv_cache_dtype: DType,
         scfg: &SpecificConfig,
     ) -> Config {
-        let sliding_window =
-            if self.use_sliding_window.is_some() && self.use_sliding_window.unwrap() {
-                self.sliding_window
-            } else {
-                None
-            };
         Config {
             hidden_size: self.hidden_size,
             head_dim: Some(
@@ -58,27 +50,27 @@ impl QwenConfig {
             ),
             intermediate_size: self.intermediate_size,
             vocab_size: self.vocab_size,
-            num_hidden_layers: self.num_hidden_layers,
+            num_hidden_layers: self.num_hidden_layers.unwrap_or(40),
             num_attention_heads: self.num_attention_heads,
             num_key_value_heads: self.num_key_value_heads,
             rms_norm_eps: self.rms_norm_eps,
-            rope_theta: self.rope_theta,
-            rope_local_base_freq: None,
+            rope_theta: self.rope_theta.unwrap_or(10_000f64),
             use_flash_attn,
-            bos_token_id: self.bos_token_id,
+            bos_token_id: super::TokenID(Either::Left(Some(128256))),
             eos_token_id: self.eos_token_id,
-            max_seq_len: self.max_position_embeddings,
-            sliding_window: sliding_window,
-            sliding_window_pattern: None,
+            max_seq_len: self.max_position_embeddings.unwrap_or(32768),
+            sliding_window: self.sliding_window,
             hidden_act: Some(self.hidden_act),
-            tie_word_embeddings: self.tie_word_embeddings,
+            tie_word_embeddings: false,
+            rope_local_base_freq: None,
+            sliding_window_pattern: None,
             rope_scaling: None,
             original_max_position_embeddings: None,
             attention_bias: self.attention_bias.unwrap_or(false),
-            partial_rotary_factor: None,
+            partial_rotary_factor: self.partial_rotary_factor,
             qk_layer_rms_norm: None,
-            kv_cache_dtype,
             use_qkv_bias: None,
+            kv_cache_dtype,
             custom_stop_tokens: None,
             specific_config: scfg.clone(),
             attn_logit_softcapping: None,
@@ -89,22 +81,34 @@ impl QwenConfig {
     }
 }
 
-#[derive(Debug, Clone)]
 struct RotaryEmbedding {
-    sin: Tensor,
     cos: Tensor,
-    cos_sin: Tensor,
+    sin: Tensor,
+    // inv_freq: Tensor,
+    rotary_dim: usize,
 }
 
+// fn repeat_interleave(xs: &Tensor, repeats: usize, dim: usize) -> Result<Tensor> {
+//     let xs = xs.unsqueeze(dim + 1)?;
+//     let mut dims = xs.dims().to_vec();
+//     dims[dim + 1] = repeats;
+//     xs.broadcast_as(dims)?.flatten(dim, dim + 1)
+// }
+
 impl RotaryEmbedding {
-    fn new(_dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
+    fn new(cfg: &Config, _dtype: DType, dev: &Device) -> Result<Self> {
         let dim = cfg
             .head_dim
             .unwrap_or(cfg.hidden_size / cfg.num_attention_heads);
+        let rotary_dim = if cfg.partial_rotary_factor.is_some() {
+            (cfg.partial_rotary_factor.unwrap() * dim as f32) as usize
+        } else {
+            dim
+        };
         let max_seq_len = cfg.max_seq_len;
-        let inv_freq: Vec<_> = (0..dim)
+        let inv_freq: Vec<_> = (0..rotary_dim)
             .step_by(2)
-            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
+            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / rotary_dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
         let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(DType::F32)?;
@@ -112,125 +116,81 @@ impl RotaryEmbedding {
             .to_dtype(DType::F32)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        let cos = freqs.cos()?;
-        let sin = freqs.sin()?;
-        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
-        Ok(Self { sin, cos, cos_sin })
-    }
-
-    fn apply_rotary_emb_qkv(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        input_positions: &[Vec<usize>],
-    ) -> Result<(Tensor, Tensor)> {
-        let (b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-        if q.device().is_gcu() {
-            let mut _input_positions = Vec::<i32>::new();
-            for seqlen_offset in input_positions {
-                _input_positions.push(seqlen_offset[0] as i32);
-            }
-            candle_nn::apply_rotary_emb_qkv(
-                &q,
-                &k,
-                &self.cos_sin,
-                &self.sin,
-                &_input_positions,
-                0,
-                true,
-                true,
-            )
-        } else {
-            let mut q_embeds = Vec::new();
-            let mut k_embeds = Vec::new();
-            for (b, seqlen_offset) in zip(0..b_sz, input_positions) {
-                let cos = self.cos.narrow(0, seqlen_offset[0], seq_len)?;
-                let sin = self.sin.narrow(0, seqlen_offset[0], seq_len)?;
-                let x_q = q.narrow(0, b, 1)?;
-                let x_k = k.narrow(0, b, 1)?;
-                let q_embed = candle_nn::rotary_emb::rope(&x_q, &cos, &sin).unwrap();
-                let k_embed = candle_nn::rotary_emb::rope(&x_k, &cos, &sin).unwrap();
-                q_embeds.push(q_embed);
-                k_embeds.push(k_embed);
-            }
-            Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
-        }
-    }
-}
-
-struct MLP {
-    gate_proj: TensorParallelColumnLinear,
-    up_proj: TensorParallelColumnLinear,
-    down_proj: TensorParallelRowLinear,
-    act_fn: candle_nn::Activation,
-}
-
-impl MLP {
-    fn new(cfg: &Config, vb: VarBuilder, comm: Rc<Comm>) -> Result<Self> {
-        let hidden_sz = cfg.hidden_size;
-        let intermediate_sz = cfg.intermediate_size;
-
-        let gate_proj = TensorParallelColumnLinear::load_with_hints(
-            hidden_sz,
-            intermediate_sz,
-            false,
-            vb.pp("gate_proj"),
-            comm.clone(),
-            &cfg.specific_config.quant,
-            &cfg.quantization_config,
-        )?;
-        let up_proj = TensorParallelColumnLinear::load_with_hints(
-            hidden_sz,
-            intermediate_sz,
-            false,
-            vb.pp("up_proj"),
-            comm.clone(),
-            &cfg.specific_config.quant,
-            &cfg.quantization_config,
-        )?;
-        let down_proj = TensorParallelRowLinear::load_with_hints(
-            intermediate_sz,
-            hidden_sz,
-            false,
-            vb.pp("down_proj"),
-            comm,
-            &cfg.specific_config.quant,
-            &cfg.quantization_config,
-        )?;
         Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-            act_fn: cfg.hidden_act.unwrap(),
+            sin: freqs.sin()?,
+            cos: freqs.cos()?,
+            rotary_dim,
+            // inv_freq: inv_freq.reshape((1, (), 1))?,
         })
     }
-}
 
-impl Module for MLP {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let lhs = self.act_fn.forward(&self.gate_proj.forward(xs)?)?;
-        let rhs = self.up_proj.forward(xs)?;
-        self.down_proj.forward(&(&lhs * &rhs)?)
+    //TODO(guoqingbao): dynamic rope
+    // pub fn update(
+    //     &self,
+    //     seq_len: usize,
+    //     input_positions: &[Vec<usize>],
+    //     device: &Device,
+    // ) -> Result<(Tensor, Tensor)> {
+    //     let mut position_ids = Vec::<Tensor>::new();
+    //     let b_size = input_positions.len();
+    //     for (b, seqlen_offset) in zip(0..b_size, input_positions) {
+    //         let t = Tensor::arange(
+    //             seqlen_offset[0] as u32,
+    //             seqlen_offset[0] as u32 + seq_len as u32,
+    //             device,
+    //         )?
+    //         .to_dtype(DType::F32)?; //optimize: make a full tensor and chunk from it
+    //         position_ids.push(t);
+    //     }
+    //     let position_ids = Tensor::cat(&position_ids, 0)?.reshape((b_size, (), 1))?;
+    //     let inv_freq_expanded =
+    //         self.inv_freq
+    //             .expand((position_ids.dim(0)?, self.inv_freq.dim(1)?, 1))?;
+    //     let freqs = inv_freq_expanded
+    //         .matmul(&position_ids.t()?)?
+    //         .transpose(1, 2)?
+    //         .contiguous()?;
+    //     let emb = repeat_interleave(&freqs, 2, 2)?;
+    //     let cos = emb.cos()?;
+    //     let sin = emb.sin()?;
+    //     Ok((cos, sin))
+    // }
+
+    fn apply_rotary_emb(&self, xs: &Tensor, input_positions: &[Vec<usize>]) -> Result<Tensor> {
+        let (b_size, _num_heads, seq_len, _headdim) = xs.dims4()?;
+        // let (cos, sin) = self.update(seq_len, &position_ids, &xs.device())?;
+        let mut embeds = Vec::new();
+        for (b, seqlen_offset) in zip(0..b_size, input_positions) {
+            let (s, e) = (seqlen_offset[0], seqlen_offset[0] + seq_len);
+            let cos = self.cos.i((s..e, ..))?.contiguous()?;
+            let sin = self.sin.i((s..e, ..))?.contiguous()?;
+            let xs_rot = xs
+                .i((b, .., .., ..self.rotary_dim))?
+                .unsqueeze(0)?
+                .contiguous()?;
+            let xs_pass = xs.i((b, .., .., self.rotary_dim..))?.unsqueeze(0)?;
+            let xs_rot = candle_nn::rotary_emb::rope_i(&xs_rot, &cos, &sin).unwrap();
+            let embed = Tensor::cat(&[&xs_rot, &xs_pass], D::Minus1)?.contiguous()?;
+            embeds.push(embed);
+        }
+        Tensor::cat(&embeds, 0)
     }
 }
 
-struct Attention {
+struct SelfAttention {
     q_proj: TensorParallelColumnLinear,
     k_proj: TensorParallelColumnLinear,
     v_proj: TensorParallelColumnLinear,
     o_proj: TensorParallelRowLinear,
-    q_norm: Option<RmsNorm>,
-    k_norm: Option<RmsNorm>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
     rotary_emb: Arc<RotaryEmbedding>,
-    attn: PagedAttention,
+    attn: super::AttentionSelect,
 }
 
-impl Attention {
+impl SelfAttention {
     fn new(
-        qwen3: bool,
         rotary_emb: Arc<RotaryEmbedding>,
         cfg: &Config,
         vb: VarBuilder,
@@ -240,7 +200,6 @@ impl Attention {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim.unwrap_or(hidden_sz / num_heads);
-
         let q_proj = TensorParallelColumnLinear::load_with_hints(
             hidden_sz,
             num_heads * head_dim,
@@ -259,6 +218,7 @@ impl Attention {
             &cfg.specific_config.quant,
             &cfg.quantization_config,
         )?;
+
         let v_proj = TensorParallelColumnLinear::load_with_hints(
             hidden_sz,
             num_kv_heads * head_dim,
@@ -279,16 +239,11 @@ impl Attention {
             &cfg.quantization_config,
         )?;
 
-        let q_norm = if qwen3 {
-            Some(rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?)
-        } else {
-            None
-        };
-        let k_norm = if qwen3 {
-            Some(rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?)
-        } else {
-            None
-        };
+        assert!(cfg.num_attention_heads >= comm.world_size());
+        assert!(cfg.num_attention_heads % comm.world_size() == 0);
+
+        assert!(cfg.num_key_value_heads >= comm.world_size());
+        assert!(cfg.num_key_value_heads % comm.world_size() == 0);
 
         let attention_heads = cfg.num_attention_heads / comm.world_size();
         let kv_heads = cfg.num_key_value_heads / comm.world_size();
@@ -297,21 +252,17 @@ impl Attention {
             k_proj,
             v_proj,
             o_proj,
-            q_norm,
-            k_norm,
             num_heads: attention_heads,
             num_kv_heads: kv_heads,
             head_dim,
             rotary_emb,
-            attn: PagedAttention::new(
-                attention_heads,
-                head_dim,
-                1. / ((head_dim as f32).sqrt()),
-                Some(kv_heads),
+            attn: super::AttentionSelect::new(
+                cfg,
                 cfg.sliding_window,
-                vb.device().clone(),
-                None,
-            )?,
+                comm.clone(),
+                vb.device(),
+                true,
+            ),
         })
     }
 
@@ -348,61 +299,85 @@ impl Attention {
             (q, k, v.contiguous()?)
         };
 
-        let (q, k) = if self.q_norm.is_some() && self.k_norm.is_some() {
-            //Per‑head RMSNorm in qwen3
-            let q_flat = q.flatten(0, 2)?; // (B*H, L, D) -> (BHL, D) after transpose later
-            let k_flat = k.flatten(0, 2)?;
-            let q_flat = self.q_norm.as_ref().unwrap().forward(&q_flat)?;
-            let k_flat = self.k_norm.as_ref().unwrap().forward(&k_flat)?;
-            let q = q_flat.reshape((b_sz, self.num_heads, seq_len, self.head_dim))?;
-            let k = k_flat.reshape((b_sz, self.num_kv_heads, seq_len, self.head_dim))?;
-            (q, k)
-        } else {
-            (q, k)
-        };
-
-        let (q, k) = self
+        let q = self
             .rotary_emb
-            .apply_rotary_emb_qkv(&q, &k, input_positions)?;
+            .apply_rotary_emb(&q.to_dtype(DType::F32)?, input_positions)?;
+        let k = self
+            .rotary_emb
+            .apply_rotary_emb(&k.to_dtype(DType::F32)?, input_positions)?;
+        let q = q.to_dtype(v.dtype())?;
+        let k = k.to_dtype(v.dtype())?;
 
-        let y = self.attn.forward(
-            &q,
-            &k,
-            &v,
-            attention_mask,
-            cache.map(|(k_, _)| k_.clone()),
-            cache.map(|(_, v_)| v_.clone()),
-            input_metadata,
-            None,
-        )?;
+        let y = self
+            .attn
+            .forward(&q, &k, &v, attention_mask, cache, input_metadata, None)?;
 
-        let y = if attention_mask.is_some() {
-            y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
-        } else {
-            y.reshape((b_sz, seq_len, ()))?
-        };
         let y = self.o_proj.forward(&y)?;
         Ok(y)
     }
 }
 
+#[allow(clippy::upper_case_acronyms)]
+struct MLP {
+    gate_up_proj: MergedParallelColumnLinear,
+    down_proj: TensorParallelRowLinear,
+    act_fn: candle_nn::Activation,
+}
+
+impl MLP {
+    fn new(cfg: &Config, vb: VarBuilder, comm: Rc<Comm>) -> Result<Self> {
+        let gate_up_proj = MergedParallelColumnLinear::load_merged_with_hints(
+            cfg.hidden_size,
+            cfg.intermediate_size * 2,
+            2,
+            vb.pp("gate_up_proj"),
+            comm.clone(),
+            &cfg.specific_config.quant,
+            &cfg.quantization_config,
+        )?;
+
+        let down_proj = TensorParallelRowLinear::load_with_hints(
+            cfg.intermediate_size,
+            cfg.hidden_size,
+            false,
+            vb.pp("down_proj"),
+            comm,
+            &cfg.specific_config.quant,
+            &cfg.quantization_config,
+        )?;
+
+        Ok(Self {
+            gate_up_proj,
+            down_proj,
+            act_fn: cfg.hidden_act.unwrap(),
+        })
+    }
+}
+
+impl Module for MLP {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let gate_up_states = self.gate_up_proj.forward(xs)?;
+        let up_states = (&gate_up_states[1] * self.act_fn.forward(&gate_up_states[0])?)?;
+        self.down_proj.forward(&up_states)
+    }
+}
+
 struct DecoderLayer {
-    self_attn: Attention,
-    mlp: MLP,
     input_layernorm: RmsNorm,
+    self_attn: SelfAttention,
     post_attention_layernorm: RmsNorm,
+    post_mlp_layernorm: RmsNorm,
+    post_self_attn_layernorm: RmsNorm,
+    mlp: MLP,
 }
 
 impl DecoderLayer {
     fn new(
-        qwen3: bool,
         rotary_emb: Arc<RotaryEmbedding>,
         cfg: &Config,
         vb: VarBuilder,
         comm: Rc<Comm>,
     ) -> Result<Self> {
-        let self_attn = Attention::new(qwen3, rotary_emb, cfg, vb.pp("self_attn"), comm.clone())?;
-        let mlp = MLP::new(cfg, vb.pp("mlp"), comm.clone())?;
         let input_layernorm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = rms_norm(
@@ -410,11 +385,26 @@ impl DecoderLayer {
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
         )?;
+        let post_self_attn_layernorm = rms_norm(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp("post_self_attn_layernorm"),
+        )?;
+        let post_mlp_layernorm = rms_norm(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp("post_mlp_layernorm"),
+        )?;
+        let self_attn =
+            SelfAttention::new(rotary_emb.clone(), cfg, vb.pp("self_attn"), comm.clone())?;
+        let mlp = MLP::new(cfg, vb.pp("mlp"), comm.clone())?;
         Ok(Self {
-            self_attn,
-            mlp,
             input_layernorm,
             post_attention_layernorm,
+            post_self_attn_layernorm,
+            post_mlp_layernorm,
+            self_attn,
+            mlp,
         })
     }
 
@@ -427,30 +417,36 @@ impl DecoderLayer {
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
         let residual = xs;
-        let xs = self.input_layernorm.forward(xs)?;
-        let xs =
-            self.self_attn
-                .forward(&xs, attention_mask, input_positions, cache, input_metadata)?;
-        let xs = (xs + residual)?;
-        let residual = &xs;
-        let xs = xs.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
-        residual + xs
+        let hidden_states = self.input_layernorm.forward(&xs)?;
+        let hidden_states = self.self_attn.forward(
+            &hidden_states,
+            attention_mask,
+            input_positions,
+            cache,
+            input_metadata,
+        )?;
+        let hidden_states = self.post_self_attn_layernorm.forward(&hidden_states)?;
+        let hidden_states = (residual + hidden_states)?;
+        let residual = &hidden_states;
+        let hidden_states = self.post_attention_layernorm.forward(&hidden_states)?;
+        let hidden_states = self.mlp.forward(&hidden_states)?;
+        let hidden_states = self.post_mlp_layernorm.forward(&hidden_states)?;
+        residual + hidden_states
     }
 }
 
-pub struct Qwen {
-    embed_tokens: candle_nn::Embedding,
+pub struct GLM4 {
+    embedding: Embedding,
     layers: Vec<DecoderLayer>,
-    norm: RmsNorm,
     lm_head: ReplicatedLinear,
-    device: Device,
+    norm: RmsNorm,
     dtype: DType,
+    device: Device,
     cfg: Config,
 }
 
-impl Qwen {
+impl GLM4 {
     pub fn new(
-        qwen3: bool,
         vb: VarBuilder,
         cfg: &Config,
         dtype: DType,
@@ -459,41 +455,35 @@ impl Qwen {
         progress_reporter: Arc<RwLock<ProgressReporter>>,
     ) -> Result<Self> {
         let vb_m = vb.pp("model");
-        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        let rotary_emb = Arc::new(RotaryEmbedding::new(dtype, cfg, device)?);
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        let vb_l = vb_m.pp("layers");
         let reporter = progress_reporter.clone();
-        for layer_idx in 0..cfg.num_hidden_layers {
-            let layer = DecoderLayer::new(
-                qwen3,
-                rotary_emb.clone(),
-                cfg,
-                vb_l.pp(layer_idx),
-                comm.clone(),
-            )?;
+
+        let rotary_emb = Arc::new(RotaryEmbedding::new(cfg, dtype, device)?);
+        let embedding = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+
+        let vb_l = vb_m.pp("layers");
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for layer_index in 0..cfg.num_hidden_layers {
+            let layer =
+                DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(layer_index), comm.clone())?;
             layers.push(layer);
-            reporter.write().unwrap().set_progress(layer_idx + 1);
+            reporter.write().unwrap().set_progress(layer_index + 1);
         }
-        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
+
         let lm_head = ReplicatedLinear::load_no_bias(
             cfg.hidden_size,
             cfg.vocab_size,
-            if cfg.tie_word_embeddings {
-                vb_m.pp("embed_tokens")
-            } else {
-                vb.pp("lm_head")
-            },
+            vb.pp("lm_head"),
             &None,
             &None,
         )?;
+        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
         Ok(Self {
-            embed_tokens,
+            embedding,
             layers,
-            norm,
             lm_head,
-            device: device.clone(),
+            norm,
             dtype,
+            device: device.clone(),
             cfg: cfg.clone(),
         })
     }
@@ -519,7 +509,7 @@ impl Qwen {
             )?;
             Some(mask)
         };
-        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let mut xs = self.embedding.forward(input_ids)?;
 
         if let Some(kv_caches) = kv_caches {
             for ((k_cache, v_cache), layer) in zip(kv_caches.iter(), self.layers.iter()) {
@@ -542,7 +532,6 @@ impl Qwen {
                 )?
             }
         }
-
         let xs = xs
             .i((.., seq_len - 1, ..))?
             .contiguous()?

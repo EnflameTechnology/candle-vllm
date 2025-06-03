@@ -39,7 +39,7 @@ serde_default_fn!(usize, first_k_dense_replace, 0);
 serde_default_fn!(bool, norm_topk_prob, false);
 serde_default_fn!(ScoringFunc, scoring_func, ScoringFunc::Softmax);
 serde_default_fn!(Activation, hidden_act, Activation::Silu);
-serde_default_fn!(bool, tie_word_embeddings, false);
+// serde_default_fn!(bool, tie_word_embeddings, false);
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct DeepSeekConfig {
@@ -1140,7 +1140,7 @@ impl DeepSeek {
                 self.dtype,
                 bs,
                 seq_len,
-                input_positions[0][0],
+                input_positions,
                 self.cfg.sliding_window,
             )?;
             Some(mask)
