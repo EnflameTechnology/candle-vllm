@@ -883,11 +883,10 @@ impl LinearX {
         quant_config: &Option<QuantConfig>,
     ) -> Self {
         let ln = Linear::new(weight, bias);
-
-        if let Some(quatized_type) = quant {
+        if let Some(quantized_type) = quant {
             LinearX(Either::Right(QLinear::from_linear_x(
                 ln,
-                quatized_type.clone(),
+                quantized_type.clone(),
                 quant_config,
             )))
         } else {
@@ -918,11 +917,11 @@ pub fn linear_x(
     quant_config: &Option<QuantConfig>,
     dtype: DType,
 ) -> Result<LinearX> {
-    if let Some(quatized_type) = quant {
+    if let Some(quantized_type) = quant {
         let ln = qlinear(in_dim, out_dim, vb, shard, quant_config, true, dtype).unwrap();
         Ok(LinearX(Either::Right(QLinear::from_linear_x(
             ln,
-            quatized_type.clone(),
+            quantized_type.clone(),
             quant_config,
         ))))
     } else {
@@ -941,7 +940,7 @@ pub fn linear_no_bias_x(
     dtype: DType,
     merged_chunks: Option<(usize, usize)>, //(chunk_idx, num_of_chunks)
 ) -> Result<LinearX> {
-    if let Some(quatized_type) = quant {
+    if let Some(quantized_type) = quant {
         //quantized weight in k x n (shift dim in original shards)
         let ln = qlinear(
             in_dim,
@@ -967,7 +966,7 @@ pub fn linear_no_bias_x(
         .unwrap();
         Ok(LinearX(Either::Right(QLinear::from_linear_x(
             ln,
-            quatized_type.clone(),
+            quantized_type.clone(),
             quant_config,
         ))))
     } else {

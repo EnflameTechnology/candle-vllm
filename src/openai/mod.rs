@@ -1,7 +1,9 @@
 use self::{pipelines::llm_engine::LLMEngine, responses::APIError};
+use crate::openai::sampling_params::SamplingParams;
 use candle_core::Device;
 use parking_lot::RwLock;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokenizers::{EncodeInput, Encoding, Tokenizer};
 
 #[cfg(feature = "eccl")]
@@ -12,7 +14,7 @@ pub mod responses;
 pub mod sampling_params;
 pub mod streaming;
 use either::Either;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 pub trait TokenizerWrapper<'s, E>
 where
     E: Into<EncodeInput<'s>>,
@@ -80,6 +82,17 @@ pub struct OpenAIServerData {
     pub pipeline_config: PipelineConfig,
     pub record_conversation: bool,
     pub device: Device,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TaskData {
+    pub seq_id: usize,
+    pub group_id: usize,
+    pub prompt: Encoding,
+    pub request_id: String,
+    pub created: SystemTime,
+    pub sampling_params: SamplingParams,
+    pub use_logprobs: bool,
 }
 
 pub mod conversation;
