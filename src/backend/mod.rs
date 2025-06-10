@@ -1,5 +1,6 @@
 #[cfg(not(feature = "gcu"))]
 mod cache;
+pub mod gguf;
 #[cfg(not(feature = "gcu"))]
 pub mod gptq;
 mod paged_attention;
