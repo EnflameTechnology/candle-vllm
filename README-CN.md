@@ -318,6 +318,67 @@ cargo build --release --features cuda,nccl,mpi #构建MPI功能
     ```
   </details>
 
+- 在多核CPU机器上使用 **NUMA绑定**运行模型
+  <details>
+    <summary>显示命令</summary>
+
+    **前置条件**
+    请确保你的机器有多个 NUMA 节点（即多个物理 CPU），并安装 numactl：
+
+    ```shell
+    sudo apt-get install numactl
+    ```
+
+    假设你的机器有 8 张 GPU 和 2 个 NUMA 节点，每 4 张 GPU 绑定到一个不同的 NUMA 节点。
+    如果你想使用全部 GPU 进行推理，下面的 NUMA 绑定配置可以获得最佳性能：
+
+    ```shell
+    MAP_NUMA_NODE=0,0,0,0,1,1,1,1 numactl --cpunodebind=0 --membind=0 cargo run --release --features cuda,nccl -- --multi-process --dtype bf16 --port 2000 --device-ids "0,1,2,3,4,5,6,7" --weight-path /home/data/DeepSeek-V2-Chat-AWQ-Marlin deep-seek --quant awq --temperature 0. --penalty 1.0
+    ```
+
+    如果你只使用 4 张 GPU，可以使用如下的 NUMA 绑定方式：
+    
+    ```shell
+    MAP_NUMA_NODE=0,0,0,0 numactl --cpunodebind=0 --membind=0 cargo run --release --features cuda,nccl -- --multi-process --dtype bf16 --port 2000 --device-ids "0,1,2,3" --weight-path /home/data/DeepSeek-V2-Chat-AWQ-Marlin deep-seek --quant awq --temperature 0. --penalty 1.0
+    ```
+
+    以上命令中 `numactl --cpunodebind=0 --membind=0`指定了master进程（master rank）绑定的NUMA node，其必须与 `MAP_NUMA_NODE`相匹配。
+    
+    注意： 绑定顺序可能会根据你的硬件配置有所不同。
+  </details>
+
+- 使用**Qwen3-Reranker**进行知识检索
+  <details>
+    <summary>显示命令</summary>
+
+    1) 启动`Qwen3-Reranker`模型服务
+    ```shell
+    target/release/candle-vllm --port 2000 --multi-process --weight-file /home/data/Qwen3-Reranker-4B-q4_k_m.gguf qwen3 --quant gguf
+    ```
+
+    2) 启动迷你聊天机器人并传入`system prompt`
+    ```shell
+    python3 examples/chat.py --thinking True --system_prompt "Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\"."
+    ```
+
+    3) 使用query/doc对进行知识检查，例如：
+    ```shell
+    <Query>: What is the capital of China?\n\n<Document>: The capital of China is Beijing.
+    ```
+
+    观察输出结果：
+    
+    ```shell
+    🙋 Please Input (Ctrl+C to start a new chat or exit): <Query>: What is the capital of China?\n\n<Document>: The capital of China is Beijing.
+    Candle-vLLM: ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    <think>
+    Okay, the user is asking for the capital of China. The document provided is a direct answer: "The capital of China is Beijing." I need to check if this is correct. From my knowledge, Beijing is indeed the capital of China. The answer is correct and straightforward. The document meets the requirement as it provides the accurate information. So the answer is yes.
+    </think>
+
+    yes
+    ```
+  </details>
+
 ## 如何向后端发送请求？
 
 **启动后端服务后运行聊天前端**

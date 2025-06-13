@@ -322,6 +322,65 @@ cargo build --release --features cuda,nccl,mpi #build with mpi feature
     ```
   </details>
 
+- Run with **NUMA binding**
+  <details>
+    <summary>Show command</summary>
+
+    **Prerequisite**
+    Ensure your machine has more than one NUMA node (i.e., more than one physical CPU), and install numactl:
+    ```shell
+    sudo apt-get install numactl
+    ```
+
+    Suppose your machine has 8 GPUs and 2 NUMA nodes, with each set of 4 GPUs bound to a different NUMA node.
+    To achieve optimal performance during inference using all GPUs, use the following NUMA binding:
+
+    ```shell
+    MAP_NUMA_NODE=0,0,0,0,1,1,1,1 numactl --cpunodebind=0 --membind=0 target/release/candle-vllm --multi-process --dtype bf16 --port 2000 --device-ids "0,1,2,3,4,5,6,7" --weight-path /home/data/DeepSeek-V2-Chat-AWQ-Marlin deep-seek --quant awq --temperature 0. --penalty 1.0
+    ```
+
+    To use only 4 GPUs, you can apply this NUMA binding:
+    
+    ```shell
+    MAP_NUMA_NODE=0,0,0,0 numactl --cpunodebind=0 --membind=0 target/release/candle-vllm --multi-process --dtype bf16 --port 2000 --device-ids "0,1,2,3" --weight-path /home/data/DeepSeek-V2-Chat-AWQ-Marlin deep-seek --quant awq --temperature 0. --penalty 1.0
+    ```
+    *where* `numactl --cpunodebind=0 --membind=0` above indicates NUMA binding for the master rank (master process) which should be matched to `MAP_NUMA_NODE`.
+
+    Note: The exact NUMA binding sequence may vary depending on your hardware configuration.
+  </details>
+
+- Run **Qwen3-Reranker**
+  <details>
+    <summary>Show command</summary>
+
+    1) Start the backend service for `Qwen3-Reranker` model
+    ```shell
+    target/release/candle-vllm --port 2000 --multi-process --weight-file /home/data/Qwen3-Reranker-4B-q4_k_m.gguf qwen3 --quant gguf
+    ```
+
+    2) Start the chatbot with `system prompt` for qwen3-reranker
+    ```shell
+    python3 examples/chat.py --thinking True --system_prompt "Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\"."
+    ```
+
+    3) Chat with chatbot for any query/doc pairs, for example,
+    ```shell
+    <Query>: What is the capital of China?\n\n<Document>: The capital of China is Beijing.
+    ```
+
+    Observe the answer:
+    
+    ```shell
+    🙋 Please Input (Ctrl+C to start a new chat or exit): <Query>: What is the capital of China?\n\n<Document>: The capital of China is Beijing.
+    Candle-vLLM: ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    <think>
+    Okay, the user is asking for the capital of China. The document provided is a direct answer: "The capital of China is Beijing." I need to check if this is correct. From my knowledge, Beijing is indeed the capital of China. The answer is correct and straightforward. The document meets the requirement as it provides the accurate information. So the answer is yes.
+    </think>
+
+    yes
+    ```
+  </details>
+
 ## How to send request(s) to the backend?
 
 **Run chat frontend after starting the backend service**
