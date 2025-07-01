@@ -71,11 +71,9 @@ impl<'a, R: std::io::Seek + std::io::Read> Content<'a, R> {
                 }
                 accum
             });
-        if n_splits.len() > 1 {
-            candle_core::bail!("GGUF files have differing `split.count` values: {n_splits:?}. Perhaps the GGUF files do not match?");
-        }
+
         #[allow(clippy::cast_possible_truncation)]
-        if !n_splits.is_empty() && n_readers != n_splits[0] as usize {
+        if !n_splits.is_empty() && n_splits[0] > 0 && n_readers != n_splits[0] as usize {
             candle_core::bail!(
                 "Number of GGUF files does not match the number of splits, expected {} files.",
                 n_splits[0]
@@ -319,20 +317,16 @@ pub fn get_gguf_info<R: std::io::Seek + std::io::Read>(
     let mut context_length = 4096;
     let mut token_types = Vec::<i32>::new();
     for key in metadata.metadata.keys() {
-        if key.find(".context_length").is_some() {
+        if key.contains(".context_length") {
             context_length = md_get(key).unwrap().to_u32().unwrap();
         }
-        if key.find("tokenizer.ggml.token_type").is_none()
-            && key.find("tokenizer.ggml.tokens").is_none()
-            && key.find("tokenizer.ggml.merges").is_none()
-            && key.find("tokenizer.chat_template").is_none()
-        {
+        if !key.contains("tokenizer.") {
             tracing::info!("{key} : {:?}", parse_gguf_value(&md_get(key).unwrap()));
         }
 
-        if key.find("tokenizer.ggml.token_type").is_some() {
+        if key.contains("tokenizer.ggml.token_type") {
             let vtypes: &Vec<Value> = md_get(key).unwrap().to_vec().unwrap();
-            let v: Vec<i32> = vtypes.into_iter().map(|v| v.to_i32().unwrap()).collect();
+            let v: Vec<i32> = vtypes.iter().map(|v| v.to_i32().unwrap()).collect();
             token_types.extend(v);
         }
     }
@@ -418,7 +412,7 @@ fn bpe_tokenizer(p: &PropsGGUF) -> Result<(Tokenizer, TokenizerKind)> {
         })
         .collect::<Vec<_>>();
 
-    let mut vocab = HashMap::new();
+    let mut vocab = ahash::AHashMap::new();
     for (i, token) in p.tokens.iter().enumerate() {
         #[allow(clippy::cast_possible_truncation)]
         vocab.insert(token.clone(), i as u32);

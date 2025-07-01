@@ -351,13 +351,9 @@ impl Attention {
             cache.map(|(_, v_)| v_.clone()),
             input_metadata,
             None,
-        )?;
+        )?
+        .reshape((b_size, seq_len, ()))?;
 
-        let y = if attention_mask.is_some() {
-            y.transpose(1, 2)?.reshape((b_size, seq_len, ()))?
-        } else {
-            y.reshape((b_size, seq_len, ()))?
-        };
         let y = y.to_dtype(dtype)?;
         self.dense.forward(&y)
     }
@@ -470,15 +466,14 @@ impl Phi2 {
         let attention_mask = if seq_len <= 1 {
             None
         } else {
-            let mask = super::get_attention_casual_mask(
+            super::get_attention_casual_mask(
                 &self.device,
                 DType::F32,
                 b_size,
                 seq_len,
                 input_positions,
                 self.cfg.sliding_window,
-            )?;
-            Some(mask)
+            )
         };
         if let Some(kv_caches) = kv_caches {
             for ((k_cache, v_cache), layer) in zip(kv_caches.iter(), self.layers.iter()) {

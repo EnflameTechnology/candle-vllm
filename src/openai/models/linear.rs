@@ -236,6 +236,12 @@ pub fn qlinear(
                 (DType::U32, 32 / cfg.bits)
             };
 
+            let dim = if shards.world_size > 1 {
+                if shards.dim == 1 { 0 } else { 1 }
+            } else {
+                0
+            };
+
             //enflame nk format
             let ws = vb.get_with_hints_dtype(
                 (
@@ -243,19 +249,10 @@ pub fn qlinear(
                     check_k_dim(in_dim, pack_factor, cfg.bits, &cfg.quant_method),
                 ),
                 if marlin_format { "B" } else { "qweight" },
-                Default::default(),
+                shard(dim, shards.rank, shards.world_size),
                 wtype,
             )?;
 
-            let ws = if shards.world_size > 1 {
-                let dim = if shards.dim == 1 { 0 } else { 1 };
-                let dim_size = ws.dims()[dim];
-                let start = shards.rank * (dim_size / shards.world_size);
-                ws.narrow(dim, start, dim_size / shards.world_size)?
-                    .contiguous()?
-            } else {
-                ws
-            };
 
             let scale_and_zero_size = in_dim / (cfg.group_size as usize);
             let scales = vb
@@ -310,7 +307,7 @@ pub fn qlinear(
                     let qzeros = vb.get_with_hints_dtype(
                         (scale_and_zero_size, out_dim),
                         "qzeros",
-                        Default::default(),
+                        shards,
                         if scales.device().is_gcu() {
                             DType::F16
                         } else {
@@ -318,17 +315,8 @@ pub fn qlinear(
                         },
                     )?;
 
-                    let mut qzeros = if qzeros.device().is_gcu() {
+                    let qzeros = if qzeros.device().is_gcu() {
                         qzeros.to_dtype(dtype)?
-                    } else {
-                        qzeros
-                    };
-                    qzeros = if shards.world_size > 1 {
-                        let dim_size = qzeros.dims()[shards.dim];
-                        let start = shards.rank * (dim_size / shards.world_size);
-                        qzeros
-                            .narrow(shards.dim, start, dim_size / shards.world_size)?
-                            .contiguous()?
                     } else {
                         qzeros
                     };
