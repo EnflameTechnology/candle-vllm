@@ -874,7 +874,7 @@ pub fn new_device(ordinal: usize) -> Result<Device> {
     let _guard = GLOBAL_LOCK.lock().unwrap(); // Acquire the lock
     if cuda_is_available() {
         use candle_core::CudaDevice;
-        let device = Device::Cuda(CudaDevice::new_with_stream(ordinal).unwrap());
+        let device = Device::Cuda(CudaDevice::new_with_stream(ordinal)?);
         Ok(device)
     } else if metal_is_available() {
         Ok(Device::new_metal(ordinal)?)
