@@ -1,77 +1,147 @@
-use super::{Config, QuantConfig};
+use super::Config;
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::openai::distributed::{
     embedding, rms_norm, Comm, ReplicatedLinear, TensorParallelColumnLinear,
     TensorParallelRowLinear, VarBuilder,
 };
+use crate::openai::models::QuantConfig;
 use crate::openai::models::TokenID;
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
-use crate::SpecificConfig;
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::{Activation, RmsNorm};
+use either::Either;
 use std::iter::zip;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct MistralConfig {
-    pub vocab_size: usize,
-    pub hidden_size: usize,
-    pub intermediate_size: usize,
-    pub num_hidden_layers: usize,
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub hidden_act: Activation,
-    pub max_position_embeddings: usize,
-    pub rms_norm_eps: f64,
-    pub rope_theta: f64,
-    pub sliding_window: Option<usize>,
-    pub bos_token_id: TokenID,
-    pub eos_token_id: TokenID,
-    pub tie_word_embeddings: Option<bool>,
-    pub quantization_config: Option<QuantConfig>,
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct MistralTextConfig {
+    pub(crate) vocab_size: usize,
+    pub(crate) hidden_size: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) num_hidden_layers: usize,
+    pub(crate) num_attention_heads: usize,
+    pub(crate) num_key_value_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) max_position_embeddings: usize,
+    pub(crate) rms_norm_eps: f64,
+    #[serde(default)]
+    pub(crate) tie_word_embeddings: bool,
+    pub(crate) rope_theta: f64,
+    #[serde(default)]
+    pub(crate) attention_bias: bool,
+    pub(crate) hidden_act: Option<Activation>,
+    pub(crate) sliding_window: Option<usize>,
+    pub(crate) quantization_config: Option<QuantConfig>,
 }
 
-impl MistralConfig {
-    pub fn into_config(
-        self,
-        use_flash_attn: bool,
-        kv_cache_dtype: DType,
-        scfg: &SpecificConfig,
-    ) -> Config {
-        Config {
-            hidden_size: self.hidden_size,
-            head_dim: Some(self.hidden_size / self.num_attention_heads),
-            intermediate_size: self.intermediate_size,
-            vocab_size: self.vocab_size,
-            num_hidden_layers: self.num_hidden_layers,
-            num_attention_heads: self.num_attention_heads,
-            num_key_value_heads: self.num_key_value_heads,
-            rms_norm_eps: self.rms_norm_eps,
-            rope_theta: self.rope_theta,
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct Mistral3Config {
+    pub architectures: Option<Vec<String>>,
+    pub bos_token_id: Option<TokenID>,
+    pub eos_token_id: Option<TokenID>,
+    pub text_config: MistralTextConfig,
+}
+
+impl Mistral {
+    pub fn load_config(filename: &PathBuf, isq: Option<String>) -> Result<Config> {
+        let mut config = Config::load_config(filename.clone())?;
+        config.head_dim = Some(
+            config
+                .head_dim
+                .unwrap_or(config.hidden_size / config.num_attention_heads),
+        );
+        config.num_key_value_heads = Some(
+            config
+                .num_key_value_heads
+                .unwrap_or(config.num_attention_heads),
+        );
+        config.max_seq_len = config.max_position_embeddings.unwrap_or(config.max_seq_len);
+        if config.quantization_config.is_some() {
+            config.quant = Some(
+                config
+                    .quantization_config
+                    .as_ref()
+                    .unwrap()
+                    .quant_method
+                    .clone(),
+            );
+        } else if isq.is_some() {
+            config.quant = Some(isq.unwrap().to_string());
+        }
+        Ok(config)
+    }
+
+    pub fn load_text_config(filename: &PathBuf, isq: Option<String>) -> Result<Config> {
+        let config = match std::fs::read(filename.clone()) {
+            Ok(f) => {
+                let config: Mistral3Config =
+                    serde_json::from_slice(&f).map_err(candle_core::Error::wrap)?;
+                config
+            }
+            Err(e) => panic!("Unable to load config file {:?}", e),
+        };
+
+        let bos_token_id = config
+            .bos_token_id
+            .unwrap_or(super::TokenID(Either::Left(Some(1))));
+
+        let eos_token_id = config
+            .eos_token_id
+            .unwrap_or(super::TokenID(Either::Left(Some(2))));
+
+        let quant = if config.text_config.quantization_config.is_some() {
+            Some(
+                config
+                    .text_config
+                    .quantization_config
+                    .as_ref()
+                    .unwrap()
+                    .quant_method
+                    .clone(),
+            )
+        } else if isq.is_some() {
+            Some(isq.unwrap().to_string())
+        } else {
+            None
+        };
+
+        let config = Config {
+            architectures: config.architectures,
+            hidden_size: config.text_config.hidden_size,
+            head_dim: Some(config.text_config.head_dim),
+            intermediate_size: config.text_config.intermediate_size,
+            vocab_size: config.text_config.vocab_size,
+            num_hidden_layers: config.text_config.num_hidden_layers,
+            num_attention_heads: config.text_config.num_attention_heads,
+            num_key_value_heads: Some(config.text_config.num_key_value_heads),
+            rms_norm_eps: config.text_config.rms_norm_eps,
+            rope_theta: config.text_config.rope_theta,
             rope_local_base_freq: None,
-            use_flash_attn,
-            bos_token_id: self.bos_token_id,
-            eos_token_id: self.eos_token_id,
-            max_seq_len: self.max_position_embeddings,
-            sliding_window: self.sliding_window,
+            bos_token_id: Some(bos_token_id),
+            eos_token_id,
+            max_seq_len: config.text_config.max_position_embeddings,
+            sliding_window: config.text_config.sliding_window,
             sliding_window_pattern: None,
-            hidden_act: Some(self.hidden_act),
-            tie_word_embeddings: self.tie_word_embeddings.unwrap_or(false),
+            hidden_act: Some(config.text_config.hidden_act.unwrap_or(Activation::Silu)),
+            hidden_activation: None,
+            tie_word_embeddings: config.text_config.tie_word_embeddings,
             rope_scaling: None,
-            original_max_position_embeddings: None,
-            attention_bias: false,
+            max_position_embeddings: Some(config.text_config.max_position_embeddings),
+            original_max_position_embeddings: config.text_config.max_position_embeddings,
+            attention_bias: Some(config.text_config.attention_bias),
             partial_rotary_factor: None,
-            qk_layer_rms_norm: None,
-            kv_cache_dtype,
+            qk_layernorm: false,
             use_qkv_bias: None,
             custom_stop_tokens: None,
-            specific_config: scfg.clone(),
             attn_logit_softcapping: None,
             final_logit_softcapping: None,
-            quantization_config: self.quantization_config,
+            quantization_config: config.text_config.quantization_config.clone(),
             moe_config: None,
-        }
+            quant,
+        };
+        Ok(config)
     }
 }
 
@@ -163,7 +233,7 @@ impl Mlp {
             false,
             vb.pp("gate_proj"),
             comm.clone(),
-            &cfg.specific_config.quant,
+            &cfg.quant,
             &cfg.quantization_config,
         )?;
         let up_proj = TensorParallelColumnLinear::load_with_hints(
@@ -172,7 +242,7 @@ impl Mlp {
             false,
             vb.pp("up_proj"),
             comm.clone(),
-            &cfg.specific_config.quant,
+            &cfg.quant,
             &cfg.quantization_config,
         )?;
         let down_proj = TensorParallelRowLinear::load_with_hints(
@@ -181,7 +251,7 @@ impl Mlp {
             false,
             vb.pp("down_proj"),
             comm,
-            &cfg.specific_config.quant,
+            &cfg.quant,
             &cfg.quantization_config,
         )?;
         Ok(Self {
@@ -222,7 +292,7 @@ impl Attention {
     ) -> Result<Self> {
         let hidden_sz = cfg.hidden_size;
         let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
+        let num_kv_heads = cfg.num_key_value_heads.unwrap();
         let head_dim = hidden_sz / num_heads;
         let q_proj = TensorParallelColumnLinear::load_with_hints(
             hidden_sz,
@@ -230,7 +300,7 @@ impl Attention {
             false,
             vb.pp("q_proj"),
             comm.clone(),
-            &cfg.specific_config.quant,
+            &cfg.quant,
             &cfg.quantization_config,
         )?;
         let k_proj = TensorParallelColumnLinear::load_with_hints(
@@ -239,7 +309,7 @@ impl Attention {
             false,
             vb.pp("k_proj"),
             comm.clone(),
-            &cfg.specific_config.quant,
+            &cfg.quant,
             &cfg.quantization_config,
         )?;
         let v_proj = TensorParallelColumnLinear::load_with_hints(
@@ -248,7 +318,7 @@ impl Attention {
             false,
             vb.pp("v_proj"),
             comm.clone(),
-            &cfg.specific_config.quant,
+            &cfg.quant,
             &cfg.quantization_config,
         )?;
 
@@ -258,11 +328,11 @@ impl Attention {
             false,
             vb.pp("o_proj"),
             comm.clone(),
-            &cfg.specific_config.quant,
+            &cfg.quant,
             &cfg.quantization_config,
         )?;
         let attention_heads = cfg.num_attention_heads / comm.world_size();
-        let kv_heads = cfg.num_key_value_heads / comm.world_size();
+        let kv_heads = cfg.num_key_value_heads.unwrap() / comm.world_size();
         Ok(Self {
             q_proj,
             k_proj,

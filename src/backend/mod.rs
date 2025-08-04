@@ -8,10 +8,11 @@ mod paged_attention;
 pub fn get_or_load_func(
     ptx_file: &'static str,
     kernel_base: &str,
-    dtype: DType,
+    dtype: candle_core::DType,
     suffix: Option<&str>,
     device: &CudaDevice,
 ) -> Result<CudaFunction, APIError> {
+    use candle_core::DType;
     let spec = match dtype {
         DType::U8 => "_u8",
         DType::I8 => "_i8",
@@ -34,6 +35,7 @@ pub fn get_or_load_func(
         .map_err(APIError::from)
 }
 
+#[allow(unused_imports)]
 use crate::openai::responses::APIError;
 #[cfg(not(feature = "gcu"))]
 pub use cache::*;

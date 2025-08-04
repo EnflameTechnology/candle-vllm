@@ -1,5 +1,5 @@
 use self::{pipelines::llm_engine::LLMEngine, responses::APIError};
-use crate::openai::sampling_params::SamplingParams;
+use crate::openai::sampling_params::{GenerationConfig, SamplingParams};
 use candle_core::Device;
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -40,12 +40,7 @@ where
 pub struct PipelineConfig {
     pub max_model_len: usize,
     pub default_max_tokens: usize,
-    pub penalty: f32,
-    pub repeat_last_n: usize,
-    pub temperature: Option<f32>,
-    pub top_k: Option<isize>,
-    pub top_p: Option<f32>,
-    pub thinking: Option<bool>,
+    pub generation_cfg: Option<GenerationConfig>,
 }
 
 #[derive(Deserialize, Debug, Clone)]

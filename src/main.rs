@@ -3,23 +3,21 @@ use axum::{
     routing::post,
     Router,
 };
-use candle_core::{DType, Device};
+use candle_core::{DType, Device, Result};
 #[cfg(feature = "eccl")]
 use candle_vllm::backend::heartbeat;
 use candle_vllm::openai::openai_server::chat_completions;
 use candle_vllm::openai::pipelines::llm_engine::LLMEngine;
-use candle_vllm::openai::pipelines::pipeline::DefaultModelPaths;
-use candle_vllm::openai::responses::APIError;
+use candle_vllm::openai::pipelines::pipeline::DefaultLoader;
+use candle_vllm::openai::sampling_params::GenerationConfig;
 use candle_vllm::openai::OpenAIServerData;
 use candle_vllm::scheduler::cache_engine::{CacheConfig, CacheEngine};
 use candle_vllm::scheduler::SchedulerConfig;
-use candle_vllm::{get_model_loader, hub_load_local_safetensors, ModelSelected};
 use clap::Parser;
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 use tracing::{info, warn};
 const SIZE_IN_MB: usize = 1024 * 1024;
 use candle_vllm::openai::models::Config;
-use std::path::Path;
 use tokio::sync::Notify;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 #[derive(Parser, Debug)]
@@ -35,15 +33,12 @@ struct Args {
     hf_token_path: Option<String>,
 
     /// Port to serve on (localhost:port)
-    #[arg(long)]
+    #[arg(long = "p", default_value_t = 2000)]
     port: u16,
 
     /// Set verbose mode (print all requests)
     #[arg(long)]
     verbose: bool,
-
-    #[clap(subcommand)]
-    command: ModelSelected,
 
     /// Maximum number of sequences to allow
     #[arg(long, default_value_t = 256)]
@@ -54,26 +49,29 @@ struct Args {
     block_size: usize,
 
     /// if weight_path is passed, it will ignore the model_id
-    #[arg(long)]
+    #[arg(long = "m")]
     model_id: Option<String>,
 
     /// The folder name that contains safetensor weights and json files
     /// (same structure as huggingface online), path must include last "/"
-    #[arg(long)]
+    #[arg(long = "w")]
     weight_path: Option<String>,
 
     /// The quantized weight file name (for gguf/ggml file)
-    #[arg(long)]
+    #[arg(long = "f")]
     weight_file: Option<String>,
 
     #[arg(long)]
     dtype: Option<String>,
 
+    #[arg(long)]
+    isq: Option<String>,
+
     #[arg(long, default_value_t = false)]
     cpu: bool,
 
     /// Available GPU memory for kvcache (MB)
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long = "mem", default_value_t = 4096)]
     kvcache_mem_gpu: usize,
 
     /// Available CPU memory for kvcache (MB)
@@ -84,7 +82,7 @@ struct Args {
     #[arg(long)]
     record_conversation: bool,
 
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long = "d", value_delimiter = ',')]
     device_ids: Option<Vec<usize>>,
 
     /// Maximum waiting time for processing parallel requests (in milliseconds).
@@ -92,12 +90,24 @@ struct Args {
     #[arg(long, default_value_t = 500)]
     holding_time: usize,
 
-    //Whether the program running in multiprocess or multithread model for parallel inference
+    //Whether the program is forced running in multithread model for parallel inference (for debug)
     #[arg(long, default_value_t = false)]
-    multi_process: bool,
+    multithread: bool,
 
     #[arg(long, default_value_t = false)]
     log: bool,
+
+    #[arg(long)]
+    temperature: Option<f32>,
+
+    #[arg(long)]
+    top_p: Option<f32>,
+
+    #[arg(long)]
+    top_k: Option<isize>,
+
+    #[arg(long)]
+    penalty: Option<f32>,
 }
 
 fn get_cache_config(
@@ -105,20 +115,21 @@ fn get_cache_config(
     kvcache_mem_cpu: usize,
     block_size: usize,
     config: &Config,
+    kv_dtype: DType,
     num_shards: usize,
 ) -> CacheConfig {
-    let dsize = config.kv_cache_dtype.size_in_bytes();
+    let dsize = kv_dtype.size_in_bytes();
     let num_gpu_blocks = kvcache_mem_gpu * SIZE_IN_MB
         / dsize
         / block_size
-        / (config.num_key_value_heads / num_shards)
+        / (config.num_key_value_heads.unwrap() / num_shards)
         / config.k_head_dim()
         / config.num_hidden_layers
         / 2;
     let num_cpu_blocks = kvcache_mem_cpu * SIZE_IN_MB
         / dsize
         / block_size
-        / (config.num_key_value_heads / num_shards)
+        / (config.num_key_value_heads.unwrap() / num_shards)
         / config.k_head_dim()
         / config.num_hidden_layers
         / 2;
@@ -127,15 +138,11 @@ fn get_cache_config(
         num_gpu_blocks: Some(num_gpu_blocks),
         num_cpu_blocks: Some(num_cpu_blocks),
         fully_init: true,
-        dtype: config.kv_cache_dtype,
+        dtype: kv_dtype,
     }
 }
 
-fn config_log(
-    logger: ftail::Ftail,
-    log_enable: bool,
-    log_file: String,
-) -> Result<(), ftail::error::FtailError> {
+fn config_log(logger: ftail::Ftail, log_enable: bool, log_file: String) -> Result<()> {
     if !log_enable {
         return Ok(());
     }
@@ -165,103 +172,11 @@ fn config_log(
         .console(cfg_filter)
         .single_file(log_file.as_str(), true, cfg_filter)
         .init()
+        .map_err(candle_core::Error::wrap)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), APIError> {
-    let args = Args::parse();
-    if !args.log {
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .init();
-    }
-
-    let (loader, model_id, quant) = get_model_loader(args.command, args.model_id.clone());
-    if args.model_id.is_none() && args.weight_path.is_none() && args.weight_file.is_none() {
-        info!("No model id specified, using the default model_id or specified in the weight_path to retrieve config files!");
-    }
-
-    let paths = match (&args.weight_path, &args.weight_file) {
-        //model in a folder (safetensor format, huggingface folder structure)
-        (Some(path), None) => DefaultModelPaths {
-            tokenizer_filename: Path::new(path).join("tokenizer.json"),
-            tokenizer_config_filename: Path::new(path).join("tokenizer_config.json"),
-            config_filename: Path::new(path).join("config.json"),
-            filenames: if Path::new(path)
-                .join("model.safetensors.index.json")
-                .exists()
-            {
-                hub_load_local_safetensors(path, "model.safetensors.index.json").unwrap()
-            } else {
-                //a single weight file case
-                let mut safetensors_files = Vec::<std::path::PathBuf>::new();
-                safetensors_files.insert(0, Path::new(path).join("model.safetensors"));
-                safetensors_files
-            },
-        },
-        //model in a quantized file (gguf/ggml format)
-        (path, Some(file)) => DefaultModelPaths {
-            tokenizer_filename: PathBuf::new(),
-            tokenizer_config_filename: PathBuf::new(),
-            config_filename: PathBuf::new(),
-            filenames: {
-                let path = path.clone().unwrap_or("".to_string());
-                if Path::new(&path).join(file).exists() {
-                    vec![Path::new(&path).join(file)]
-                } else {
-                    panic!("Model file not found {file}");
-                }
-            },
-        },
-        _ => {
-            //try download model anonymously
-            let loaded = loader.download_model(
-                model_id.clone(),
-                args.weight_file.clone(),
-                quant.clone(),
-                None,
-                args.hf_token.clone(),
-                args.hf_token_path.clone(),
-            );
-            if loaded.is_ok() {
-                loaded.unwrap()
-            } else {
-                //if it's failed, try using huggingface token
-                info!("Try request model using cached huggingface token...");
-                if args.hf_token.is_none() && args.hf_token_path.is_none() {
-                    //no token provided
-                    let token_path = format!(
-                        "{}/.cache/huggingface/token",
-                        dirs::home_dir()
-                            .ok_or(APIError::new_str("No home directory"))?
-                            .display()
-                    );
-                    if !Path::new(&token_path).exists() {
-                        //also no token cache
-                        use std::io::Write;
-                        let mut input_token = String::new();
-                        warn!("Unable to request model, please provide your huggingface token to download model:\n");
-                        std::io::stdin()
-                            .read_line(&mut input_token)
-                            .expect("Failed to read token!");
-                        std::fs::create_dir_all(Path::new(&token_path).parent().unwrap()).unwrap();
-                        let mut output = std::fs::File::create(token_path).unwrap();
-                        write!(output, "{}", input_token.trim()).expect("Failed to save token!");
-                    }
-                }
-                loader.download_model(
-                    model_id,
-                    args.weight_file,
-                    quant.clone(),
-                    None,
-                    args.hf_token,
-                    args.hf_token_path,
-                )?
-            }
-        }
-    };
-
-    let dtype = match args.dtype.as_deref() {
+fn get_dtype(dtype: Option<String>) -> DType {
+    let dtype = match dtype.as_deref() {
         Some("f16") => DType::F16,
         Some("bf16") => DType::BF16,
         Some("f32") => DType::F32,
@@ -269,6 +184,65 @@ async fn main() -> Result<(), APIError> {
         None => DType::BF16,
     };
 
+    #[cfg(feature = "cuda")]
+    let dtype = {
+        use candle_core::cuda_backend::cudarc::driver::result::{device, init};
+        use candle_core::cuda_backend::cudarc::driver::sys::CUdevice_attribute;
+        match (init(), device::get(0)) {
+            (Ok(_), Ok(d)) => {
+                let (compute_major, compute_minor) = unsafe {
+                    (
+                        device::get_attribute(
+                            d,
+                            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                        )
+                        .unwrap_or(8),
+                        device::get_attribute(
+                            d,
+                            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                        )
+                        .unwrap_or(8),
+                    )
+                };
+                info!(
+                    "CUDA compute capability: {}.{}",
+                    compute_major, compute_minor,
+                );
+                if dtype != DType::F32 && compute_major < 8 {
+                    warn!(
+                        "CUDA compute capability: {} (<8), switched to F16 cause no BF16 support.",
+                        compute_major
+                    );
+                    DType::F16
+                } else {
+                    dtype
+                }
+            }
+            _ => dtype,
+        }
+    };
+    dtype
+}
+
+#[tokio::main]
+#[allow(unused_mut)]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    if !args.log {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .init();
+    }
+
+    let loader = Box::new(DefaultLoader::new(
+        args.model_id,
+        args.weight_path,
+        args.weight_file,
+    ));
+
+    let (paths, gguf) = loader.prepare_model_weights(args.hf_token, args.hf_token_path)?;
+
+    let dtype = get_dtype(args.dtype);
     let device_ids: Vec<usize> = match args.device_ids {
         Some(ids) => ids,
         _ => vec![0usize],
@@ -281,17 +255,29 @@ async fn main() -> Result<(), APIError> {
         "More than one shard was given, but ECCL is not enabled for parallel inference!"
     );
 
-    if num_shards > 1
-        && quant.is_some()
-        && matches!(quant.as_ref().unwrap().as_str(), "ggml" | "gguf")
-    {
+    if gguf && num_shards > 1 {
         panic!("Multiple device-ids detected: ggml/gguf model is not supported for multi-rank inference!");
     }
 
-    let logger = ftail::Ftail::new();
+    if gguf && args.isq.is_some() {
+        panic!("Quantized gguf/ggml model does not support isq option!");
+    }
+
+    let multi_process = if num_shards > 1 {
+        if args.multithread {
+            tracing::warn!("The program is forced running under multithread mode (for debug purpose), which may not stable!");
+            false
+        } else {
+            tracing::warn!("Multi-process mode is automatically enabled for multi-rank inference!");
+            true
+        }
+    } else {
+        !args.multithread
+    };
+    let logger: ftail::Ftail = ftail::Ftail::new();
     let mut port = args.port;
     #[cfg(feature = "eccl")]
-    let (pipelines, global_rank, daemon_manager) = if args.multi_process {
+    let (pipelines, global_rank, daemon_manager) = if multi_process {
         use candle_vllm::openai::communicator::init_subprocess;
         let (id, local_rank, global_rank, global_world_size, daemon_manager) =
             init_subprocess(device_ids.clone()).unwrap();
@@ -310,7 +296,8 @@ async fn main() -> Result<(), APIError> {
                 .load_model(
                     paths,
                     dtype,
-                    &quant,
+                    gguf,
+                    args.isq.clone(),
                     vec![device_ids[local_rank]],
                     Some(id),
                     Some(local_rank),
@@ -330,7 +317,16 @@ async fn main() -> Result<(), APIError> {
         (
             loader
                 .load_model(
-                    paths, dtype, &quant, device_ids, None, None, None, None, None,
+                    paths,
+                    dtype,
+                    gguf,
+                    args.isq.clone(),
+                    device_ids,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                 )
                 .await,
             0,
@@ -341,7 +337,7 @@ async fn main() -> Result<(), APIError> {
     #[cfg(feature = "eccl")]
     info!(
         "parallel model: {}!",
-        if args.multi_process {
+        if multi_process {
             "multiprocess"
         } else {
             "multithread"
@@ -354,13 +350,13 @@ async fn main() -> Result<(), APIError> {
         let _ = config_log(logger, args.log, log_file);
         (
             loader
-                .load_model(paths, dtype, &quant, device_ids, None, None)
+                .load_model(paths, dtype, gguf, args.isq.clone(), device_ids, None, None)
                 .await,
             0,
         )
     };
 
-    let (default_pipelines, pipeline_config) = match pipelines {
+    let (default_pipelines, mut pipeline_config) = match pipelines {
         Err(e) => panic!("{e:?}"),
         Ok((p, c)) => (p, c),
     };
@@ -371,11 +367,17 @@ async fn main() -> Result<(), APIError> {
         .into_iter()
         .map(|pipeline| {
             let cfg = pipeline.get_model_config();
+            let kv_dtype = if matches!(pipeline.name(), "phi2" | "PhiForCausalLM") {
+                DType::F32
+            } else {
+                dtype
+            };
             let cache_cfg = get_cache_config(
                 args.kvcache_mem_gpu,
                 args.kvcache_mem_cpu, //dummy 512MB for cpu
                 args.block_size,
                 &cfg,
+                kv_dtype,
                 num_shards,
             );
             let cache_engine = CacheEngine::new(
@@ -410,10 +412,21 @@ async fn main() -> Result<(), APIError> {
         Arc::new(Notify::new()),
         args.holding_time,
         num_shards,
-        args.multi_process,
+        multi_process,
         #[cfg(feature = "eccl")]
         daemon_manager,
     )?;
+
+    if (args.top_k.is_some() && args.top_p.is_some()) || pipeline_config.generation_cfg.is_none() {
+        pipeline_config.generation_cfg = Some(GenerationConfig {
+            temperature: args.temperature,
+            top_k: args.top_k,
+            top_p: args.top_p,
+            penalty: args.penalty,
+        })
+    } else {
+        pipeline_config.generation_cfg.as_mut().unwrap().penalty = args.penalty;
+    }
 
     let max_model_len = pipeline_config.max_model_len;
     let kvcached_tokens = cache_config.num_gpu_blocks.unwrap() * cache_config.block_size;
@@ -429,14 +442,16 @@ async fn main() -> Result<(), APIError> {
     }
 
     #[cfg(feature = "eccl")]
-    if args.multi_process {
+    if multi_process {
         let e = server_data.model.read();
         let mut daemon_manager = e.daemon_manager.write();
         daemon_manager.as_mut().unwrap().mpi_sync();
     }
 
     if global_rank == 0 {
-        warn!("Maximum Model Length (affected by `--kvcache-mem-gpu` and the number of ranks):");
+        warn!(
+            "Maximum Model Length (affected by `--mem` (kvcache-mem-gpu) and the number of ranks):"
+        );
         for batch in [1, 8] {
             println!(
                 "-> Batch {}: {}",
@@ -460,10 +475,10 @@ async fn main() -> Result<(), APIError> {
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
         .await
-        .map_err(|e| APIError::new(e.to_string()))?;
+        .map_err(candle_core::Error::wrap)?;
     axum::serve(listener, app)
         .await
-        .map_err(|e| APIError::new(e.to_string()))?;
+        .map_err(candle_core::Error::wrap)?;
 
     Ok(())
 }

@@ -1,14 +1,8 @@
-#![allow(unused_variables)]
+use crate::openai::models::Config;
+use candle_core::{DType, Device, Result, Tensor};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard},
-};
-
-use candle_core::{DType, Device, Tensor};
-
-use crate::{
-    openai::{models::Config, responses::APIError},
-    try_api,
 };
 
 #[cfg(not(feature = "gcu"))]
@@ -54,7 +48,7 @@ impl CacheEngine {
         dtype: DType,
         device: &Device,
         num_shards: usize,
-    ) -> Result<Self, APIError> {
+    ) -> Result<Self> {
         Ok(Self {
             gpu_cache: Arc::new(Mutex::new(Self::allocate_gpu_cache(
                 model_config,
@@ -88,7 +82,7 @@ impl CacheEngine {
         dtype: DType,
         device: &Device,
         num_shards: usize,
-    ) -> Result<Vec<KVCache>, APIError> {
+    ) -> Result<Vec<KVCache>> {
         assert!(cache_config.fully_init);
 
         let key_block_shape = Self::calculate_key_block_shape(
@@ -102,7 +96,7 @@ impl CacheEngine {
         let mut gpu_cache = Vec::new();
         for _ in 0..model_config.num_hidden_layers {
             #[cfg(not(feature = "gcu"))]
-            let key_blocks = try_api!(Tensor::zeros(
+            let key_blocks = Tensor::zeros(
                 (
                     cache_config.num_gpu_blocks.unwrap(),
                     key_block_shape.0,
@@ -112,9 +106,9 @@ impl CacheEngine {
                 ),
                 dtype,
                 device,
-            ));
+            )?;
             #[cfg(not(feature = "gcu"))]
-            let value_blocks = try_api!(Tensor::zeros(
+            let value_blocks = Tensor::zeros(
                 (
                     cache_config.num_gpu_blocks.unwrap(),
                     value_block_shape.0,
@@ -123,9 +117,9 @@ impl CacheEngine {
                 ),
                 dtype,
                 device,
-            ));
+            )?;
             #[cfg(feature = "gcu")]
-            let key_blocks = try_api!(Tensor::empty(
+            let key_blocks = Tensor::empty(
                 (
                     cache_config.num_gpu_blocks.unwrap(),
                     key_block_shape.0,
@@ -135,9 +129,9 @@ impl CacheEngine {
                 ),
                 dtype,
                 device,
-            ));
+            )?;
             #[cfg(feature = "gcu")]
-            let value_blocks = try_api!(Tensor::empty(
+            let value_blocks = Tensor::empty(
                 (
                     cache_config.num_gpu_blocks.unwrap(),
                     value_block_shape.0,
@@ -146,7 +140,7 @@ impl CacheEngine {
                 ),
                 dtype,
                 device,
-            ));
+            )?;
             gpu_cache.push((key_blocks, value_blocks));
         }
         Ok(gpu_cache)
@@ -158,7 +152,7 @@ impl CacheEngine {
         dtype: DType,
         device: &Device,
         num_shards: usize,
-    ) -> Result<Vec<KVCache>, APIError> {
+    ) -> Result<Vec<KVCache>> {
         assert!(cache_config.fully_init);
 
         let key_block_shape = Self::calculate_key_block_shape(
@@ -171,7 +165,7 @@ impl CacheEngine {
             Self::calculate_value_block_shape(model_config, cache_config.block_size, num_shards);
         let mut cpu_cache = Vec::new();
         for _ in 0..model_config.num_hidden_layers {
-            let key_blocks = try_api!(Tensor::zeros(
+            let key_blocks = Tensor::zeros(
                 (
                     cache_config.num_cpu_blocks.unwrap(),
                     key_block_shape.0,
@@ -181,8 +175,8 @@ impl CacheEngine {
                 ),
                 dtype,
                 device,
-            ));
-            let value_blocks = try_api!(Tensor::zeros(
+            )?;
+            let value_blocks = Tensor::zeros(
                 (
                     cache_config.num_cpu_blocks.unwrap(),
                     value_block_shape.0,
@@ -191,7 +185,7 @@ impl CacheEngine {
                 ),
                 dtype,
                 device,
-            ));
+            )?;
             cpu_cache.push((key_blocks, value_blocks));
         }
         Ok(cpu_cache)
@@ -208,7 +202,7 @@ impl CacheEngine {
         let element_size = dtype.size_in_bytes();
         let x = 16 / element_size;
         (
-            model_config.num_key_value_heads / num_shards,
+            model_config.num_key_value_heads.unwrap() / num_shards,
             model_config.k_head_dim() / x,
             block_size,
             x,
@@ -221,7 +215,7 @@ impl CacheEngine {
         num_shards: usize,
     ) -> (usize, usize, usize) {
         (
-            model_config.num_key_value_heads / num_shards,
+            model_config.num_key_value_heads.unwrap() / num_shards,
             model_config.v_head_dim(),
             block_size,
         )
@@ -229,30 +223,22 @@ impl CacheEngine {
 }
 
 impl CacheEngine {
-    pub fn swap_in(&self, src_to_dst: HashMap<usize, usize>) -> Result<(), APIError> {
+    pub fn swap_in(&self, src_to_dst: HashMap<usize, usize>) -> Result<()> {
         for i in 0..self.num_layers {
             let (src_key_cache, src_value_cache) = self.cpu_cache.get(i).unwrap();
             let mut gpu_cache = self.get_kv_cache();
             let (dst_key_cache, dst_value_cache) = gpu_cache.get_mut(i).unwrap();
             // Swap (copy) key blocks
             #[cfg(not(feature = "gcu"))]
-            try_api!(swap_blocks(
-                src_key_cache.clone(),
-                dst_key_cache,
-                src_to_dst.clone()
-            ));
+            swap_blocks(src_key_cache.clone(), dst_key_cache, src_to_dst.clone())?;
             // Swap (copy) key blocks
             #[cfg(not(feature = "gcu"))]
-            try_api!(swap_blocks(
-                src_value_cache.clone(),
-                dst_value_cache,
-                src_to_dst.clone()
-            ));
+            swap_blocks(src_value_cache.clone(), dst_value_cache, src_to_dst.clone())?;
         }
         Ok(())
     }
 
-    pub fn swap_out(&mut self, src_to_dst: HashMap<usize, usize>) -> Result<(), APIError> {
+    pub fn swap_out(&mut self, src_to_dst: HashMap<usize, usize>) -> Result<()> {
         for i in 0..self.num_layers {
             let gpu_cache = self.get_kv_cache();
             let (src_key_cache, src_value_cache) = gpu_cache.get(i).unwrap().clone();
@@ -261,23 +247,15 @@ impl CacheEngine {
             let (dst_key_cache, dst_value_cache) = self.cpu_cache.get_mut(i).unwrap();
             // Swap (copy) key blocks
             #[cfg(not(feature = "gcu"))]
-            try_api!(swap_blocks(
-                src_key_cache.clone(),
-                dst_key_cache,
-                src_to_dst.clone()
-            ));
+            swap_blocks(src_key_cache.clone(), dst_key_cache, src_to_dst.clone())?;
             // Swap (copy) key blocks
             #[cfg(not(feature = "gcu"))]
-            try_api!(swap_blocks(
-                src_value_cache.clone(),
-                dst_value_cache,
-                src_to_dst.clone()
-            ));
+            swap_blocks(src_value_cache.clone(), dst_value_cache, src_to_dst.clone())?;
         }
         Ok(())
     }
-
-    pub fn copy(&mut self, src_to_dst: HashMap<usize, Vec<usize>>) -> Result<(), APIError> {
+    #[allow(unused_unsafe)]
+    pub fn copy(&mut self, src_to_dst: HashMap<usize, Vec<usize>>) -> Result<()> {
         let mut gpu_cache = self.get_kv_cache();
         #[allow(clippy::map_identity)]
         let caches: (Vec<&mut Tensor>, Vec<&mut Tensor>) =
@@ -285,9 +263,10 @@ impl CacheEngine {
         let (key_caches, value_caches) = caches;
 
         // NOTE(EricLBuehler): This may synchronize the CPU and GPU
-        #[cfg(not(feature = "gcu"))]
-        try_api!(unsafe { copy_blocks(key_caches, value_caches, src_to_dst) });
-
+        unsafe {
+            #[cfg(not(feature = "gcu"))]
+            copy_blocks(key_caches, value_caches, src_to_dst)?;
+        }
         Ok(())
     }
 }
