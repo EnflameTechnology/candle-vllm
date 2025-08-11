@@ -19,7 +19,8 @@ use crate::{
             deepseek::DeepSeek, gemma::Gemma, gemma3::Gemma3, glm4::GLM4, llama::Llama,
             mistral::Mistral, phi2::Phi2, phi3::Phi, quantized_glm4::GGUFGLM4,
             quantized_llama::GGUFLLaMa, quantized_phi3::GGUFPhi3, quantized_qwen::GGUFQWen,
-            qwen::Qwen, stable_lm::StableLM, yi::Yi, Config,
+            quantized_qwen3_moe::GGUFQWenMoE, qwen::Qwen, qwen3_moe::Qwen3MoE, stable_lm::StableLM,
+            yi::Yi, Config,
         },
         PipelineConfig,
     },
@@ -48,6 +49,7 @@ enum LLMModel {
     Phi2(Phi2),
     Phi3(Phi),
     Qwen(Qwen),
+    Qwen3MoE(Qwen3MoE),
     Gemma(Gemma),
     Gemma3(Gemma3),
     Mistral(Mistral),
@@ -58,6 +60,7 @@ enum LLMModel {
     LlamaGGUF(GGUFLLaMa),
     Phi3GGUF(GGUFPhi3),
     QWenGGUF(GGUFQWen),
+    QWenGGUFMoE(GGUFQWenMoE),
     GLM4GGUF(GGUFGLM4),
 }
 /// top-p, multinomial, and argmax sampling are implemented. Beam search is not implemented.
@@ -359,7 +362,7 @@ impl DefaultLoader {
                     gguf::get_arch_and_num_of_layers(content).map_err(candle_core::Error::wrap)?;
                 if !matches!(
                     arch.as_str(),
-                    "llama" | "llama3" | "phi3" | "qwen2" | "qwen3" | "glm4"
+                    "llama" | "llama3" | "phi3" | "qwen2" | "qwen3" | "qwen3moe" | "glm4"
                 ) {
                     panic!("Model arch {} not supported!", arch);
                 } else {
@@ -423,6 +426,18 @@ impl DefaultLoader {
                     let cfg = model.get_config().clone();
                     (LLMModel::QWenGGUF(model), cfg, SeparatorStyle::Qwen)
                 }
+                "qwen3moe" => {
+                    let model = GGUFQWenMoE::from_gguf(
+                        &content,
+                        &mut file,
+                        &device,
+                        dtype,
+                        Arc::clone(&reporter),
+                    )
+                    .map_err(candle_core::Error::wrap)?;
+                    let cfg = model.get_config().clone();
+                    (LLMModel::QWenGGUFMoE(model), cfg, SeparatorStyle::Qwen)
+                }
                 "glm4" => {
                     let model = GGUFGLM4::from_gguf(
                         &content,
@@ -448,6 +463,7 @@ impl DefaultLoader {
                 "PhiForCausalLM" => Phi2::load_config(&cfile, isq)?,
                 "Phi3ForCausalLM" => Phi::load_config(&cfile, isq)?,
                 "Qwen2ForCausalLM" | "Qwen3ForCausalLM" => Qwen::load_config(&cfile, isq)?,
+                "Qwen3MoeForCausalLM" => Qwen3MoE::load_config(&cfile, isq)?,
                 "Gemma2ForCausalLM" => Gemma::load_config(&cfile, isq)?,
                 "Gemma3ForConditionalGeneration" => Gemma3::load_config(&cfile, isq)?,
                 "MistralForCausalLM" => Mistral::load_config(&cfile, isq)?,
@@ -574,6 +590,21 @@ impl DefaultLoader {
                             LLMModel::Qwen(
                                 Qwen::new(
                                     matches!(arch.as_str(), "qwen3" | "Qwen3ForCausalLM"),
+                                    vb,
+                                    &config,
+                                    dtype,
+                                    &device,
+                                    comm,
+                                    Arc::clone(&reporter),
+                                )
+                                .unwrap(),
+                            ),
+                            SeparatorStyle::Qwen,
+                        ),
+                        "Qwen3MoeForCausalLM" => (
+                            LLMModel::Qwen3MoE(
+                                Qwen3MoE::new(
+                                    matches!(arch.as_str(), "qwen3moe" | "Qwen3MoeForCausalLM"),
                                     vb,
                                     &config,
                                     dtype,
@@ -927,6 +958,9 @@ impl DefaultPipeline {
             LLMModel::Qwen(qwen) => {
                 qwen.forward(&input_tokens, input_positions, kv_cache, input_metadata)
             }
+            LLMModel::Qwen3MoE(qwen) => {
+                qwen.forward(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
             LLMModel::Gemma(gemma) => {
                 gemma.forward(&input_tokens, input_positions, kv_cache, input_metadata)
             }
@@ -955,6 +989,9 @@ impl DefaultPipeline {
                 llama.forward(&input_tokens, input_positions, kv_cache, input_metadata)
             }
             LLMModel::QWenGGUF(qwen) => {
+                qwen.forward(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
+            LLMModel::QWenGGUFMoE(qwen) => {
                 qwen.forward(&input_tokens, input_positions, kv_cache, input_metadata)
             }
             LLMModel::GLM4GGUF(glm4) => {
@@ -1126,6 +1163,7 @@ impl DefaultPipeline {
             LLMModel::Phi2(phi) => phi.get_config().clone(),
             LLMModel::Phi3(phi) => phi.get_config().clone(),
             LLMModel::Qwen(qwen) => qwen.get_config().clone(),
+            LLMModel::Qwen3MoE(qwen) => qwen.get_config().clone(),
             LLMModel::Gemma(gemma) => gemma.get_config().clone(),
             LLMModel::Gemma3(gemma3) => gemma3.get_config().clone(),
             LLMModel::Mistral(mistral) => mistral.get_config().clone(),
@@ -1136,6 +1174,7 @@ impl DefaultPipeline {
             LLMModel::Phi3GGUF(phi3) => phi3.get_config().clone(),
             LLMModel::LlamaGGUF(llama) => llama.get_config().clone(),
             LLMModel::QWenGGUF(qwen) => qwen.get_config().clone(),
+            LLMModel::QWenGGUFMoE(qwen) => qwen.get_config().clone(),
             LLMModel::GLM4GGUF(glm4) => glm4.get_config().clone(),
         }
     }
