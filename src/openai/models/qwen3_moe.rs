@@ -1,5 +1,8 @@
 use super::Config;
+use crate::backend::custom_ops::moe::TopKLastDimOp;
+use crate::backend::custom_ops::moe::TopKOutput;
 use crate::backend::progress::{ProgressLike, ProgressReporter};
+use crate::openai::distributed::AllReduce;
 use crate::openai::distributed::{
     embedding, rms_norm, Comm, ReplicatedLinear, TensorParallelColumnLinear,
     TensorParallelRowLinear, VarBuilder,
@@ -61,6 +64,7 @@ impl Qwen3MoE {
 struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
+    cos_sin: Tensor,
 }
 
 impl RotaryEmbedding {
@@ -79,10 +83,10 @@ impl RotaryEmbedding {
             .to_dtype(DType::F32)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        Ok(Self {
-            sin: freqs.sin()?,
-            cos: freqs.cos()?,
-        })
+        let cos = freqs.cos()?;
+        let sin = freqs.sin()?;
+        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
+        Ok(Self { sin, cos, cos_sin })
     }
 
     fn apply_rotary_emb_qkv(
@@ -92,19 +96,36 @@ impl RotaryEmbedding {
         input_positions: &[Vec<usize>],
     ) -> Result<(Tensor, Tensor)> {
         let (b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-        let mut q_embeds = Vec::new();
-        let mut k_embeds = Vec::new();
-        for (b, seqlen_offset) in zip(0..b_sz, input_positions) {
-            let cos = self.cos.narrow(0, seqlen_offset[0], seq_len)?;
-            let sin = self.sin.narrow(0, seqlen_offset[0], seq_len)?;
-            let x_q = q.narrow(0, b, 1)?;
-            let x_k = k.narrow(0, b, 1)?;
-            let q_embed = candle_nn::rotary_emb::rope(&x_q, &cos, &sin)?;
-            let k_embed = candle_nn::rotary_emb::rope(&x_k, &cos, &sin)?;
-            q_embeds.push(q_embed);
-            k_embeds.push(k_embed);
+        if q.device().is_gcu() {
+            let mut _input_positions = Vec::<i32>::new();
+            for seqlen_offset in input_positions {
+                _input_positions.push(seqlen_offset[0] as i32);
+            }
+            candle_nn::apply_rotary_emb_qkv(
+                &q,
+                &k,
+                &self.cos_sin,
+                &self.sin,
+                &_input_positions,
+                0,
+                true,
+                true,
+            )
+        } else {
+            let mut q_embeds = Vec::new();
+            let mut k_embeds = Vec::new();
+            for (b, seqlen_offset) in zip(0..b_sz, input_positions) {
+                let cos = self.cos.narrow(0, seqlen_offset[0], seq_len)?;
+                let sin = self.sin.narrow(0, seqlen_offset[0], seq_len)?;
+                let x_q = q.narrow(0, b, 1)?;
+                let x_k = k.narrow(0, b, 1)?;
+                let q_embed = candle_nn::rotary_emb::rope(&x_q, &cos, &sin)?;
+                let k_embed = candle_nn::rotary_emb::rope(&x_k, &cos, &sin)?;
+                q_embeds.push(q_embed);
+                k_embeds.push(k_embed);
+            }
+            Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
         }
-        Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
     }
 }
 
@@ -169,6 +190,8 @@ struct Moe {
     experts: Vec<Mlp>,
     norm_topk_prob: bool,
     num_experts_per_tok: usize,
+    all_reduce: AllReduce,
+    world_size: usize,
 }
 
 impl Moe {
@@ -200,28 +223,40 @@ impl Moe {
             )?);
         }
 
+        let world_size = comm.world_size();
         Ok(Self {
             gate,
             experts,
             norm_topk_prob: moe_cfg.norm_topk_prob,
             num_experts_per_tok: moe_cfg.num_experts_per_tok,
+            all_reduce: AllReduce::new(comm),
+            world_size,
         })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (batch, seq_len, hidden_dim) = xs.dims3()?;
         let xs = xs.reshape(((), hidden_dim))?;
-        let router_logits = xs.apply(&self.gate)?;
+        let router_logits = xs.apply(&self.gate)?.to_dtype(DType::F32)?;
         let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
 
+        // Select top-k experts
+        #[cfg(feature = "gcu")]
+        let TopKOutput {
+            values: mut routing_weights,
+            indices: experts_per_tok,
+        } = routing_weights.topk(self.num_experts_per_tok)?;
+
+        #[cfg(not(feature = "gcu"))]
         let experts_per_tok = routing_weights
             .arg_sort_last_dim(false)?
             .narrow(D::Minus1, 0, self.num_experts_per_tok)?
             .contiguous()?;
 
+        #[cfg(not(feature = "gcu"))]
         let routing_weights = routing_weights.gather(&experts_per_tok, D::Minus1)?;
 
-        let routing_weights = routing_weights.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        let routing_weights = routing_weights.to_vec2::<f32>()?;
         let experts_per_tok = experts_per_tok.to_vec2::<u32>()?;
         let mut top_x = vec![vec![]; self.experts.len()];
         let mut selected_experts = vec![vec![]; self.experts.len()];
@@ -255,6 +290,9 @@ impl Moe {
                 .squeeze(0)?;
             let current_hidden_states = current_hidden_states.broadcast_mul(&selected_experts)?;
             ys = ys.index_add(&top_x, &current_hidden_states, 0)?;
+        }
+        if self.world_size > 1 {
+            ys = self.all_reduce.apply(&ys)?;
         }
         ys = ys.reshape((batch, seq_len, hidden_dim))?;
         Ok(ys)
@@ -423,13 +461,9 @@ impl Attention {
             (q, k)
         };
 
-        let (q, k) = self.rotary_emb.apply_rotary_emb_qkv(
-            &q.to_dtype(DType::F32)?,
-            &k.to_dtype(DType::F32)?,
-            input_positions,
-        )?;
-        let q = q.to_dtype(v.dtype())?;
-        let k = k.to_dtype(v.dtype())?;
+        let (q, k) = self
+            .rotary_emb
+            .apply_rotary_emb_qkv(&q, &k, input_positions)?;
 
         let y = self
             .attn

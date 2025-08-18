@@ -232,7 +232,11 @@ pub fn qlinear(
             };
 
             let dim = if shards.world_size > 1 {
-                if shards.dim == 1 { 0 } else { 1 }
+                if shards.dim == 1 {
+                    0
+                } else {
+                    1
+                }
             } else {
                 0
             };
@@ -247,7 +251,6 @@ pub fn qlinear(
                 shard(dim, shards.rank, shards.world_size),
                 wtype,
             )?;
-
 
             let scale_and_zero_size = in_dim / (cfg.group_size as usize);
             let scales = vb

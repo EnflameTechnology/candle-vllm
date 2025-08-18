@@ -306,17 +306,19 @@ impl Attention {
             .rotary_emb
             .apply_rotary_emb_qkv(&q, &k, input_positions)?;
 
-        let y = self.attn.forward(
-            &q,
-            &k,
-            &v,
-            attention_mask,
-            cache.map(|(k_, _)| k_.clone()),
-            cache.map(|(_, v_)| v_.clone()),
-            input_metadata,
-            None,
-        )?
-        .reshape((b_size, seq_len, ()))?;
+        let y = self
+            .attn
+            .forward(
+                &q,
+                &k,
+                &v,
+                attention_mask,
+                cache.map(|(k_, _)| k_.clone()),
+                cache.map(|(_, v_)| v_.clone()),
+                input_metadata,
+                None,
+            )?
+            .reshape((b_size, seq_len, ()))?;
 
         let y = y.to_dtype(dtype)?;
         self.dense.forward(&y)

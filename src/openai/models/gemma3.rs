@@ -339,10 +339,7 @@ impl RotaryEmbedding {
                 q_embeds.push(q_embed);
                 k_embeds.push(k_embed);
             }
-            Ok((
-                Tensor::cat(&q_embeds, 0)?,
-                Tensor::cat(&k_embeds, 0)?,
-            ))
+            Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
         }
     }
 }
