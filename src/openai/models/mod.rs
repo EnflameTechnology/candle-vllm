@@ -14,6 +14,7 @@ pub mod quantized_qwen;
 pub mod quantized_qwen3_moe;
 pub mod qwen;
 pub mod qwen3_moe;
+pub mod rotary_emb;
 pub mod stable_lm;
 pub mod yi;
 use crate::openai::distributed::Comm;
@@ -295,10 +296,10 @@ pub fn get_attention_casual_mask(
     dtype: DType,
     b_size: usize,
     tgt_len: usize,
-    positions: &[Vec<usize>],
+    _: &[Vec<usize>],
     sliding_window: Option<usize>,
 ) -> Option<Tensor> {
-    let seqlen_offset = positions[0][0]; //TODO(guoqingbao): position for each request
+    let seqlen_offset = 0;
     let mask: Vec<_> = if let Some(sliding_window) = sliding_window {
         (0..tgt_len)
             .flat_map(|i| {

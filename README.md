@@ -22,6 +22,7 @@ Efficient, easy-to-use platform for inference and serving local LLMs including a
 - Support `Mac/Metal` devices
 - Support `Multi-GPU` inference (both `multi-process` and  `multi-threaded` mode)
 - Support `Multi-node` inference with MPI runner
+- Support Chunked Prefilling (default chunk size 8K)
 
 ## Supported Models
 - Currently, candle-vllm supports chat serving for the following model structures.
@@ -74,7 +75,7 @@ export PATH=$PATH:/usr/local/cuda/bin/
 #CUDA: single-node compilation (single gpu, or multi-gpus on single machine)
 cargo build --release --features cuda,nccl
 
-#CUDA: single-node compilation with flash attention (takes few minutes for the first build, faster inference for long-context)
+#CUDA: single-node compilation with flash attention (takes few minutes for the first build, faster inference for long-context, requires CUDA_ARCH >= 800)
 cargo build --release --features cuda,nccl,flash-attn
 
 #CUDA: multinode compilation with MPI (multi-gpus, multiple machines)
@@ -95,18 +96,18 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
     **Example:**
 
     ```shell
-    [RUST_LOG=warn] cargo run [--release --features cuda,nccl] -- [--log --dtype bf16 --p 2000 --d 0,1 --mem 4096] [--w /home/weights/Qwen3-30B-A3B-Instruct-2507]
+    [RUST_LOG=warn] cargo run [--release --features cuda,nccl] -- [--log --dtype bf16 --p 2000 --d 0,1 --mem 4096 --isq q4k --prefill-chunk-size 8192 --penalty 1.1] [--w /home/weights/Qwen3-30B-A3B-Instruct-2507]
     ```
 
     `ENV_PARAM`: RUST_LOG=warn
 
     `BUILD_PARAM`: --release --features cuda,nccl
 
-    `PROGRAM_PARAM`：--log --dtype bf16 --p 2000 --d 0,1 --mem 4096
+    `PROGRAM_PARAM`：--log --dtype bf16 --p 2000 --d 0,1 --mem 4096 --isq q4k --prefill-chunk-size 8192 --penalty 1.1
 
     `MODEL_ID/MODEL_WEIGHT_PATH`: --w /home/weights/Qwen3-30B-A3B-Instruct-2507 (or `--m` specify model-id)
 
-    where, `--p`: server port; `--d`: device ids; `--w`: weight path (safetensors folder); `--f`: weight file (for gguf); `--m`: huggingface model-id; `--mem` (`kvcache-mem-gpu`) is the key parameter to control KV cache usage (increase this for large batch); supported model archs include ["llama", "llama3", "mistral", "phi2", "phi3", "qwen2", "qwen3", "qwen3_moe", "glm4", "gemma", "gemma3", "yi", "stable-lm", "deep-seek"]
+    where, `--p`: server port; `--d`: device ids; `--w`: weight path (safetensors folder); `--f`: weight file (for gguf); `--m`: huggingface model-id; `--isq q4k`: convert weights into `q4k` format during model loading; `--prefill-chunk-size` chunk the prefill into size defined in this flag (default 8K, `0` for disable); `--penalty` repetition penalty (1.0 : no penalty to 2.0 : maximum penalty); `--mem` (`kvcache-mem-gpu`) is the key parameter to control KV cache usage (increase this for large batch).
   </details>
 
 
@@ -117,10 +118,10 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
   <details open>
     <summary>Show command</summary>
 
-    **Local Path (with port and device specified)**
+    **Local Path (with port, device and isq specified)**
 
     ```shell
-    target/release/candle-vllm --p 2000 --d 0,1 --w /home/Qwen3-30B-A3B-Instruct-2507/
+    target/release/candle-vllm --p 2000 --d 0,1 --w /home/Qwen3-30B-A3B-Instruct-2507/ --isq q4k
     ```
 
     **Model-ID (download from Huggingface)**

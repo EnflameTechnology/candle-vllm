@@ -1,3 +1,4 @@
+use super::rotary_emb::Llama3RotaryEmbedding;
 use super::Config;
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::openai::distributed::{
@@ -44,33 +45,6 @@ impl Llama {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Cache {
-    cos: Tensor,
-    sin: Tensor,
-    cos_sin: Tensor,
-}
-
-impl Cache {
-    pub fn new(dtype: DType, config: &Config, device: &Device) -> Result<Self> {
-        // precompute freqs_cis
-        let n_elem = config.hidden_size / config.num_attention_heads;
-        let theta: Vec<_> = (0..n_elem)
-            .step_by(2)
-            .map(|i| 1f32 / config.rope_theta.powf(i as f64 / n_elem as f64) as f32)
-            .collect();
-        let theta = Tensor::new(theta.as_slice(), device)?;
-        let idx_theta = Tensor::arange(0, config.max_seq_len as u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((config.max_seq_len, 1))?
-            .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-        let cos = idx_theta.cos()?.to_dtype(dtype)?;
-        let sin = idx_theta.sin()?.to_dtype(dtype)?;
-        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
-        Ok(Self { cos, sin, cos_sin })
-    }
-}
-
 struct CausalSelfAttention {
     q_proj: TensorParallelColumnLinear,
     k_proj: TensorParallelColumnLinear,
@@ -80,55 +54,10 @@ struct CausalSelfAttention {
     num_key_value_heads: usize,
     head_dim: usize,
     attn: PagedAttention,
-    cos_sin_cache: Cache,
+    rotay_emb: Arc<Llama3RotaryEmbedding>,
 }
 
 impl CausalSelfAttention {
-    fn apply_rotary_emb_qkv(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        input_positions: &[Vec<usize>],
-    ) -> Result<(Tensor, Tensor)> {
-        let (b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-        if q.device().is_gcu() {
-            let mut _input_positions = Vec::<i32>::new();
-            for seqlen_offset in input_positions {
-                _input_positions.push(seqlen_offset[0] as i32);
-            }
-            candle_nn::apply_rotary_emb_qkv(
-                &q,
-                &k,
-                &self.cos_sin_cache.cos_sin,
-                &self.cos_sin_cache.sin,
-                &_input_positions,
-                0,
-                true,
-                true,
-            )
-        } else {
-            let mut q_embeds = Vec::new();
-            let mut k_embeds = Vec::new();
-            for (b, seqlen_offset) in zip(0..b_sz, input_positions) {
-                let cos = self
-                    .cos_sin_cache
-                    .cos
-                    .narrow(0, seqlen_offset[0], seq_len)?;
-                let sin = self
-                    .cos_sin_cache
-                    .sin
-                    .narrow(0, seqlen_offset[0], seq_len)?;
-                let x_q = q.narrow(0, b, 1)?;
-                let x_k = k.narrow(0, b, 1)?;
-                let q_embed = candle_nn::rotary_emb::rope(&x_q, &cos, &sin).unwrap();
-                let k_embed = candle_nn::rotary_emb::rope(&x_k, &cos, &sin).unwrap();
-                q_embeds.push(q_embed);
-                k_embeds.push(k_embed);
-            }
-            Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
-        }
-    }
-
     fn forward(
         &self,
         x: &Tensor,
@@ -161,7 +90,7 @@ impl CausalSelfAttention {
             (q, k, v.contiguous()?)
         };
 
-        let (q, k) = self.apply_rotary_emb_qkv(&q, &k, input_positions)?;
+        let (q, k) = self.rotay_emb.apply_rotary_emb(&q, &k, input_positions)?;
 
         let y = self
             .attn
@@ -184,9 +113,8 @@ impl CausalSelfAttention {
     fn load(
         vb: VarBuilder,
         cfg: &Config,
-        dtype: DType,
-        device: &Device,
         comm: Rc<Comm>,
+        rotay_emb: Arc<Llama3RotaryEmbedding>,
     ) -> Result<Self> {
         let size_in = cfg.hidden_size;
         let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
@@ -210,13 +138,24 @@ impl CausalSelfAttention {
             &cfg.quant,
             &cfg.quantization_config,
         )?;
+
+        let q8_0_quant = Some("q8_0".to_string());
         let v_proj = TensorParallelColumnLinear::load_with_hints(
             size_in,
             size_kv,
             false,
             vb.pp("v_proj"),
             comm.clone(),
-            &cfg.quant,
+            if cfg.quant.is_some()
+                && !matches!(
+                    cfg.quant.as_ref().unwrap().as_str(),
+                    "gptq" | "awq" | "marlin"
+                )
+            {
+                &q8_0_quant
+            } else {
+                &cfg.quant
+            },
             &cfg.quantization_config,
         )?;
 
@@ -249,7 +188,7 @@ impl CausalSelfAttention {
                 vb.device().clone(),
                 None,
             )?,
-            cos_sin_cache: Cache::new(dtype, cfg, device)?,
+            rotay_emb: rotay_emb.clone(),
         })
     }
 }
@@ -334,11 +273,10 @@ impl Block {
     fn load(
         vb: VarBuilder,
         cfg: &Config,
-        dtype: DType,
-        device: &Device,
         comm: Rc<Comm>,
+        rotay_emb: Arc<Llama3RotaryEmbedding>,
     ) -> Result<Self> {
-        let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg, dtype, device, comm.clone())?;
+        let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg, comm.clone(), rotay_emb)?;
         let mlp = Mlp::load(vb.pp("mlp"), cfg, comm.clone())?;
         let rms_1 = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let rms_2 = rms_norm(
@@ -430,6 +368,8 @@ impl Llama {
             &None,
             &None,
         )?;
+
+        let rotary_emb = Arc::new(Llama3RotaryEmbedding::new(dtype, cfg, device, true)?);
         let ln_f = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let reporter = progress_reporter.clone();
         let blocks: Vec<_> = (0..cfg.num_hidden_layers)
@@ -437,9 +377,8 @@ impl Llama {
                 let b = Block::load(
                     vb.pp(format!("model.layers.{i}")),
                     cfg,
-                    dtype,
-                    device,
                     comm.clone(),
+                    rotary_emb.clone(),
                 )
                 .unwrap();
                 reporter.write().unwrap().set_progress(i + 1);

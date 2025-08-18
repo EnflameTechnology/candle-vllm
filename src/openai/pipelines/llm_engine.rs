@@ -48,6 +48,7 @@ struct PreparedInputs {
 }
 
 const _PAD_SLOT_ID: i32 = -1;
+const PREFILL_CHUNK_SIZE: usize = 8192;
 
 #[allow(unused)]
 pub struct LLMEngine {
@@ -67,6 +68,7 @@ pub struct LLMEngine {
     waiting_tasks: RwLock<Vec<TaskData>>,
     #[cfg(feature = "eccl")]
     pub daemon_manager: RwLock<Option<DaemonManager>>,
+    prefill_chunk_size: Option<usize>,
 }
 
 impl LLMEngine {
@@ -99,6 +101,7 @@ impl LLMEngine {
         num_shards: usize,
         multi_process: bool,
         #[cfg(feature = "eccl")] daemon_manager: Option<DaemonManager>,
+        prefill_chunk_size: Option<usize>,
     ) -> Result<Arc<RwLock<Self>>> {
         let num_threads: usize = pipelines.len();
         let engine = Arc::new(RwLock::new(Self {
@@ -118,6 +121,7 @@ impl LLMEngine {
             daemon_manager: RwLock::new(daemon_manager),
             sync_notifies: HashMap::new(),
             senders: HashMap::new(),
+            prefill_chunk_size,
         }));
         let engine_clone = engine.clone();
 
@@ -465,7 +469,7 @@ impl LLMEngine {
                 };
             };
 
-            let scheduled: VecDeque<Arc<SequenceGroup>> = {
+            let mut scheduled: VecDeque<Arc<SequenceGroup>> = {
                 let e = engine.read();
                 let x = e.sequence_groups.read();
                 x.clone()
@@ -476,7 +480,7 @@ impl LLMEngine {
 
             let seqs = scheduled[0].get_seqs();
             //run partial models in parallel
-            let logits = {
+            let (mut logits, is_prompt) = {
                 let e = engine.read();
                 let (pipeline, cache_engine) = e.get_pipeline(rank).unwrap();
                 let device = pipeline.device();
@@ -497,8 +501,28 @@ impl LLMEngine {
                     &metadata,
                 )?;
 
-                x
+                (x, metadata.is_prompt)
             };
+
+            if is_prompt {
+                let mut e = engine.write();
+                let prefill_chunk_size = e.prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE);
+                if prefill_chunk_size > 0 {
+                    let (finished_indices, finished_groups) = e
+                        .scheduler
+                        .filter_prefill_finished(&scheduled, prefill_chunk_size);
+
+                    if finished_indices.is_empty() {
+                        continue;
+                    }
+                    scheduled = finished_groups;
+                    let batch = finished_indices.len();
+                    logits = logits.index_select(
+                        &Tensor::from_vec(finished_indices, (batch,), logits.device())?,
+                        0,
+                    )?;
+                }
+            }
 
             #[cfg(feature = "eccl")]
             let do_sample = if rank == 0 && DaemonManager::is_master_rank() {
@@ -835,12 +859,21 @@ impl LLMEngine {
         for group in groups {
             for seq in group.get_seqs().values() {
                 let prompt_ids = seq.deref_mut().get_token_ids();
-
                 let prompt_len = prompt_ids.len();
-                prompt_lens.push(prompt_len);
+                let num_cached_tokens = seq.deref().get_num_cached_tokens();
+                let chunk_size = self.prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE);
+                let num_tokens = if chunk_size > 0 {
+                    std::cmp::min(chunk_size, prompt_len - num_cached_tokens)
+                } else {
+                    prompt_len - num_cached_tokens
+                };
 
-                input_tokens.push(prompt_ids);
-                input_positions.push((0..prompt_len).collect::<Vec<_>>());
+                prompt_lens.push(num_tokens);
+
+                input_tokens
+                    .push(prompt_ids[num_cached_tokens..num_cached_tokens + num_tokens].to_vec());
+                input_positions
+                    .push((num_cached_tokens..num_cached_tokens + num_tokens).collect::<Vec<_>>());
                 let table = self
                     .scheduler
                     .block_engine
@@ -868,7 +901,7 @@ impl LLMEngine {
                 };
 
                 let mut slot_mapping = Vec::new();
-                for i in 0..prompt_len {
+                for i in num_cached_tokens..num_cached_tokens + num_tokens {
                     if i < start_idx {
                         // Pad [0,start_idx) with _PAD_TOKEN_ID
                         slot_mapping.push(_PAD_SLOT_ID);
@@ -1065,7 +1098,7 @@ impl LLMEngine {
         sender: Option<Arc<Sender<ChatResponse>>>,
         sync_notify: Option<Arc<Notify>>,
     ) {
-        let prompt_len = prompt.get_ids().len();
+        let prompt_len = prompt.len();
         let sync_notify = sync_notify.clone();
         if let Some(sync) = sync_notify {
             self.sync_notifies.insert(request_id.clone(), Some(sync));
@@ -1082,7 +1115,7 @@ impl LLMEngine {
         let do_log = true;
         if do_log {
             warn!(
-                "New Request with length {} ({}).",
+                "New Request with length {} tokens ({}).",
                 prompt_len,
                 request_id.clone(),
             );
