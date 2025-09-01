@@ -1,4 +1,4 @@
-use super::{rotary_emb::DefaultRotaryEmbedding, Config};
+use super::{rotary_emb::ScalingRotaryEmbedding, Config};
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::openai::distributed::{
     embedding, rms_norm, Comm, ReplicatedLinear, TensorParallelColumnLinear,
@@ -111,14 +111,14 @@ struct Attention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    rotary_emb: Arc<DefaultRotaryEmbedding>,
+    rotary_emb: Arc<ScalingRotaryEmbedding>,
     attn: PagedAttention,
 }
 
 impl Attention {
     fn new(
         qwen3: bool,
-        rotary_emb: Arc<DefaultRotaryEmbedding>,
+        rotary_emb: Arc<ScalingRotaryEmbedding>,
         cfg: &Config,
         vb: VarBuilder,
         comm: Rc<Comm>,
@@ -259,7 +259,13 @@ impl Attention {
             (q, k)
         };
 
-        let (q, k) = self.rotary_emb.apply_rotary_emb(&q, &k, input_positions)?;
+        let (q, k) = self.rotary_emb.apply_rotary_emb(
+            &q.to_dtype(DType::F32)?,
+            &k.to_dtype(DType::F32)?,
+            input_positions,
+        )?;
+        let q = q.to_dtype(v.dtype())?;
+        let k = k.to_dtype(v.dtype())?;
 
         let y = self
             .attn
@@ -290,7 +296,7 @@ struct DecoderLayer {
 impl DecoderLayer {
     fn new(
         qwen3: bool,
-        rotary_emb: Arc<DefaultRotaryEmbedding>,
+        rotary_emb: Arc<ScalingRotaryEmbedding>,
         cfg: &Config,
         vb: VarBuilder,
         comm: Rc<Comm>,
@@ -354,7 +360,7 @@ impl Qwen {
     ) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        let rotary_emb = Arc::new(DefaultRotaryEmbedding::new(dtype, cfg, device, true)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, cfg, device, true)?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         let reporter = progress_reporter.clone();

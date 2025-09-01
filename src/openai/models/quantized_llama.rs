@@ -1,8 +1,9 @@
+use super::rotary_emb::ScalingRotaryEmbedding;
 use super::Config;
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
-use candle_core::quantized::{ggml_file, gguf_file, QMatMul};
+use candle_core::quantized::{gguf_file, QMatMul};
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module};
 use candle_transformers::quantized_nn::RmsNorm;
@@ -117,35 +118,12 @@ struct LayerWeights {
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
-    cos: Tensor,
-    sin: Tensor,
     attn: PagedAttention,
+    rotary_emb: Arc<ScalingRotaryEmbedding>,
     dtype: DType,
 }
 
 impl LayerWeights {
-    fn apply_rotary_emb(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        input_positions: &[Vec<usize>],
-    ) -> Result<(Tensor, Tensor)> {
-        let (b_size, _h, seq_len, _n_embd) = q.dims4()?;
-        let mut q_embeds = Vec::new();
-        let mut k_embeds = Vec::new();
-        for (b, seqlen_offset) in zip(0..b_size, input_positions) {
-            let cos = self.cos.narrow(0, seqlen_offset[0], seq_len)?;
-            let sin = self.sin.narrow(0, seqlen_offset[0], seq_len)?;
-            let x_q = q.narrow(0, b, 1)?;
-            let x_k = k.narrow(0, b, 1)?;
-            let q_embed = candle_nn::rotary_emb::rope_i(&x_q, &cos, &sin)?;
-            let k_embed = candle_nn::rotary_emb::rope_i(&x_k, &cos, &sin)?;
-            q_embeds.push(q_embed);
-            k_embeds.push(k_embed);
-        }
-        Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
-    }
-
     fn forward_attn(
         &self,
         x: &Tensor,
@@ -178,7 +156,11 @@ impl LayerWeights {
             (q.contiguous()?, k.contiguous()?, v.contiguous()?)
         };
 
-        let (q, k) = self.apply_rotary_emb(&q, &k, input_positions)?;
+        let (q, k) = self.rotary_emb.apply_rotary_emb(
+            &q.to_dtype(DType::F32)?,
+            &k.to_dtype(DType::F32)?,
+            input_positions,
+        )?;
         let (q, k, v) = (
             q.to_dtype(self.dtype)?,
             k.to_dtype(self.dtype)?,
@@ -214,27 +196,6 @@ pub struct GGUFLLaMa {
     device: Device,
 }
 
-fn precomput_freqs_cis(
-    head_dim: usize,
-    freq_base: f32,
-    context_length: usize,
-    device: &Device,
-    dtype: DType,
-) -> Result<(Tensor, Tensor)> {
-    let theta: Vec<_> = (0..head_dim)
-        .step_by(2)
-        .map(|i| 1f32 / freq_base.powf(i as f32 / head_dim as f32))
-        .collect();
-    let theta = Tensor::new(theta.as_slice(), device)?;
-    let idx_theta = Tensor::arange(0, context_length as u32, device)?
-        .to_dtype(DType::F32)?
-        .reshape((context_length, 1))?
-        .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-    let cos = idx_theta.cos()?.to_dtype(dtype)?;
-    let sin = idx_theta.sin()?.to_dtype(dtype)?;
-    Ok((cos, sin))
-}
-
 impl GGUFLLaMa {
     pub fn into_config(
         embedding_length: usize,
@@ -244,7 +205,10 @@ impl GGUFLLaMa {
         head_count: usize,
         head_count_kv: usize,
         rms_eps: f64,
+        rope_theta: f64,
         max_seq_len: usize,
+        original_max_position_embeddings: Option<usize>,
+        partial_rotary_factor: Option<f32>,
     ) -> Config {
         Config {
             architectures: Some(vec!["llama".to_string()]),
@@ -256,7 +220,7 @@ impl GGUFLLaMa {
             num_attention_heads: head_count,
             num_key_value_heads: Some(head_count_kv),
             rms_norm_eps: rms_eps,
-            rope_theta: 10_000.0f64,
+            rope_theta,
             rope_local_base_freq: None,
             bos_token_id: Some(super::TokenID(Either::Left(Some(128256)))),
             eos_token_id: super::TokenID(Either::Left(Some(128257))),
@@ -268,9 +232,9 @@ impl GGUFLLaMa {
             tie_word_embeddings: false,
             rope_scaling: None,
             max_position_embeddings: Some(max_seq_len),
-            original_max_position_embeddings: max_seq_len,
+            original_max_position_embeddings,
             attention_bias: Some(false),
-            partial_rotary_factor: None,
+            partial_rotary_factor,
             qk_layernorm: false,
             use_qkv_bias: None,
             custom_stop_tokens: Some(vec!["<|end_of_text|>".to_string()]),
@@ -278,88 +242,8 @@ impl GGUFLLaMa {
             final_logit_softcapping: None,
             quantization_config: None,
             moe_config: None,
-            qwen_moe_config: None,
             quant: Some("gguf".to_string()),
         }
-    }
-
-    pub fn from_ggml(mut ct: ggml_file::Content, gqa: usize, dtype: DType) -> Result<Self> {
-        let head_dim = (ct.hparams.n_embd / ct.hparams.n_head) as usize;
-        let (cos, sin) = precomput_freqs_cis(head_dim, 10000., 8192, &ct.device, DType::F32)?;
-        let tok_embeddings = ct.remove("tok_embeddings.weight")?;
-        let tok_embeddings = tok_embeddings.dequantize(&ct.device)?;
-        let norm = RmsNorm::from_qtensor(ct.remove("norm.weight")?, 1e-5)?;
-        let output = ct.remove("output.weight")?;
-        let mut layers = Vec::with_capacity(ct.hparams.n_layer as usize);
-        for layer_idx in 0..ct.hparams.n_layer {
-            let prefix = format!("layers.{layer_idx}");
-            let attention_wq = ct.remove(&format!("{prefix}.attention.wq.weight"))?;
-            let attention_wk = ct.remove(&format!("{prefix}.attention.wk.weight"))?;
-            let attention_wv = ct.remove(&format!("{prefix}.attention.wv.weight"))?;
-            let attention_wo = ct.remove(&format!("{prefix}.attention.wo.weight"))?;
-            let mlp_or_moe = {
-                let feed_forward_w1 = ct.remove(&format!("{prefix}.feed_forward.w1.weight"))?;
-                let feed_forward_w2 = ct.remove(&format!("{prefix}.feed_forward.w2.weight"))?;
-                let feed_forward_w3 = ct.remove(&format!("{prefix}.feed_forward.w3.weight"))?;
-                MlpOrMoe::Mlp(Mlp {
-                    feed_forward_w1: QMatMul::from_qtensor(feed_forward_w1)?,
-                    feed_forward_w2: QMatMul::from_qtensor(feed_forward_w2)?,
-                    feed_forward_w3: QMatMul::from_qtensor(feed_forward_w3)?,
-                })
-            };
-            let attention_norm = ct.remove(&format!("{prefix}.attention_norm.weight"))?;
-            let ffn_norm = ct.remove(&format!("{prefix}.ffn_norm.weight"))?;
-            layers.push(LayerWeights {
-                attention_wq: QMatMul::from_qtensor(attention_wq)?,
-                attention_wk: QMatMul::from_qtensor(attention_wk)?,
-                attention_wv: QMatMul::from_qtensor(attention_wv)?,
-                attention_wo: QMatMul::from_qtensor(attention_wo)?,
-                attention_norm: RmsNorm::from_qtensor(attention_norm, 1e-5)?,
-                mlp_or_moe,
-                ffn_norm: RmsNorm::from_qtensor(ffn_norm, 1e-5)?,
-                n_head: ct.hparams.n_head as usize,
-                n_kv_head: ct.hparams.n_head as usize / gqa,
-                head_dim: (ct.hparams.n_embd / ct.hparams.n_head) as usize,
-                cos: cos.clone(),
-                sin: sin.clone(),
-                attn: PagedAttention::new(
-                    ct.hparams.n_head as usize,
-                    (ct.hparams.n_embd / ct.hparams.n_head) as usize,
-                    1. / ((head_dim as f32).sqrt()),
-                    Some(ct.hparams.n_head as usize / gqa),
-                    None,
-                    ct.device.clone(),
-                    None,
-                )?,
-                dtype,
-            })
-        }
-        Ok(Self {
-            tok_embeddings: Embedding::new(tok_embeddings, ct.hparams.n_embd as usize),
-            layers,
-            norm,
-            output: QMatMul::from_qtensor(output)?,
-            cfg: GGUFLLaMa::into_config(
-                ct.hparams.n_embd as usize,
-                head_dim,
-                0,
-                ct.hparams.n_layer as usize,
-                ct.hparams.n_head as usize,
-                ct.hparams.n_head as usize / gqa,
-                1e-5,
-                0,
-            ),
-            dtype,
-            device: ct.device.clone(),
-        })
-    }
-
-    pub fn get_num_of_layers(ct: gguf_file::Content) -> Result<usize> {
-        let md_get = |s: &str| match ct.metadata.get(s) {
-            None => candle_core::bail!("cannot find {s} in metadata"),
-            Some(v) => Ok(v),
-        };
-        Ok(md_get("llama.block_count")?.to_u32()? as usize)
     }
 
     pub fn from_gguf<R: std::io::Seek + std::io::Read>(
@@ -374,23 +258,26 @@ impl GGUFLLaMa {
             Some(v) => Ok(v),
         };
         let reporter = progress_reporter.clone();
+        let arch = md_get("general.architecture")?.to_string()?;
 
         // Parameter extraction from metadata.
-        let n_expert = md_get("llama.expert_count")
+        let n_expert = md_get(format!("{arch}.expert_count").as_str())
             .and_then(|v| v.to_u32())
             .unwrap_or(0) as usize;
-        let n_expert_used = md_get("llama.expert_used_count")
+        let n_expert_used = md_get(format!("{arch}.expert_used_count").as_str())
             .and_then(|v| v.to_u32())
             .unwrap_or(0) as usize;
-        let head_count = md_get("llama.attention.head_count")?.to_u32()? as usize;
-        let head_count_kv = md_get("llama.attention.head_count_kv")?.to_u32()? as usize;
-        let block_count = md_get("llama.block_count")?.to_u32()? as usize;
-        let embedding_length = md_get("llama.embedding_length")?.to_u32()? as usize;
-        // let rope_dim = md_get("llama.rope.dimension_count")?.to_u32()? as usize;
-        let context_length = md_get("llama.context_length")?.to_u32();
+        let head_count =
+            md_get(format!("{arch}.attention.head_count").as_str())?.to_u32()? as usize;
+        let head_count_kv =
+            md_get(format!("{arch}.attention.head_count_kv").as_str())?.to_u32()? as usize;
+        let block_count = md_get(format!("{arch}.block_count").as_str())?.to_u32()? as usize;
+        let embedding_length =
+            md_get(format!("{arch}.embedding_length").as_str())?.to_u32()? as usize;
+        let context_length = md_get(format!("{arch}.context_length").as_str())?.to_u32();
         let context_length = context_length.unwrap_or(8192) as usize;
 
-        let head_dim = md_get("llama.attention.key_length");
+        let head_dim = md_get(format!("{arch}.attention.key_length").as_str());
         let head_dim = if head_dim.is_ok() {
             head_dim.unwrap().to_u32()? as usize
         } else {
@@ -398,13 +285,12 @@ impl GGUFLLaMa {
         };
 
         // Strangely this value is generally 1e-6 in GGUF file but used to be 1e-5 by default.
-        let rms_norm_eps = md_get("llama.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
+        let rms_norm_eps =
+            md_get(format!("{arch}.attention.layer_norm_rms_epsilon").as_str())?.to_f32()? as f64;
 
-        let rope_freq_base = md_get("llama.rope.freq_base")
+        let rope_freq_base = md_get(format!("{arch}.rope.freq_base").as_str())
             .and_then(|m| m.to_f32())
             .unwrap_or(10000f32);
-        let (cos, sin) =
-            precomput_freqs_cis(head_dim, rope_freq_base, context_length, device, DType::F32)?;
 
         let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", device)?;
         let tok_embeddings = tok_embeddings_q.dequantize(device)?;
@@ -416,6 +302,45 @@ impl GGUFLLaMa {
             Ok(tensor) => tensor,
             Err(_) => tok_embeddings_q,
         };
+        let original_max_position_embeddings =
+            md_get(format!("{arch}.rope.scaling.original_context_length").as_str());
+        let original_max_position_embeddings = if original_max_position_embeddings.is_ok() {
+            Some(original_max_position_embeddings.unwrap().to_u32()? as usize)
+        } else {
+            None
+        };
+
+        let rope_dim = md_get(format!("{arch}.rope.dimension_count").as_str());
+        let partial_rotary_factor = if rope_dim.is_ok() {
+            let rope_dim = rope_dim.unwrap().to_u32()? as usize;
+            if rope_dim != head_dim {
+                Some(rope_dim as f32 / head_dim as f32)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let cfg = GGUFLLaMa::into_config(
+            embedding_length,
+            head_dim,
+            0,
+            block_count,
+            head_count,
+            head_count_kv,
+            rms_norm_eps,
+            rope_freq_base as f64,
+            context_length,
+            original_max_position_embeddings,
+            partial_rotary_factor,
+        );
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(
+            DType::F32,
+            &cfg,
+            device,
+            false,
+        )?);
+
         let mut layers = Vec::with_capacity(block_count);
         for layer_idx in 0..block_count {
             let prefix = format!("blk.{layer_idx}");
@@ -459,6 +384,7 @@ impl GGUFLLaMa {
                     experts,
                 }
             };
+
             let attention_norm =
                 ct.tensor(reader, &format!("{prefix}.attn_norm.weight"), device)?;
             let ffn_norm = ct.tensor(reader, &format!("{prefix}.ffn_norm.weight"), device)?;
@@ -473,8 +399,6 @@ impl GGUFLLaMa {
                 n_head: head_count,
                 n_kv_head: head_count_kv,
                 head_dim,
-                cos: cos.clone(),
-                sin: sin.clone(),
                 attn: PagedAttention::new(
                     head_count,
                     head_dim,
@@ -484,6 +408,7 @@ impl GGUFLLaMa {
                     device.clone(),
                     None,
                 )?,
+                rotary_emb: rotary_emb.clone(),
                 dtype,
             });
             reporter.write().unwrap().set_progress(layer_idx + 1);
@@ -493,16 +418,7 @@ impl GGUFLLaMa {
             layers,
             norm,
             output: QMatMul::from_qtensor(output)?,
-            cfg: GGUFLLaMa::into_config(
-                embedding_length,
-                head_dim,
-                0,
-                block_count,
-                head_count,
-                head_count_kv,
-                rms_norm_eps,
-                context_length,
-            ),
+            cfg,
             dtype,
             device: device.clone(),
         })

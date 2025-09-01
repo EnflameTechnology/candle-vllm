@@ -1,3 +1,4 @@
+use super::rotary_emb::ScalingRotaryEmbedding;
 use super::Config;
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::paged_attention::input_metadata::InputMetadata;
@@ -9,6 +10,7 @@ use candle_transformers::quantized_nn::RmsNorm;
 use either::Either;
 use std::iter::zip;
 use std::sync::{Arc, RwLock};
+
 #[derive(Debug, Clone)]
 struct Mlp {
     feed_forward_w1: QMatMul,
@@ -41,35 +43,12 @@ struct LayerWeights {
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
-    cos: Tensor,
-    sin: Tensor,
     attn: PagedAttention,
+    rotary_emb: Arc<ScalingRotaryEmbedding>,
     dtype: DType,
 }
 
 impl LayerWeights {
-    fn apply_rotary_emb(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        input_positions: &[Vec<usize>],
-    ) -> Result<(Tensor, Tensor)> {
-        let (b_size, _h, seq_len, _n_embd) = q.dims4()?;
-        let mut q_embeds = Vec::new();
-        let mut k_embeds = Vec::new();
-        for (b, seqlen_offset) in zip(0..b_size, input_positions) {
-            let cos = self.cos.narrow(0, seqlen_offset[0], seq_len)?;
-            let sin = self.sin.narrow(0, seqlen_offset[0], seq_len)?;
-            let x_q = q.narrow(0, b, 1)?;
-            let x_k = k.narrow(0, b, 1)?;
-            let q_embed = candle_nn::rotary_emb::rope(&x_q, &cos, &sin)?;
-            let k_embed = candle_nn::rotary_emb::rope(&x_k, &cos, &sin)?;
-            q_embeds.push(q_embed);
-            k_embeds.push(k_embed);
-        }
-        Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
-    }
-
     fn forward_attn(
         &self,
         x: &Tensor,
@@ -138,7 +117,7 @@ impl LayerWeights {
             (q, k)
         };
 
-        let (q, k) = self.apply_rotary_emb(&q, &k, input_positions)?;
+        let (q, k) = self.rotary_emb.apply_rotary_emb(&q, &k, input_positions)?;
         let (q, k, v) = (
             q.to_dtype(self.dtype)?,
             k.to_dtype(self.dtype)?,
@@ -174,27 +153,6 @@ pub struct GGUFQWen {
     device: Device,
 }
 
-fn precomput_freqs_cis(
-    head_dim: usize,
-    freq_base: f32,
-    context_length: usize,
-    device: &Device,
-    _dtype: DType,
-) -> Result<(Tensor, Tensor)> {
-    let theta: Vec<_> = (0..head_dim)
-        .step_by(2)
-        .map(|i| 1f32 / freq_base.powf(i as f32 / head_dim as f32))
-        .collect();
-    let theta = Tensor::new(theta.as_slice(), device)?;
-    let idx_theta = Tensor::arange(0, context_length as u32, device)?
-        .to_dtype(DType::F32)?
-        .reshape((context_length, 1))?
-        .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-    let cos = idx_theta.cos()?;
-    let sin = idx_theta.sin()?;
-    Ok((cos, sin))
-}
-
 impl GGUFQWen {
     pub fn into_config(
         embedding_length: usize,
@@ -203,8 +161,11 @@ impl GGUFQWen {
         block_count: usize,
         head_count: usize,
         head_count_kv: usize,
+        rope_theta: f64,
         rms_eps: f64,
         max_seq_len: usize,
+        original_max_position_embeddings: Option<usize>,
+        partial_rotary_factor: Option<f32>,
     ) -> Config {
         Config {
             architectures: Some(vec!["qwen".to_string()]),
@@ -216,7 +177,7 @@ impl GGUFQWen {
             num_attention_heads: head_count,
             num_key_value_heads: Some(head_count_kv),
             rms_norm_eps: rms_eps,
-            rope_theta: 10_000.0f64,
+            rope_theta,
             rope_local_base_freq: None,
             bos_token_id: Some(super::TokenID(Either::Left(Some(151644)))),
             eos_token_id: super::TokenID(Either::Left(Some(151645))),
@@ -228,9 +189,9 @@ impl GGUFQWen {
             tie_word_embeddings: false,
             rope_scaling: None,
             max_position_embeddings: Some(max_seq_len),
-            original_max_position_embeddings: max_seq_len,
+            original_max_position_embeddings,
             attention_bias: Some(false),
-            partial_rotary_factor: None,
+            partial_rotary_factor,
             qk_layernorm: false,
             use_qkv_bias: None,
             custom_stop_tokens: None,
@@ -238,20 +199,8 @@ impl GGUFQWen {
             final_logit_softcapping: None,
             quantization_config: None,
             moe_config: None,
-            qwen_moe_config: None,
             quant: Some("gguf".to_string()),
         }
-    }
-
-    pub fn get_num_of_layers(qwen3: bool, ct: gguf_file::Content) -> Result<usize> {
-        let md_get = |s: &str| match ct.metadata.get(s) {
-            None => candle_core::bail!("cannot find {s} in metadata"),
-            Some(v) => Ok(v),
-        };
-        Ok(
-            md_get(format!("qwen{}.block_count", if qwen3 { 3 } else { 2 }).as_str())?.to_u32()?
-                as usize,
-        )
     }
 
     pub fn from_gguf<R: std::io::Seek + std::io::Read>(
@@ -267,32 +216,29 @@ impl GGUFQWen {
             Some(v) => Ok(v),
         };
         let reporter = progress_reporter.clone();
+        let arch = md_get("general.architecture")?.to_string()?;
 
-        let version = if qwen3 { 3 } else { 2 };
         let head_count =
-            md_get(format!("qwen{version}.attention.head_count").as_str())?.to_u32()? as usize;
+            md_get(format!("{arch}.attention.head_count").as_str())?.to_u32()? as usize;
         let head_count_kv =
-            md_get(format!("qwen{version}.attention.head_count_kv").as_str())?.to_u32()? as usize;
+            md_get(format!("{arch}.attention.head_count_kv").as_str())?.to_u32()? as usize;
 
-        let head_dim = md_get(format!("qwen{version}.attention.key_length").as_str());
-        let head_dim = if head_dim.is_ok() {
-            Some(head_dim.unwrap().to_u32()? as usize)
-        } else {
-            None
-        };
+        let head_dim = md_get(format!("{arch}.attention.key_length").as_str());
         let embedding_length =
-            md_get(format!("qwen{version}.embedding_length").as_str())?.to_u32()? as usize;
-        let context_length =
-            md_get(format!("qwen{version}.context_length").as_str())?.to_u32()? as usize;
-        let block_count = md_get(format!("qwen{version}.block_count").as_str())?.to_u32()? as usize;
+            md_get(format!("{arch}.embedding_length").as_str())?.to_u32()? as usize;
+        let head_dim = if head_dim.is_ok() {
+            head_dim.unwrap().to_u32()? as usize
+        } else {
+            embedding_length / head_count
+        };
+        let context_length = md_get(format!("{arch}.context_length").as_str())?.to_u32()? as usize;
+        let block_count = md_get(format!("{arch}.block_count").as_str())?.to_u32()? as usize;
         let rms_norm_eps =
-            md_get(format!("qwen{version}.attention.layer_norm_rms_epsilon").as_str())?.to_f32()?
-                as f64;
-        let rope_freq_base = md_get(format!("qwen{version}.rope.freq_base").as_str())
+            md_get(format!("{arch}.attention.layer_norm_rms_epsilon").as_str())?.to_f32()? as f64;
+        let rope_freq_base = md_get(format!("{arch}.rope.freq_base").as_str())
             .and_then(|m| m.to_f32())
             .unwrap_or(10000f32);
 
-        let head_dim = head_dim.unwrap_or(embedding_length / head_count);
         let tok_embeddings = ct.tensor(reader, "token_embd.weight", device)?;
         let tok_embeddings = tok_embeddings.dequantize(device)?;
         let norm = RmsNorm::from_qtensor(
@@ -306,9 +252,39 @@ impl GGUFQWen {
                 QMatMul::from_qtensor(ct.tensor(reader, "token_embd.weight", device)?)?
             }
         };
+        let original_max_position_embeddings =
+            md_get(format!("{arch}.rope.scaling.original_context_length").as_str());
+        let original_max_position_embeddings = if original_max_position_embeddings.is_ok() {
+            Some(original_max_position_embeddings.unwrap().to_u32()? as usize)
+        } else {
+            None
+        };
 
-        let (cos, sin) =
-            precomput_freqs_cis(head_dim, rope_freq_base, context_length, device, dtype)?;
+        let rope_dim = md_get(format!("{arch}.rope.dimension_count").as_str());
+        let partial_rotary_factor = if rope_dim.is_ok() {
+            let rope_dim = rope_dim.unwrap().to_u32()? as usize;
+            if rope_dim != head_dim {
+                Some(rope_dim as f32 / head_dim as f32)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let cfg = GGUFQWen::into_config(
+            embedding_length,
+            head_dim,
+            0,
+            block_count,
+            head_count,
+            head_count_kv,
+            rope_freq_base as f64,
+            rms_norm_eps,
+            context_length,
+            original_max_position_embeddings,
+            partial_rotary_factor,
+        );
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, &cfg, device, true)?);
 
         let mut layers = Vec::with_capacity(block_count);
 
@@ -396,8 +372,6 @@ impl GGUFQWen {
                 attention_norm: RmsNorm::from_qtensor(attention_norm, rms_norm_eps)?,
                 q_norm,
                 k_norm,
-                cos: cos.clone(),
-                sin: sin.clone(),
                 mlp,
                 ffn_norm: RmsNorm::from_qtensor(ffn_norm, rms_norm_eps)?,
                 n_head: head_count,
@@ -412,6 +386,7 @@ impl GGUFQWen {
                     device.clone(),
                     None,
                 )?,
+                rotary_emb: rotary_emb.clone(),
                 dtype,
             });
             reporter.write().unwrap().set_progress(layer_idx + 1);
@@ -422,16 +397,7 @@ impl GGUFQWen {
             layers,
             norm,
             output,
-            cfg: GGUFQWen::into_config(
-                embedding_length,
-                head_dim,
-                0,
-                block_count,
-                head_count,
-                head_count_kv,
-                rms_norm_eps,
-                context_length,
-            ),
+            cfg,
             dtype,
             device: device.clone(),
         })

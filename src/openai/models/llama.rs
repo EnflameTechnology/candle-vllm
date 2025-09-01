@@ -1,4 +1,4 @@
-use super::rotary_emb::Llama3RotaryEmbedding;
+use super::rotary_emb::ScalingRotaryEmbedding;
 use super::Config;
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::openai::distributed::{
@@ -54,7 +54,7 @@ struct CausalSelfAttention {
     num_key_value_heads: usize,
     head_dim: usize,
     attn: PagedAttention,
-    rotay_emb: Arc<Llama3RotaryEmbedding>,
+    rotay_emb: Arc<ScalingRotaryEmbedding>,
 }
 
 impl CausalSelfAttention {
@@ -90,8 +90,9 @@ impl CausalSelfAttention {
             (q, k, v.contiguous()?)
         };
 
-        let (q, k) = self.rotay_emb.apply_rotary_emb(&q, &k, input_positions)?;
+        let (q, k) = self.rotay_emb.apply_rotary_emb(&q.to_dtype(DType::F32)?, &k.to_dtype(DType::F32)?, input_positions)?;
 
+        let (q, k) = (q.to_dtype(v.dtype())?, k.to_dtype(v.dtype())?);
         let y = self
             .attn
             .forward(
@@ -114,7 +115,7 @@ impl CausalSelfAttention {
         vb: VarBuilder,
         cfg: &Config,
         comm: Rc<Comm>,
-        rotay_emb: Arc<Llama3RotaryEmbedding>,
+        rotay_emb: Arc<ScalingRotaryEmbedding>,
     ) -> Result<Self> {
         let size_in = cfg.hidden_size;
         let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
@@ -274,7 +275,7 @@ impl Block {
         vb: VarBuilder,
         cfg: &Config,
         comm: Rc<Comm>,
-        rotay_emb: Arc<Llama3RotaryEmbedding>,
+        rotay_emb: Arc<ScalingRotaryEmbedding>,
     ) -> Result<Self> {
         let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg, comm.clone(), rotay_emb)?;
         let mlp = Mlp::load(vb.pp("mlp"), cfg, comm.clone())?;
@@ -369,7 +370,7 @@ impl Llama {
             &None,
         )?;
 
-        let rotary_emb = Arc::new(Llama3RotaryEmbedding::new(dtype, cfg, device, true)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, cfg, device, true)?);
         let ln_f = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let reporter = progress_reporter.clone();
         let blocks: Vec<_> = (0..cfg.num_hidden_layers)

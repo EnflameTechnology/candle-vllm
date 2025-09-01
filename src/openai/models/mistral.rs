@@ -1,4 +1,4 @@
-use super::{rotary_emb::DefaultRotaryEmbedding, Config};
+use super::{rotary_emb::ScalingRotaryEmbedding, Config};
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::openai::distributed::{
     embedding, rms_norm, Comm, ReplicatedLinear, TensorParallelColumnLinear,
@@ -15,6 +15,7 @@ use std::iter::zip;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
+
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct MistralTextConfig {
     pub(crate) vocab_size: usize,
@@ -25,6 +26,7 @@ pub struct MistralTextConfig {
     pub(crate) num_key_value_heads: usize,
     pub(crate) head_dim: usize,
     pub(crate) max_position_embeddings: usize,
+    pub(crate) original_max_position_embeddings: Option<usize>,
     pub(crate) rms_norm_eps: f64,
     #[serde(default)]
     pub(crate) tie_word_embeddings: bool,
@@ -129,7 +131,7 @@ impl Mistral {
             tie_word_embeddings: config.text_config.tie_word_embeddings,
             rope_scaling: None,
             max_position_embeddings: Some(config.text_config.max_position_embeddings),
-            original_max_position_embeddings: config.text_config.max_position_embeddings,
+            original_max_position_embeddings: config.text_config.original_max_position_embeddings,
             attention_bias: Some(config.text_config.attention_bias),
             partial_rotary_factor: None,
             qk_layernorm: false,
@@ -139,7 +141,6 @@ impl Mistral {
             final_logit_softcapping: None,
             quantization_config: config.text_config.quantization_config.clone(),
             moe_config: None,
-            qwen_moe_config: None,
             quant,
         };
         Ok(config)
@@ -209,13 +210,13 @@ struct Attention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    rotary_emb: Arc<DefaultRotaryEmbedding>,
+    rotary_emb: Arc<ScalingRotaryEmbedding>,
     attn: PagedAttention,
 }
 
 impl Attention {
     fn new(
-        rotary_emb: Arc<DefaultRotaryEmbedding>,
+        rotary_emb: Arc<ScalingRotaryEmbedding>,
         cfg: &Config,
         vb: VarBuilder,
         comm: Rc<Comm>,
@@ -357,7 +358,7 @@ struct DecoderLayer {
 
 impl DecoderLayer {
     fn new(
-        rotary_emb: Arc<DefaultRotaryEmbedding>,
+        rotary_emb: Arc<ScalingRotaryEmbedding>,
         cfg: &Config,
         vb: VarBuilder,
         comm: Rc<Comm>,
@@ -427,7 +428,7 @@ impl Mistral {
             vb.pp("model")
         };
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        let rotary_emb = Arc::new(DefaultRotaryEmbedding::new(dtype, cfg, device, true)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(dtype, cfg, device, true)?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         let reporter = progress_reporter.clone();

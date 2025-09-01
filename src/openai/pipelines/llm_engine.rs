@@ -36,7 +36,6 @@ use std::{
     iter::zip,
     sync::Arc,
 };
-use tokenizers::Encoding;
 use tokio::sync::Notify;
 #[allow(unused_imports)]
 use tracing::{debug, info, warn};
@@ -616,6 +615,8 @@ impl LLMEngine {
                     Either::Left(logprobs) => {
                         let seq = group.get_seqs().values().nth(0).unwrap();
                         if seq.deref().is_prompt() {
+                            let e = engine.read();
+                            e.scheduler.print_free_blocks();
                             prompt_finish_times.insert(*group.get_id(), SystemTime::now());
                         }
                         if let Some(sender) = &group.sender {
@@ -635,6 +636,9 @@ impl LLMEngine {
                                     seq.deref().get_id()
                                 );
                                 seq.deref_mut().set_finish_reason("abort".to_string());
+                            }
+                            if seq.deref_mut().get_len() % 1000 == 0 {
+                                e.scheduler.print_free_blocks();
                             }
                         };
                         seq.deref_mut().add_token(logprobs);
@@ -1059,7 +1063,7 @@ impl LLMEngine {
         &mut self,
         seq_id: usize,
         group_id: usize,
-        prompt: &Encoding,
+        prompt: &Vec<u32>,
         request_id: &str,
         created: SystemTime,
         sampling_params: &SamplingParams,
@@ -1067,12 +1071,7 @@ impl LLMEngine {
         sender: Option<Sender<ChatResponse>>,
     ) -> SequenceGroup {
         let seq = Arc::new(Sequence(std::sync::RwLock::new(_Sequence::new(
-            prompt
-                .get_ids()
-                .to_vec()
-                .iter()
-                .map(|x| *x as usize)
-                .collect::<Vec<_>>(),
+            prompt,
             seq_id,
             self.cache_config.block_size,
         ))));
@@ -1090,7 +1089,7 @@ impl LLMEngine {
 
     pub fn add_request(
         &mut self,
-        prompt: Encoding,
+        prompt: Vec<u32>,
         request_id: String,
         created: SystemTime,
         sampling_params: SamplingParams,

@@ -1,6 +1,6 @@
+use super::rotary_emb::ScalingRotaryEmbedding;
 use super::Config;
 use crate::backend::progress::{ProgressLike, ProgressReporter};
-use crate::openai::models::glm4::RotaryEmbedding;
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
 use candle_core::quantized::{gguf_file, QMatMul};
@@ -40,7 +40,7 @@ struct LayerWeights {
     attention_norm: RmsNorm,
     post_ffw_norm: RmsNorm,
     post_attention_norm: RmsNorm,
-    rotary_emb: Arc<RotaryEmbedding>,
+    rotary_emb: Arc<ScalingRotaryEmbedding>,
     mlp: Mlp,
     ffn_norm: RmsNorm,
     n_head: usize,
@@ -102,12 +102,11 @@ impl LayerWeights {
             (q.contiguous()?, k.contiguous()?, v.contiguous()?)
         };
 
-        let q = self
-            .rotary_emb
-            .apply_rotary_emb(&q.to_dtype(DType::F32)?, input_positions)?;
-        let k = self
-            .rotary_emb
-            .apply_rotary_emb(&k.to_dtype(DType::F32)?, input_positions)?;
+        let (q, k) = self.rotary_emb.apply_rotary_emb(
+            &q.to_dtype(DType::F32)?,
+            &k.to_dtype(DType::F32)?,
+            input_positions,
+        )?;
         let (q, k, v) = (
             q.to_dtype(self.dtype)?,
             k.to_dtype(self.dtype)?,
@@ -154,6 +153,7 @@ impl GGUFGLM4 {
         rope_theta: f64,
         rms_eps: f64,
         max_seq_len: usize,
+        partial_rotary_factor: Option<f32>,
     ) -> Config {
         Config {
             architectures: Some(vec!["glm4".to_string()]),
@@ -177,9 +177,9 @@ impl GGUFGLM4 {
             tie_word_embeddings: false,
             rope_scaling: None,
             max_position_embeddings: Some(max_seq_len),
-            original_max_position_embeddings: max_seq_len,
+            original_max_position_embeddings: None,
             attention_bias: Some(false),
-            partial_rotary_factor: Some(0.5),
+            partial_rotary_factor,
             qk_layernorm: false,
             use_qkv_bias: None,
             custom_stop_tokens: None,
@@ -187,17 +187,8 @@ impl GGUFGLM4 {
             final_logit_softcapping: None,
             quantization_config: None,
             moe_config: None,
-            qwen_moe_config: None,
             quant: Some("gguf".to_string()),
         }
-    }
-
-    pub fn get_num_of_layers(ct: gguf_file::Content) -> Result<usize> {
-        let md_get = |s: &str| match ct.metadata.get(s) {
-            None => candle_core::bail!("cannot find {s} in metadata"),
-            Some(v) => Ok(v),
-        };
-        Ok(md_get("glm4.block_count")?.to_u32()? as usize)
     }
 
     pub fn from_gguf<R: std::io::Seek + std::io::Read>(
@@ -213,24 +204,29 @@ impl GGUFGLM4 {
         };
         let reporter = progress_reporter.clone();
 
-        let head_count = md_get("glm4.attention.head_count")?.to_u32()? as usize;
-        let head_count_kv = md_get("glm4.attention.head_count_kv")?.to_u32()? as usize;
+        let arch = md_get("general.architecture")?.to_string()?;
 
-        let head_dim = md_get("glm4.attention.key_length");
+        let head_count =
+            md_get(format!("{arch}.attention.head_count").as_str())?.to_u32()? as usize;
+        let head_count_kv =
+            md_get(format!("{arch}.attention.head_count_kv").as_str())?.to_u32()? as usize;
+
+        let head_dim = md_get(format!("{arch}.attention.key_length").as_str());
+        let embedding_length =
+            md_get(format!("{arch}.embedding_length").as_str())?.to_u32()? as usize;
         let head_dim = if head_dim.is_ok() {
-            Some(head_dim.unwrap().to_u32()? as usize)
+            head_dim.unwrap().to_u32()? as usize
         } else {
-            None
+            embedding_length / head_count
         };
-        let embedding_length = md_get("glm4.embedding_length")?.to_u32()? as usize;
-        let context_length = md_get("glm4.context_length")?.to_u32()? as usize;
-        let block_count = md_get("glm4.block_count")?.to_u32()? as usize;
-        let rms_norm_eps = md_get("glm4.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
-        let rope_freq_base = md_get("glm4.rope.freq_base")
+        let context_length = md_get(format!("{arch}.context_length").as_str())?.to_u32()? as usize;
+        let block_count = md_get(format!("{arch}.block_count").as_str())?.to_u32()? as usize;
+        let rms_norm_eps =
+            md_get(format!("{arch}.attention.layer_norm_rms_epsilon").as_str())?.to_f32()? as f64;
+        let rope_freq_base = md_get(format!("{arch}.rope.freq_base").as_str())
             .and_then(|m| m.to_f32())
             .unwrap_or(10000f32);
 
-        let head_dim = head_dim.unwrap_or(embedding_length / head_count);
         let tok_embeddings = ct.tensor(reader, "token_embd.weight", device)?;
         let tok_embeddings = tok_embeddings.dequantize(device)?;
         let norm = RmsNorm::from_qtensor(
@@ -245,6 +241,18 @@ impl GGUFGLM4 {
             }
         };
 
+        let rope_dim = md_get(format!("{arch}.rope.dimension_count").as_str());
+        let partial_rotary_factor = if rope_dim.is_ok() {
+            let rope_dim = rope_dim.unwrap().to_u32()? as usize;
+            if rope_dim != head_dim {
+                Some(rope_dim as f32 / head_dim as f32)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let cfg = GGUFGLM4::into_config(
             embedding_length,
             head_dim,
@@ -255,8 +263,14 @@ impl GGUFGLM4 {
             rope_freq_base as f64,
             rms_norm_eps,
             context_length,
+            partial_rotary_factor,
         );
-        let rotary_emb = Arc::new(RotaryEmbedding::new(&cfg, dtype, device)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(
+            DType::F32,
+            &cfg,
+            device,
+            false,
+        )?);
 
         let mut layers = Vec::with_capacity(block_count);
         for layer_idx in 0..block_count {

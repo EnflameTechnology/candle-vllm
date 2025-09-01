@@ -1,3 +1,4 @@
+use super::rotary_emb::ScalingRotaryEmbedding;
 use super::Config;
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::openai::distributed::{
@@ -6,7 +7,7 @@ use crate::openai::distributed::{
 };
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
-use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::{Activation, LayerNorm};
 use std::iter::zip;
 use std::path::PathBuf;
@@ -42,61 +43,6 @@ impl StableLM {
             config.quant = Some(isq.unwrap().to_string());
         }
         Ok(config)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct RotaryEmbedding {
-    sin: Tensor,
-    cos: Tensor,
-    cos_sin: Tensor,
-    dim: usize,
-}
-
-impl RotaryEmbedding {
-    pub(crate) fn new(_dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
-        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
-        let dim = (cfg.partial_rotary_factor.unwrap() * head_dim as f32) as usize;
-        let max_seq_len = cfg.max_seq_len;
-        let inv_freq: Vec<_> = (0..dim)
-            .step_by(2)
-            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
-            .collect();
-        let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(DType::F32)?;
-        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(DType::F32)?
-            .reshape((max_seq_len, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
-        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?.contiguous()?; //must be contiguous tensor;
-        Ok(Self {
-            sin: freqs.sin()?,
-            cos: freqs.cos()?,
-            cos_sin,
-            dim,
-        })
-    }
-
-    fn apply_rotary_emb_qkv(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        input_positions: &[Vec<usize>],
-    ) -> Result<(Tensor, Tensor)> {
-        let mut _input_positions = Vec::<i32>::new();
-        for seqlen_offset in input_positions {
-            _input_positions.push(seqlen_offset[0] as i32);
-        }
-        candle_nn::apply_rotary_emb_qkv(
-            &q,
-            &k,
-            &self.cos_sin,
-            &self.sin,
-            &_input_positions,
-            self.dim,
-            true,
-            true,
-        )
     }
 }
 
@@ -164,13 +110,13 @@ struct Attention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    rotary_emb: Arc<RotaryEmbedding>,
+    rotary_emb: Arc<ScalingRotaryEmbedding>,
     attn: PagedAttention,
 }
 
 impl Attention {
     fn new(
-        rotary_emb: Arc<RotaryEmbedding>,
+        rotary_emb: Arc<ScalingRotaryEmbedding>,
         cfg: &Config,
         vb: VarBuilder,
         comm: Rc<Comm>,
@@ -275,7 +221,7 @@ impl Attention {
 
         let (q, k) = self
             .rotary_emb
-            .apply_rotary_emb_qkv(&q, &k, input_positions)?;
+            .apply_rotary_emb(&q, &k, input_positions)?;
 
         let y = self
             .attn
@@ -305,7 +251,7 @@ struct DecoderLayer {
 
 impl DecoderLayer {
     fn new(
-        rotary_emb: Arc<RotaryEmbedding>,
+        rotary_emb: Arc<ScalingRotaryEmbedding>,
         cfg: &Config,
         vb: VarBuilder,
         comm: Rc<Comm>,
@@ -373,7 +319,12 @@ impl StableLM {
     ) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb_m.device())?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(
+            dtype,
+            cfg,
+            vb_m.device(),
+            true,
+        )?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         let reporter = progress_reporter.clone();

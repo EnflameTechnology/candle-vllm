@@ -1,14 +1,14 @@
-use super::Config;
-use crate::backend::custom_ops::moe::TopKLastDimOp;
-use crate::backend::custom_ops::moe::TopKOutput;
+#[cfg(feature = "gcu")]
+use crate::backend::custom_ops::moe::{TopKOutput, TopKLastDimOp};
+use crate::openai::distributed::shard;
+use super::{rotary_emb::ScalingRotaryEmbedding, Config, MoEConfig};
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::openai::distributed::AllReduce;
 use crate::openai::distributed::{
-    embedding, rms_norm, Comm, ReplicatedLinear, TensorParallelColumnLinear,
-    TensorParallelRowLinear, VarBuilder, shard,
+    embedding, rms_norm, rms_norm_with_dtype, Comm, ReplicatedLinear, TensorParallelColumnLinear,
+    TensorParallelRowLinear, VarBuilder,
 };
-use crate::openai::models::rotary_emb::DefaultRotaryEmbedding;
-use crate::openai::models::linear::{linear_no_bias_x as linear_no_bias, LinearX as Linear};
+use crate::openai::models::linear::LinearX as Linear;
 use crate::openai::models::QwenMoEConfig;
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
@@ -55,7 +55,7 @@ impl Qwen3MoE {
             Ok(f) => {
                 let cfg: QwenMoEConfig =
                     serde_json::from_slice(&f).map_err(candle_core::Error::wrap)?;
-                config.qwen_moe_config = Some(cfg);
+                config.moe_config = Some(MoEConfig::QwenMoE(cfg));
             }
             Err(e) => panic!("Unable to load MoE config from file {:?}!", e),
         }
@@ -129,22 +129,20 @@ struct Moe {
 }
 
 impl Moe {
-    fn new(cfg: &Config, vb: VarBuilder, comm: Rc<Comm>, dtype: DType) -> Result<Self> {
-        let moe_cfg = cfg
-            .qwen_moe_config
-            .as_ref()
-            .expect("MoE config is not available!");
+    fn new(cfg: &Config, vb: VarBuilder, comm: Rc<Comm>) -> Result<Self> {
+        let moe_cfg = if let Some(MoEConfig::QwenMoE(moe_cfg)) = &cfg.moe_config {
+            moe_cfg.clone()
+        } else {
+            candle::bail!("Expected QwenMoEConfig")
+        };
         let num_experts = moe_cfg.num_experts.unwrap();
-        let gate = linear_no_bias(
-            cfg.hidden_size,
-            num_experts,
-            vb.pp("gate"),
+        let ws = vb.pp("gate").get_with_hints_dtype(
+            (num_experts, cfg.hidden_size),
+            "weight",
             Shard::default(),
-            &cfg.quant,
-            &cfg.quantization_config,
-            dtype,
-            None,
+            DType::F32,
         )?;
+        let gate = Linear::new(ws, None, &None, &None);
 
         let experts_vb = vb.pp("experts");
         let mut experts = Vec::with_capacity(num_experts);
@@ -171,7 +169,7 @@ impl Moe {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (batch, seq_len, hidden_dim) = xs.dims3()?;
         let xs = xs.reshape(((), hidden_dim))?;
-        let router_logits = xs.apply(&self.gate)?.to_dtype(DType::F32)?;
+        let router_logits = self.gate.forward(&xs.to_dtype(DType::F32)?)?;
         let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
 
         // Select top-k experts
@@ -246,11 +244,13 @@ struct FusedMoe {
 }
 
 impl FusedMoe {
-    fn new(cfg: &Config, vb: VarBuilder, comm: Rc<Comm>, dtype: DType) -> Result<Self> {
-        let moe_cfg = cfg
-            .qwen_moe_config
-            .as_ref()
-            .expect("MoE config is not available!");
+    fn new(cfg: &Config, vb: VarBuilder, comm: Rc<Comm>) -> Result<Self> {
+        let moe_cfg = if let Some(MoEConfig::QwenMoE(moe_cfg)) = &cfg.moe_config {
+            moe_cfg.clone()
+        } else {
+            candle::bail!("Expected QwenMoEConfig")
+        };
+
         let num_experts = moe_cfg.num_experts.unwrap();
 
         let quant_type = match cfg.quant.as_ref().unwrap().as_str() {
@@ -268,16 +268,25 @@ impl FusedMoe {
         };
 
         let block_size = quant_type.block_size();
-        let gate = linear_no_bias(
-            cfg.hidden_size,
-            num_experts,
-            vb.pp("gate"),
+
+        let ws = vb.pp("gate").get_with_hints_dtype(
+            (num_experts, cfg.hidden_size),
+            "weight",
             Shard::default(),
-            &cfg.quant,
-            &cfg.quantization_config,
-            dtype,
-            None,
+            DType::F32,
         )?;
+        let gate = Linear::new(ws, None, &None, &None);
+
+        // let gate = linear_no_bias(
+        //     cfg.hidden_size,
+        //     num_experts,
+        //     vb.pp("gate"),
+        //     Shard::default(),
+        //     &None,
+        //     &None,
+        //     DType::F32,
+        //     None,
+        // )?;
 
         let experts_vb = vb.pp("experts");
         let mut gate_experts = Vec::with_capacity(num_experts);
@@ -421,8 +430,8 @@ impl FusedMoe {
         let xs = xs.reshape(((), hidden_dim))?;
         let original_dtype = xs.dtype();
         let (num_tokens, hidden_dim) = xs.dims2()?;
-        let router_logits = self.gate.forward(&xs)?.to_dtype(DType::F32)?;
         let xs = xs.to_dtype(DType::F32)?;
+        let router_logits = self.gate.forward(&xs)?;
         let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
 
         let indices = routing_weights
@@ -483,14 +492,14 @@ struct Attention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    rotary_emb: Arc<DefaultRotaryEmbedding>,
+    rotary_emb: Arc<ScalingRotaryEmbedding>,
     attn: PagedAttention,
 }
 
 impl Attention {
     fn new(
         qwen3: bool,
-        rotary_emb: Arc<DefaultRotaryEmbedding>,
+        rotary_emb: Arc<ScalingRotaryEmbedding>,
         cfg: &Config,
         vb: VarBuilder,
         comm: Rc<Comm>,
@@ -550,13 +559,24 @@ impl Attention {
             &cfg.quantization_config,
         )?;
 
+        //we use higher precision for q/k norm
         let q_norm = if qwen3 {
-            Some(rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?)
+            Some(rms_norm_with_dtype(
+                head_dim,
+                cfg.rms_norm_eps,
+                vb.pp("q_norm"),
+                DType::F32,
+            )?)
         } else {
             None
         };
         let k_norm = if qwen3 {
-            Some(rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?)
+            Some(rms_norm_with_dtype(
+                head_dim,
+                cfg.rms_norm_eps,
+                vb.pp("k_norm"),
+                DType::F32,
+            )?)
         } else {
             None
         };
@@ -619,6 +639,9 @@ impl Attention {
             (q, k, v.contiguous()?)
         };
 
+        let q = q.to_dtype(DType::F32)?;
+        let k = k.to_dtype(DType::F32)?;
+
         let (q, k) = if self.q_norm.is_some() && self.k_norm.is_some() {
             //Per‑head RMSNorm in qwen3
             let q_flat = q.flatten(0, 2)?; // (B*H, L, D) -> (BHL, D) after transpose later
@@ -633,6 +656,8 @@ impl Attention {
         };
 
         let (q, k) = self.rotary_emb.apply_rotary_emb(&q, &k, input_positions)?;
+        let q = q.to_dtype(v.dtype())?;
+        let k = k.to_dtype(v.dtype())?;
 
         let y = self
             .attn
@@ -663,19 +688,20 @@ struct DecoderLayer {
 impl DecoderLayer {
     fn new(
         qwen3: bool,
-        rotary_emb: Arc<DefaultRotaryEmbedding>,
+        rotary_emb: Arc<ScalingRotaryEmbedding>,
         cfg: &Config,
         vb: VarBuilder,
         comm: Rc<Comm>,
-        dtype: DType,
+        _dtype: DType,
         layer_idx: usize,
     ) -> Result<Self> {
         let self_attn = Attention::new(qwen3, rotary_emb, cfg, vb.pp("self_attn"), comm.clone())?;
 
-        let moe_cfg = cfg
-            .qwen_moe_config
-            .as_ref()
-            .expect("MoE config is not available!");
+        let moe_cfg = if let Some(MoEConfig::QwenMoE(moe_cfg)) = &cfg.moe_config {
+            moe_cfg.clone()
+        } else {
+            candle::bail!("Expected QwenMoEConfig")
+        };
 
         let mlp = if !moe_cfg
             .mlp_only_layers
@@ -686,14 +712,9 @@ impl DecoderLayer {
                 && (layer_idx + 1) % moe_cfg.decoder_sparse_step.unwrap() == 0)
         {
             if cfg.quant.is_some() {
-                MoeOrMlp::FusedMoe(FusedMoe::new(
-                    cfg,
-                    vb.pp("mlp").clone(),
-                    comm.clone(),
-                    dtype,
-                )?)
+                MoeOrMlp::FusedMoe(FusedMoe::new(cfg, vb.pp("mlp").clone(), comm.clone())?)
             } else {
-                MoeOrMlp::Moe(Moe::new(cfg, vb.pp("mlp").clone(), comm.clone(), dtype)?)
+                MoeOrMlp::Moe(Moe::new(cfg, vb.pp("mlp").clone(), comm.clone())?)
             }
         } else {
             let mlp = Mlp::new(
@@ -764,7 +785,7 @@ impl Qwen3MoE {
     ) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        let rotary_emb = Arc::new(DefaultRotaryEmbedding::new(DType::F32, cfg, device, true)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, cfg, device, true)?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         let reporter = progress_reporter.clone();

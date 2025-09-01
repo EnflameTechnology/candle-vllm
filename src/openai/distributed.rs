@@ -401,6 +401,11 @@ pub fn rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
     Ok(RmsNorm::new(weight, eps))
 }
 
+pub fn rms_norm_with_dtype(size: usize, eps: f64, vb: VarBuilder, dtype: DType) -> Result<RmsNorm> {
+    let weight = vb.get_with_hints_dtype(size, "weight", shard(0, 0, 1), dtype)?;
+    Ok(RmsNorm::new(weight, eps))
+}
+
 pub fn layer_norm(size: usize, eps: f64, affine: bool, vb: VarBuilder) -> Result<LayerNorm> {
     let weight = vb.get_with_hints(size, "weight", Shard::default())?;
     if affine {

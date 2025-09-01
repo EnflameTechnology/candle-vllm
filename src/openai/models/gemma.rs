@@ -372,7 +372,7 @@ impl Gemma {
         let vb_m = vb.pp("model");
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let rotary_emb = Arc::new(DefaultRotaryEmbedding::new(
-            vb.dtype(),
+            dtype,
             cfg,
             vb_m.device(),
             true,

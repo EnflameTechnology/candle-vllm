@@ -8,6 +8,7 @@ use crate::openai::distributed::{
     embedding, rms_norm, AllReduce, Comm, ReplicatedLinear, TensorParallelColumnLinear,
     TensorParallelRowLinear, VarBuilder,
 };
+use crate::openai::models::DeepSeekMoEConfig;
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
 use candle::{DType, Device, IndexOp, Result, Tensor, D};
@@ -118,7 +119,7 @@ impl DeepSeek {
             None
         };
 
-        let moe_config = MoEConfig {
+        let moe_config = DeepSeekMoEConfig {
             num_experts_per_tok: config.num_experts_per_tok,
             n_routed_experts: config.n_routed_experts.unwrap_or(0),
             moe_intermediate_size: config.moe_intermediate_size,
@@ -181,7 +182,7 @@ impl DeepSeek {
             tie_word_embeddings: config.tie_word_embeddings,
             rope_scaling: None,
             max_position_embeddings: Some(config.max_position_embeddings),
-            original_max_position_embeddings: config.max_position_embeddings,
+            original_max_position_embeddings: None,
             attention_bias: Some(false),
             partial_rotary_factor: None,
             qk_layernorm: false,
@@ -190,8 +191,7 @@ impl DeepSeek {
             attn_logit_softcapping: None,
             final_logit_softcapping: None,
             quantization_config: config.quantization_config.clone(),
-            moe_config: Some(moe_config),
-            qwen_moe_config: None,
+            moe_config: Some(MoEConfig::DeepSeekMoE(moe_config)),
             quant,
         };
         Ok(config)
@@ -389,7 +389,7 @@ impl DeepSeekV2RotaryEmbedding {
     }
 }
 
-impl MoEConfig {
+impl DeepSeekMoEConfig {
     pub(crate) fn q_head_dim(&self) -> usize {
         self.qk_rope_head_dim + self.qk_nope_head_dim
     }
@@ -434,10 +434,10 @@ struct Attention {
     kv_b_proj: TensorParallelColumnLinear,
     o_proj: TensorParallelRowLinear,
     rotary_emb: Arc<DeepSeekV2RotaryEmbedding>,
-    cfg: Config,
     q_head_dim: usize,
     num_attention_heads: usize,
     attn: PagedAttention,
+    moe_cfg: DeepSeekMoEConfig,
 }
 
 impl Attention {
@@ -448,7 +448,11 @@ impl Attention {
         comm: Rc<Comm>,
     ) -> Result<Self> {
         let q_head_dim = cfg.q_head_dim();
-        let moe_cfg = cfg.moe_config.as_ref().unwrap();
+        let moe_cfg = if let Some(MoEConfig::DeepSeekMoE(moe_cfg)) = &cfg.moe_config {
+            moe_cfg.clone()
+        } else {
+            candle::bail!("Expected DeepSeekMoEConfig")
+        };
         let attention_bias = cfg.attention_bias.unwrap();
         let q = match moe_cfg.q_lora_rank {
             Some(lora_rank) => {
@@ -526,7 +530,6 @@ impl Attention {
             kv_b_proj,
             o_proj,
             rotary_emb,
-            cfg: cfg.clone(),
             q_head_dim,
             num_attention_heads,
             attn: PagedAttention::new(
@@ -538,6 +541,7 @@ impl Attention {
                 vb.device().clone(),
                 None,
             )?,
+            moe_cfg,
         })
     }
 
@@ -550,12 +554,11 @@ impl Attention {
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
         let (bs, seq_len, _) = xs.dims3()?;
-        let moe_cfg = self.cfg.moe_config.as_ref().unwrap();
         let (q_nope, mut q_pe) = {
             let q = self.q.forward(xs)?;
             let q = q.reshape((bs, seq_len, self.num_attention_heads, self.q_head_dim))?;
             let (q_nope, q_pe) = q.split2(
-                &[moe_cfg.qk_nope_head_dim, moe_cfg.qk_rope_head_dim],
+                &[self.moe_cfg.qk_nope_head_dim, self.moe_cfg.qk_rope_head_dim],
                 D::Minus1,
             )?;
             let q_nope = q_nope.transpose(1, 2)?;
@@ -564,10 +567,12 @@ impl Attention {
         };
 
         let compressed_kv = self.kv_a_proj_with_mqa.forward(xs)?;
-        let (compressed_kv, k_pe) =
-            compressed_kv.split2(&[moe_cfg.kv_lora_rank, moe_cfg.qk_rope_head_dim], D::Minus1)?;
+        let (compressed_kv, k_pe) = compressed_kv.split2(
+            &[self.moe_cfg.kv_lora_rank, self.moe_cfg.qk_rope_head_dim],
+            D::Minus1,
+        )?;
         let mut k_pe = k_pe
-            .reshape((bs, seq_len, 1, moe_cfg.qk_rope_head_dim))?
+            .reshape((bs, seq_len, 1, self.moe_cfg.qk_rope_head_dim))?
             .transpose(1, 2)?;
         let kv = {
             let kv = self
@@ -577,12 +582,15 @@ impl Attention {
                 bs,
                 seq_len,
                 self.num_attention_heads,
-                moe_cfg.qk_nope_head_dim + moe_cfg.v_head_dim,
+                self.moe_cfg.qk_nope_head_dim + self.moe_cfg.v_head_dim,
             ))?
             .transpose(1, 2)?
         };
 
-        let (k_nope, v) = kv.split2(&[moe_cfg.qk_nope_head_dim, moe_cfg.v_head_dim], D::Minus1)?;
+        let (k_nope, v) = kv.split2(
+            &[self.moe_cfg.qk_nope_head_dim, self.moe_cfg.v_head_dim],
+            D::Minus1,
+        )?;
         let mut v = v.contiguous()?;
 
         (q_pe, k_pe) = self.rotary_emb.forward(&q_pe, &k_pe, input_positions)?;
@@ -591,9 +599,9 @@ impl Attention {
         let k_pe = k_pe.repeat((1, q.dim(1)?, 1, 1))?;
         let k = Tensor::cat(&[k_nope, k_pe], D::Minus1)?.contiguous()?;
 
-        if self.q_head_dim != moe_cfg.v_head_dim {
+        if self.q_head_dim != self.moe_cfg.v_head_dim {
             v = v
-                .pad_with_zeros(D::Minus1, 0, self.q_head_dim - moe_cfg.v_head_dim)?
+                .pad_with_zeros(D::Minus1, 0, self.q_head_dim - self.moe_cfg.v_head_dim)?
                 .contiguous()?;
         }
 
@@ -608,8 +616,8 @@ impl Attention {
             None,
         )?;
 
-        if self.q_head_dim != moe_cfg.v_head_dim {
-            y = y.narrow(D::Minus1, 0, moe_cfg.v_head_dim)?;
+        if self.q_head_dim != self.moe_cfg.v_head_dim {
+            y = y.narrow(D::Minus1, 0, self.moe_cfg.v_head_dim)?;
         }
 
         y = y.reshape((bs, seq_len, ()))?;
@@ -704,15 +712,19 @@ impl Mlp {
 
 struct MoeGate {
     weight: Tensor,
-    cfg: Config,
     top_k: usize,
     n_routed_experts: usize,
     e_score_correction_bias: Option<Tensor>,
+    moe_cfg: DeepSeekMoEConfig,
 }
 
 impl MoeGate {
     fn new(cfg: &Config, vb: VarBuilder, n_routed_experts: usize) -> Result<Self> {
-        let moe_cfg = cfg.moe_config.as_ref().unwrap();
+        let moe_cfg = if let Some(MoEConfig::DeepSeekMoE(moe_cfg)) = &cfg.moe_config {
+            moe_cfg.clone()
+        } else {
+            candle::bail!("Expected DeepSeekMoEConfig")
+        };
         let weight = vb.get((n_routed_experts, cfg.hidden_size), "weight")?;
         let e_score_correction_bias = if matches!(moe_cfg.topk_method, TopkMethod::NoAuxTc) {
             Some(vb.get_with_hints_dtype(
@@ -726,17 +738,17 @@ impl MoeGate {
         };
         Ok(Self {
             weight: weight.to_dtype(DType::F32)?,
-            cfg: cfg.clone(),
             top_k: moe_cfg.num_experts_per_tok.unwrap(),
             n_routed_experts,
             e_score_correction_bias,
+            moe_cfg,
         })
     }
 
     /// (topk_idx, topk_weight)
     fn forward(&self, xs: &Tensor) -> Result<(Tensor, Tensor)> {
         let (bs, seq_len, h) = xs.dims3()?;
-        let moe_cfg = self.cfg.moe_config.as_ref().unwrap();
+        let moe_cfg = &self.moe_cfg;
         // Compute gating score
         let xs = xs.reshape(((), h))?;
         let logits = xs
@@ -857,7 +869,11 @@ impl Moe {
         n_routed_experts: usize,
         comm: Rc<Comm>,
     ) -> Result<Self> {
-        let moe_cfg = cfg.moe_config.as_ref().unwrap();
+        let moe_cfg = if let Some(MoEConfig::DeepSeekMoE(moe_cfg)) = &cfg.moe_config {
+            moe_cfg.clone()
+        } else {
+            candle::bail!("Expected DeepSeekMoEConfig")
+        };
         let mut experts = Vec::with_capacity(n_routed_experts);
         let n_local_experts = n_routed_experts / comm.world_size();
         let experts_start_idx = comm.rank() * n_local_experts;
@@ -1031,7 +1047,11 @@ impl DecoderLayer {
         layer_idx: usize,
         comm: Rc<Comm>,
     ) -> Result<Self> {
-        let moe_cfg = cfg.moe_config.as_ref().unwrap();
+        let moe_cfg = if let Some(MoEConfig::DeepSeekMoE(moe_cfg)) = &cfg.moe_config {
+            moe_cfg.clone()
+        } else {
+            candle::bail!("Expected DeepSeekMoEConfig")
+        };
         let attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"), comm.clone())?;
         let input_layernorm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
@@ -1105,7 +1125,11 @@ impl DeepSeek {
         progress_reporter: Arc<RwLock<ProgressReporter>>,
     ) -> Result<Self> {
         let vb_m = vb.pp("model");
-        let moe_cfg = cfg.moe_config.as_ref().unwrap();
+        let moe_cfg = if let Some(MoEConfig::DeepSeekMoE(moe_cfg)) = &cfg.moe_config {
+            moe_cfg.clone()
+        } else {
+            candle::bail!("Expected DeepSeekMoEConfig")
+        };
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let reporter = progress_reporter.clone();
         let lm_head = if !cfg.tie_word_embeddings {
