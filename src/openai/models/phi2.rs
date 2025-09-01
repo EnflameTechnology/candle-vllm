@@ -221,12 +221,7 @@ impl Attention {
             (q, k, v)
         };
 
-        let (q, k) = self.rotary_emb.apply_rotary_emb(
-            &q.to_dtype(DType::F32)?,
-            &k.to_dtype(DType::F32)?,
-            input_positions,
-        )?;
-        let v = v.to_dtype(DType::F32)?;
+        let (q, k) = self.rotary_emb.apply_rotary_emb(&q, &k, input_positions)?;
 
         let y = self
             .attn
@@ -323,7 +318,7 @@ impl Phi2 {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_m = vb_m.pp("layers");
         let reporter = progress_reporter.clone();
-        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, cfg, device, true)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(dtype, cfg, device, true)?);
 
         for layer_idx in 0..cfg.num_hidden_layers {
             let layer =

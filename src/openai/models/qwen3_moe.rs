@@ -1,8 +1,8 @@
-#[cfg(feature = "gcu")]
-use crate::backend::custom_ops::moe::{TopKOutput, TopKLastDimOp};
-use crate::openai::distributed::shard;
 use super::{rotary_emb::ScalingRotaryEmbedding, Config, MoEConfig};
+#[cfg(feature = "gcu")]
+use crate::backend::custom_ops::moe::{TopKLastDimOp, TopKOutput};
 use crate::backend::progress::{ProgressLike, ProgressReporter};
+use crate::openai::distributed::shard;
 use crate::openai::distributed::AllReduce;
 use crate::openai::distributed::{
     embedding, rms_norm, rms_norm_with_dtype, Comm, ReplicatedLinear, TensorParallelColumnLinear,
@@ -639,9 +639,6 @@ impl Attention {
             (q, k, v.contiguous()?)
         };
 
-        let q = q.to_dtype(DType::F32)?;
-        let k = k.to_dtype(DType::F32)?;
-
         let (q, k) = if self.q_norm.is_some() && self.k_norm.is_some() {
             //Per‑head RMSNorm in qwen3
             let q_flat = q.flatten(0, 2)?; // (B*H, L, D) -> (BHL, D) after transpose later
@@ -656,8 +653,6 @@ impl Attention {
         };
 
         let (q, k) = self.rotary_emb.apply_rotary_emb(&q, &k, input_positions)?;
-        let q = q.to_dtype(v.dtype())?;
-        let k = k.to_dtype(v.dtype())?;
 
         let y = self
             .attn
@@ -785,7 +780,7 @@ impl Qwen3MoE {
     ) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, cfg, device, true)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(dtype, cfg, device, true)?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         let reporter = progress_reporter.clone();

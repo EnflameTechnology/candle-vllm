@@ -219,9 +219,7 @@ impl Attention {
             (q, k, v.contiguous()?)
         };
 
-        let (q, k) = self
-            .rotary_emb
-            .apply_rotary_emb(&q, &k, input_positions)?;
+        let (q, k) = self.rotary_emb.apply_rotary_emb(&q, &k, input_positions)?;
 
         let y = self
             .attn

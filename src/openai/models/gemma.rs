@@ -224,14 +224,6 @@ impl Attention {
 
         let (q, k) = self.rotary_emb.apply_rotary_emb(&q, &k, input_positions)?;
 
-        // let q = q.to_dtype(v.dtype())?;
-        // let k = k.to_dtype(v.dtype())?;
-        // No need repeat_kv since we performed broadcasted matmul in the prefiling stage
-        // while, the decoding stage used paged-attention which also does not need kv stacking (to match query dim)
-        // let k = candle_transformers::utils::repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-        // let v =
-        //     candle_transformers::utils::repeat_kv(v, self.num_kv_groups)?.contiguous()?;
-
         let y = self
             .attn
             .forward(

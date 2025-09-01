@@ -184,13 +184,7 @@ impl SelfAttention {
             (q, k, v.contiguous()?)
         };
 
-        let (q, k) = self.rotary_emb.apply_rotary_emb(
-            &q.to_dtype(DType::F32)?,
-            &k.to_dtype(DType::F32)?,
-            input_positions,
-        )?;
-        let q = q.to_dtype(v.dtype())?;
-        let k = k.to_dtype(v.dtype())?;
+        let (q, k) = self.rotary_emb.apply_rotary_emb(&q, &k, input_positions)?;
 
         let y = self
             .attn
@@ -341,7 +335,7 @@ impl GLM4 {
         let vb_m = vb.pp("model");
         let reporter = progress_reporter.clone();
 
-        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, cfg, device, false)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(dtype, cfg, device, false)?);
         let embedding = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
 
         let vb_l = vb_m.pp("layers");

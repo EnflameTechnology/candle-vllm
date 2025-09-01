@@ -75,7 +75,6 @@ impl DefaultRotaryEmbedding {
                 self.is_gpt_neox,
             );
         }
-        
 
         let mut q_embeds = Vec::new();
         let mut k_embeds = Vec::new();
@@ -175,7 +174,8 @@ impl ScalingRotaryEmbedding {
                             .matmul(&inv_freq.reshape((1, inv_freq.elem_count()))?)?;
                         let cos = idx_theta.cos()?.to_dtype(dtype)?;
                         let sin = idx_theta.sin()?.to_dtype(dtype)?;
-                        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
+                        let cos_sin =
+                            Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
                         Self(DefaultRotaryEmbedding {
                             sin,
                             cos,
@@ -231,7 +231,8 @@ impl ScalingRotaryEmbedding {
                             let freqs = t.matmul(&inv_freq)?;
                             let sin = freqs.sin()?.to_dtype(dtype)?;
                             let cos = freqs.cos()?.to_dtype(dtype)?;
-                            let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
+                            let cos_sin =
+                                Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
                             Self(DefaultRotaryEmbedding {
                                 sin,
                                 cos,
@@ -336,7 +337,9 @@ impl ScalingRotaryEmbedding {
                                 *extrapolation_factor as f32,
                                 *factor as f32,
                             )?;
-                            let cos_sin = Tensor::cat(&[&embed.cos, &embed.sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
+                            let cos_sin =
+                                Tensor::cat(&[&embed.cos, &embed.sin], candle::D::Minus1)?
+                                    .contiguous()?; //must be contiguous tensor;
                             Self(DefaultRotaryEmbedding {
                                 sin: embed.sin,
                                 cos: embed.cos,

@@ -90,9 +90,8 @@ impl CausalSelfAttention {
             (q, k, v.contiguous()?)
         };
 
-        let (q, k) = self.rotay_emb.apply_rotary_emb(&q.to_dtype(DType::F32)?, &k.to_dtype(DType::F32)?, input_positions)?;
+        let (q, k) = self.rotay_emb.apply_rotary_emb(&q, &k, input_positions)?;
 
-        let (q, k) = (q.to_dtype(v.dtype())?, k.to_dtype(v.dtype())?);
         let y = self
             .attn
             .forward(
@@ -370,7 +369,7 @@ impl Llama {
             &None,
         )?;
 
-        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, cfg, device, true)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(dtype, cfg, device, true)?);
         let ln_f = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let reporter = progress_reporter.clone();
         let blocks: Vec<_> = (0..cfg.num_hidden_layers)
