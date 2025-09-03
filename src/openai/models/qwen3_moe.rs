@@ -277,17 +277,6 @@ impl FusedMoe {
         )?;
         let gate = Linear::new(ws, None, &None, &None);
 
-        // let gate = linear_no_bias(
-        //     cfg.hidden_size,
-        //     num_experts,
-        //     vb.pp("gate"),
-        //     Shard::default(),
-        //     &None,
-        //     &None,
-        //     DType::F32,
-        //     None,
-        // )?;
-
         let experts_vb = vb.pp("experts");
         let mut gate_experts = Vec::with_capacity(num_experts);
         let mut up_experts = Vec::with_capacity(num_experts);
@@ -498,7 +487,6 @@ struct Attention {
 
 impl Attention {
     fn new(
-        qwen3: bool,
         rotary_emb: Arc<ScalingRotaryEmbedding>,
         cfg: &Config,
         vb: VarBuilder,
@@ -560,26 +548,10 @@ impl Attention {
         )?;
 
         //we use higher precision for q/k norm
-        let q_norm = if qwen3 {
-            Some(rms_norm_with_dtype(
-                head_dim,
-                cfg.rms_norm_eps,
-                vb.pp("q_norm"),
-                DType::F32,
-            )?)
-        } else {
-            None
-        };
-        let k_norm = if qwen3 {
-            Some(rms_norm_with_dtype(
-                head_dim,
-                cfg.rms_norm_eps,
-                vb.pp("k_norm"),
-                DType::F32,
-            )?)
-        } else {
-            None
-        };
+        let q_norm =
+            rms_norm_with_dtype(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"), DType::F32).ok();
+        let k_norm =
+            rms_norm_with_dtype(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"), DType::F32).ok();
 
         let attention_heads = cfg.num_attention_heads / comm.world_size();
         let kv_heads = cfg.num_key_value_heads.unwrap() / comm.world_size();
@@ -656,7 +628,6 @@ impl Attention {
         };
 
         let (q, k) = self.rotary_emb.apply_rotary_emb(&q, &k, input_positions)?;
-
         let q = q.to_dtype(v.dtype())?;
         let k = k.to_dtype(v.dtype())?;
 
@@ -682,21 +653,22 @@ impl Attention {
 struct DecoderLayer {
     self_attn: Attention,
     mlp: MoeOrMlp,
+    shared_gate: Option<Linear>,
+    shared_expert: Option<Mlp>,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
 
 impl DecoderLayer {
     fn new(
-        qwen3: bool,
         rotary_emb: Arc<ScalingRotaryEmbedding>,
         cfg: &Config,
         vb: VarBuilder,
         comm: Rc<Comm>,
-        _dtype: DType,
+        dtype: DType,
         layer_idx: usize,
     ) -> Result<Self> {
-        let self_attn = Attention::new(qwen3, rotary_emb, cfg, vb.pp("self_attn"), comm.clone())?;
+        let self_attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"), comm.clone())?;
 
         let moe_cfg = if let Some(MoEConfig::QwenMoE(moe_cfg)) = &cfg.moe_config {
             moe_cfg.clone()
@@ -735,9 +707,37 @@ impl DecoderLayer {
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
         )?;
+
+        //shared experts weights in Qwen2 MoE models
+        let (shared_gate, shared_expert) = if let Some(intermediate_size) =
+            moe_cfg.shared_expert_intermediate_size
+        {
+            if intermediate_size > 0 {
+                let ws = vb
+                    .pp("mlp.shared_expert_gate")
+                    .get_with_hints_dtype((cfg.hidden_size,), "weight", Default::default(), dtype)?
+                    .reshape((1, cfg.hidden_size))?; //weight must be 2d+
+
+                let shared_gate = Linear::new(ws, None, &None, &None);
+
+                let mlp = Mlp::new(
+                    cfg,
+                    intermediate_size,
+                    vb.pp("mlp.shared_expert").clone(),
+                    comm.clone(),
+                )?;
+                (Some(shared_gate), Some(mlp))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
         Ok(Self {
             self_attn,
             mlp,
+            shared_gate,
+            shared_expert,
             input_layernorm,
             post_attention_layernorm,
         })
@@ -759,8 +759,21 @@ impl DecoderLayer {
         let xs = (xs + residual)?;
         let residual = &xs;
         let xs = xs.apply(&self.post_attention_layernorm)?;
+        //shared experts for Qwen2 MoE models
+        let shared_output = match (&self.shared_gate, &self.shared_expert) {
+            (Some(shared_gate), Some(shared_expert)) => {
+                let gate = candle_nn::ops::sigmoid(&shared_gate.forward(&xs)?)?;
+                let shared_output = shared_expert.forward(&xs)?;
+                Some(gate.broadcast_mul(&shared_output)?)
+            }
+            _ => None,
+        };
         let mlp_output = self.mlp.forward(&xs)?;
-        residual + mlp_output
+        if let Some(shared_output) = shared_output {
+            residual + (mlp_output + shared_output)?
+        } else {
+            residual + mlp_output
+        }
     }
 }
 
@@ -776,7 +789,6 @@ pub struct Qwen3MoE {
 
 impl Qwen3MoE {
     pub fn new(
-        qwen3: bool,
         vb: VarBuilder,
         cfg: &Config,
         dtype: DType,
@@ -792,7 +804,6 @@ impl Qwen3MoE {
         let reporter = progress_reporter.clone();
         for layer_idx in 0..cfg.num_hidden_layers {
             let layer = DecoderLayer::new(
-                qwen3,
                 rotary_emb.clone(),
                 cfg,
                 vb_l.pp(layer_idx),
