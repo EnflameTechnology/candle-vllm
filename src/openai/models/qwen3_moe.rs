@@ -233,8 +233,18 @@ impl Moe {
 
 struct FusedMoe {
     gate: Linear,
+    #[cfg(feature = "gcu")]
+    gate_experts: Tensor,
+    #[cfg(feature = "gcu")]
+    up_experts: Tensor,
+    #[cfg(feature = "gcu")]
+    down_experts: Tensor,
+
+    #[cfg(not(feature = "gcu"))]
     gate_experts: QMatMul,
+    #[cfg(not(feature = "gcu"))]
     up_experts: QMatMul,
+    #[cfg(not(feature = "gcu"))]
     down_experts: QMatMul,
     act: candle_nn::Activation,
     norm_topk_prob: bool,
@@ -253,6 +263,7 @@ impl FusedMoe {
 
         let num_experts = moe_cfg.num_experts.unwrap();
 
+        #[cfg(not(feature = "gcu"))]
         let quant_type = match cfg.quant.as_ref().unwrap().as_str() {
             "q4_0" => GgmlDType::Q4_0,
             "q4_1" => GgmlDType::Q4_1,
@@ -267,6 +278,9 @@ impl FusedMoe {
             _ => panic!("Unsupported GGML data type!"),
         };
 
+        #[cfg(feature = "gcu")]
+        let block_size = 1;
+        #[cfg(not(feature = "gcu"))]
         let block_size = quant_type.block_size();
 
         let ws = vb.pp("gate").get_with_hints_dtype(
@@ -389,15 +403,22 @@ impl FusedMoe {
         let gate_experts = Tensor::stack(&gate_experts, 0)?;
         let up_experts = Tensor::stack(&up_experts, 0)?;
         let down_experts = Tensor::stack(&down_experts, 0)?;
+
         // in-situ quantization for using fused moe kernel
+        #[cfg(not(feature = "gcu"))]
         let qtensor = QTensor::quantize(&gate_experts, quant_type).unwrap();
+        #[cfg(not(feature = "gcu"))]
         let gate_experts = QMatMul::QTensor(Arc::new(qtensor));
 
+        #[cfg(not(feature = "gcu"))]
         let qtensor = QTensor::quantize(&up_experts, quant_type).unwrap();
+        #[cfg(not(feature = "gcu"))]
         let up_experts = QMatMul::QTensor(Arc::new(qtensor));
 
         //down_experts requires higher precision
+        #[cfg(not(feature = "gcu"))]
         let qtensor = QTensor::quantize(&down_experts, GgmlDType::Q8_0).unwrap();
+        #[cfg(not(feature = "gcu"))]
         let down_experts = QMatMul::QTensor(Arc::new(qtensor));
         let world_size = comm.world_size();
 
@@ -419,21 +440,40 @@ impl FusedMoe {
         let xs = xs.reshape(((), hidden_dim))?;
         let original_dtype = xs.dtype();
         let (num_tokens, hidden_dim) = xs.dims2()?;
+        #[cfg(not(feature = "gcu"))]
         let xs = xs.to_dtype(DType::F32)?;
-        let router_logits = self.gate.forward(&xs)?;
+        let router_logits = self.gate.forward(&xs.to_dtype(DType::F32)?)?;
         let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
 
+        #[cfg(feature = "gcu")]
+        let TopKOutput {
+            values: mut scores,
+            indices,
+        } = routing_weights.topk(self.num_experts_per_tok)?;
+
+        #[cfg(not(feature = "gcu"))]
         let indices = routing_weights
             .arg_sort_last_dim(false)?
             .narrow(D::Minus1, 0, self.num_experts_per_tok)?
             .contiguous()?;
 
+        #[cfg(not(feature = "gcu"))]
         let mut scores = routing_weights.gather(&indices, D::Minus1)?;
 
         if self.norm_topk_prob {
             scores = scores.broadcast_div(&scores.sum_keepdim(D::Minus1)?)?;
         }
 
+        #[cfg(feature = "gcu")]
+        let ys = {
+            let xs = xs.reshape((num_tokens, 1, hidden_dim))?;
+            let gate = candle_nn::ops::indexed_moe(&xs, &self.gate_experts, &indices)?;
+            let up = candle_nn::ops::indexed_moe(&xs, &self.up_experts, &indices)?;
+            let down_inputs = (up * gate.apply(&self.act)?)?;
+            candle_nn::ops::indexed_moe(&down_inputs, &self.down_experts, &indices)?.to_dtype(DType::F32)?
+        };
+
+        #[cfg(not(feature = "gcu"))]
         let ys = {
             let xs = xs.reshape((num_tokens, 1, hidden_dim))?;
             let gate = self.gate_experts.indexed_moe_forward(&xs, &indices)?;
@@ -443,8 +483,8 @@ impl FusedMoe {
                 .indexed_moe_forward(&down_inputs, &indices)?
         };
         let mut ys = ys
-            .broadcast_mul(&scores.unsqueeze(D::Minus1)?)?
-            .sum(D::Minus2)?
+            .broadcast_mul(&scores.unsqueeze(D::Minus1)?)?.t()?.contiguous()?
+            .sum(D::Minus1)?
             .reshape((batch, seq_len, hidden_dim))?
             .to_dtype(original_dtype)?;
 
@@ -684,11 +724,15 @@ impl DecoderLayer {
             && (moe_cfg.num_experts.unwrap() > 0
                 && (layer_idx + 1) % moe_cfg.decoder_sparse_step.unwrap() == 0)
         {
+            #[cfg(not(feature = "gcu"))]
             if cfg.quant.is_some() {
                 MoeOrMlp::FusedMoe(FusedMoe::new(cfg, vb.pp("mlp").clone(), comm.clone())?)
             } else {
                 MoeOrMlp::Moe(Moe::new(cfg, vb.pp("mlp").clone(), comm.clone())?)
             }
+
+            #[cfg(feature = "gcu")]
+            MoeOrMlp::FusedMoe(FusedMoe::new(cfg, vb.pp("mlp").clone(), comm.clone())?)
         } else {
             let mlp = Mlp::new(
                 cfg,
