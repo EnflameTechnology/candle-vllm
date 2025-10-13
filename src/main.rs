@@ -1,7 +1,7 @@
 use axum::{
     http::{self, Method},
-    routing::post,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
 use candle_core::{DType, Device, Result};
 #[cfg(feature = "eccl")]
@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 const SIZE_IN_MB: usize = 1024 * 1024;
 use candle_vllm::openai::models::Config;
+use serde_json::json;
 use tokio::sync::Notify;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 #[derive(Parser, Debug)]
@@ -41,11 +42,11 @@ struct Args {
     verbose: bool,
 
     /// Maximum number of sequences to allow
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 16)]
     max_num_seqs: usize,
 
     /// Size of a block
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 64)]
     block_size: usize,
 
     /// if weight_path is passed, it will ignore the model_id
@@ -104,13 +105,22 @@ struct Args {
     top_p: Option<f32>,
 
     #[arg(long)]
+    min_p: Option<f32>,
+
+    #[arg(long)]
     top_k: Option<isize>,
 
     #[arg(long)]
-    penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+
+    #[arg(long)]
+    presence_penalty: Option<f32>,
 
     #[arg(long)]
     prefill_chunk_size: Option<usize>,
+
+    #[arg(long, default_value_t = false)]
+    fp8_kvcache: bool,
 }
 
 fn get_cache_config(
@@ -246,6 +256,8 @@ async fn main() -> Result<()> {
     let (paths, gguf) = loader.prepare_model_weights(args.hf_token, args.hf_token_path)?;
 
     let dtype = get_dtype(args.dtype);
+    let kv_cache_dtype = if args.fp8_kvcache { DType::U8 } else { dtype };
+
     let device_ids: Vec<usize> = match args.device_ids {
         Some(ids) => ids,
         _ => vec![0usize],
@@ -282,6 +294,18 @@ async fn main() -> Result<()> {
     } else {
         !args.multithread
     };
+
+    #[cfg(all(feature = "gcu", feature = "graph"))]
+    {
+        assert!(
+            multi_process,
+            "Graph capture is only available under multi process mode!"
+        );
+        if args.max_num_seqs > 16 {
+            tracing::warn!("Higher GPU memory required for capturing large batch!");
+        }
+    }
+
     let logger: ftail::Ftail = ftail::Ftail::new();
     let mut port = args.port;
     #[cfg(feature = "eccl")]
@@ -304,8 +328,11 @@ async fn main() -> Result<()> {
                 .load_model(
                     paths,
                     dtype,
+                    kv_cache_dtype,
                     gguf,
                     args.isq.clone(),
+                    args.block_size,
+                    args.max_num_seqs,
                     vec![device_ids[local_rank]],
                     Some(id),
                     Some(local_rank),
@@ -327,8 +354,11 @@ async fn main() -> Result<()> {
                 .load_model(
                     paths,
                     dtype,
+                    kv_cache_dtype,
                     gguf,
                     args.isq.clone(),
+                    args.block_size,
+                    args.max_num_seqs,
                     device_ids,
                     None,
                     None,
@@ -358,7 +388,18 @@ async fn main() -> Result<()> {
         let _ = config_log(logger, args.log, log_file);
         (
             loader
-                .load_model(paths, dtype, gguf, args.isq.clone(), device_ids, None, None)
+                .load_model(
+                    paths,
+                    dtype,
+                    kv_cache_dtype,
+                    gguf,
+                    args.isq.clone(),
+                    args.block_size,
+                    args.max_num_seqs,
+                    device_ids,
+                    None,
+                    None,
+                )
                 .await,
             0,
         )
@@ -375,17 +416,12 @@ async fn main() -> Result<()> {
         .into_iter()
         .map(|pipeline| {
             let cfg = pipeline.get_model_config();
-            let kv_dtype = if matches!(pipeline.name(), "phi2" | "PhiForCausalLM") {
-                DType::F32
-            } else {
-                dtype
-            };
             let cache_cfg = get_cache_config(
                 args.kvcache_mem_gpu,
                 args.kvcache_mem_cpu, //dummy 512MB for cpu
                 args.block_size,
                 &cfg,
-                kv_dtype,
+                kv_cache_dtype,
                 num_shards,
             );
             let cache_engine = CacheEngine::new(
@@ -426,15 +462,29 @@ async fn main() -> Result<()> {
         args.prefill_chunk_size,
     )?;
 
-    if (args.top_k.is_some() && args.top_p.is_some()) || pipeline_config.generation_cfg.is_none() {
+    if args.temperature.is_some() || pipeline_config.generation_cfg.is_none() {
+        //overwrite the generation config when temperature (and others) specified in arguments
+        //disable multinomial sampling (generation randomness) by setting `temperature` as 0
         pipeline_config.generation_cfg = Some(GenerationConfig {
             temperature: args.temperature,
             top_k: args.top_k,
             top_p: args.top_p,
-            penalty: args.penalty,
+            min_p: args.min_p,
+            frequency_penalty: args.frequency_penalty,
+            presence_penalty: args.presence_penalty,
         })
     } else {
-        pipeline_config.generation_cfg.as_mut().unwrap().penalty = args.penalty;
+        pipeline_config
+            .generation_cfg
+            .as_mut()
+            .unwrap()
+            .frequency_penalty = args.frequency_penalty;
+        pipeline_config
+            .generation_cfg
+            .as_mut()
+            .unwrap()
+            .presence_penalty = args.presence_penalty;
+        pipeline_config.generation_cfg.as_mut().unwrap().min_p = args.min_p;
     }
 
     info!("Pipeline config {:?}", pipeline_config);
@@ -459,6 +509,9 @@ async fn main() -> Result<()> {
         daemon_manager.as_mut().unwrap().mpi_sync();
     }
 
+    #[cfg(all(feature = "gcu", feature = "graph"))]
+    LLMEngine::graph_capture(&server_data.model).unwrap();
+
     if global_rank == 0 {
         warn!(
             "Maximum Model Length (affected by `--mem` (kvcache-mem-gpu) and the number of ranks):"
@@ -470,7 +523,7 @@ async fn main() -> Result<()> {
                 std::cmp::min(kvcached_tokens / batch, max_model_len)
             );
         }
-        warn!("Server started at http://0.0.0.0:{}.", port);
+        warn!("Server started at http://0.0.0.0:{}/v1/", port);
     }
 
     let allow_origin = AllowOrigin::any();
@@ -481,6 +534,26 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .layer(cors_layer)
+        .route(
+            "/v1/models",
+            get(|| async {
+                Json(json!({
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "default",
+                            "object": "model",
+                            "created": std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as i64,
+                            "owned_by": "candle-vllm",
+                            "permission": []
+                        }
+                    ]
+                }))
+            }),
+        )
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(Arc::new(server_data));
 

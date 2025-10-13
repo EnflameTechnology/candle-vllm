@@ -1,5 +1,7 @@
 use super::{get_token, TokenOrFinishReason};
 use crate::backend::gguf;
+#[cfg(all(feature = "gcu", feature = "graph"))]
+use crate::backend::graph::{CudaGraphFn, CudaGraphWrapper, GraphCapturer, ModelFn};
 use crate::backend::progress::{progress_worker, ProgressReporter};
 use crate::openai::logits_processor::LogitsProcessor;
 use crate::openai::models::TokenID;
@@ -31,38 +33,40 @@ use candle_core::{DType, Device, Result, Tensor};
 use either::Either;
 use either::Either::{Left, Right};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use parking_lot::RwLock;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
 pub use std::rc::Rc;
-use std::sync::RwLock;
 use std::{path::PathBuf, sync::Arc};
 use tokenizers::Tokenizer;
 use tracing::{info, warn};
+
 const EOS_TOKEN: &str = "</s>";
 const SAMPLING_SEED: u64 = 299792458;
 const MIN_GEN_TOKENS: usize = 128;
 const MAX_GEN_TOKENS: usize = 16 * 1024;
-enum LLMModel {
-    Llama(Llama),
-    Phi2(Phi2),
-    Phi3(Phi),
-    Qwen(Qwen),
-    Qwen3MoE(Qwen3MoE),
-    Gemma(Gemma),
-    Gemma3(Gemma3),
-    Mistral(Mistral),
-    Yi(Yi),
-    StableLM(StableLM),
-    GLM4(GLM4),
-    DeepSeek(DeepSeek),
-    LlamaGGUF(GGUFLLaMa),
-    Phi3GGUF(GGUFPhi3),
-    QWenGGUF(GGUFQWen),
-    QWenGGUFMoE(GGUFQWenMoE),
-    GLM4GGUF(GGUFGLM4),
+pub enum LLMModel {
+    Llama(Arc<Llama>),
+    Phi2(Arc<Phi2>),
+    Phi3(Arc<Phi>),
+    Qwen(Arc<Qwen>),
+    Qwen3MoE(Arc<Qwen3MoE>),
+    Gemma(Arc<Gemma>),
+    Gemma3(Arc<Gemma3>),
+    Mistral(Arc<Mistral>),
+    Yi(Arc<Yi>),
+    StableLM(Arc<StableLM>),
+    GLM4(Arc<GLM4>),
+    DeepSeek(Arc<DeepSeek>),
+    LlamaGGUF(Arc<GGUFLLaMa>),
+    Phi3GGUF(Arc<GGUFPhi3>),
+    QWenGGUF(Arc<GGUFQWen>),
+    QWenGGUFMoE(Arc<GGUFQWenMoE>),
+    GLM4GGUF(Arc<GGUFGLM4>),
 }
+
 /// top-p, multinomial, and argmax sampling are implemented. Beam search is not implemented.
 pub struct DefaultPipeline {
     model: LLMModel,
@@ -75,6 +79,8 @@ pub struct DefaultPipeline {
     stop_token_ids: Vec<u32>,
     rank: usize,
     pub stream_decoders: RwLock<super::StreamDecoderMap>,
+    #[cfg(all(feature = "gcu", feature = "graph"))]
+    pub capturer: GraphCapturer<CudaGraphWrapper<CudaGraphFn>>,
 }
 
 pub struct DefaultLoader {
@@ -322,8 +328,11 @@ impl DefaultLoader {
         &self,
         paths: DefaultModelPaths,
         dtype: DType,
+        kv_cache_dtype: DType,
         gguf: bool,
         isq: Option<String>,
+        block_size: usize,
+        max_num_seqs: usize,
         device_ids: Vec<usize>, //pass only 1 device_id in multiprocess mode, otherwise, multiple device_ids in multithread mode
         #[cfg(feature = "eccl")] comm_id: Option<crate::openai::distributed::Id>, //must pass comm id in multiprocess mode
         local_rank: Option<usize>, //must pass current rank in multiprocess mode
@@ -390,11 +399,16 @@ impl DefaultLoader {
                         &mut file,
                         &device,
                         dtype,
+                        kv_cache_dtype,
                         Arc::clone(&reporter),
                     )
                     .map_err(candle_core::Error::wrap)?;
                     let cfg = model.get_config().clone();
-                    (LLMModel::LlamaGGUF(model), cfg, SeparatorStyle::Llama)
+                    (
+                        LLMModel::LlamaGGUF(Arc::new(model)),
+                        cfg,
+                        SeparatorStyle::Llama,
+                    )
                 }
                 "llama3" => {
                     let model = GGUFLLaMa::from_gguf(
@@ -402,11 +416,16 @@ impl DefaultLoader {
                         &mut file,
                         &device,
                         dtype,
+                        kv_cache_dtype,
                         Arc::clone(&reporter),
                     )
                     .map_err(candle_core::Error::wrap)?;
                     let cfg = model.get_config().clone();
-                    (LLMModel::LlamaGGUF(model), cfg, SeparatorStyle::Llama3)
+                    (
+                        LLMModel::LlamaGGUF(Arc::new(model)),
+                        cfg,
+                        SeparatorStyle::Llama3,
+                    )
                 }
                 "phi3" => {
                     let model = GGUFPhi3::from_gguf(
@@ -414,24 +433,33 @@ impl DefaultLoader {
                         &mut file,
                         &device,
                         dtype,
+                        kv_cache_dtype,
                         Arc::clone(&reporter),
                     )
                     .map_err(candle_core::Error::wrap)?;
                     let cfg = model.get_config().clone();
-                    (LLMModel::Phi3GGUF(model), cfg, SeparatorStyle::Phi)
+                    (
+                        LLMModel::Phi3GGUF(Arc::new(model)),
+                        cfg,
+                        SeparatorStyle::Phi,
+                    )
                 }
                 "qwen2" | "qwen3" => {
                     let model = GGUFQWen::from_gguf(
-                        arch.as_str() == "qwen3",
                         &content,
                         &mut file,
                         &device,
                         dtype,
+                        kv_cache_dtype,
                         Arc::clone(&reporter),
                     )
                     .map_err(candle_core::Error::wrap)?;
                     let cfg = model.get_config().clone();
-                    (LLMModel::QWenGGUF(model), cfg, SeparatorStyle::Qwen)
+                    (
+                        LLMModel::QWenGGUF(Arc::new(model)),
+                        cfg,
+                        SeparatorStyle::Qwen,
+                    )
                 }
                 "qwen2moe" | "qwen3moe" => {
                     let model = GGUFQWenMoE::from_gguf(
@@ -439,11 +467,16 @@ impl DefaultLoader {
                         &mut file,
                         &device,
                         dtype,
+                        kv_cache_dtype,
                         Arc::clone(&reporter),
                     )
                     .map_err(candle_core::Error::wrap)?;
                     let cfg = model.get_config().clone();
-                    (LLMModel::QWenGGUFMoE(model), cfg, SeparatorStyle::Qwen)
+                    (
+                        LLMModel::QWenGGUFMoE(Arc::new(model)),
+                        cfg,
+                        SeparatorStyle::Qwen,
+                    )
                 }
                 "glm4" => {
                     let model = GGUFGLM4::from_gguf(
@@ -451,11 +484,16 @@ impl DefaultLoader {
                         &mut file,
                         &device,
                         dtype,
+                        kv_cache_dtype,
                         Arc::clone(&reporter),
                     )
                     .map_err(candle_core::Error::wrap)?;
                     let cfg = model.get_config().clone();
-                    (LLMModel::GLM4GGUF(model), cfg, SeparatorStyle::GLM)
+                    (
+                        LLMModel::GLM4GGUF(Arc::new(model)),
+                        cfg,
+                        SeparatorStyle::GLM,
+                    )
                 }
                 _ => panic!("Model not supported!"),
             };
@@ -465,7 +503,7 @@ impl DefaultLoader {
             let cfile = paths.get_config_filename();
             let arch = Config::get_model_arch(&cfile)?;
 
-            let config = match arch.as_str() {
+            let mut config = match arch.as_str() {
                 "LlamaForCausalLM" => Llama::load_config(&cfile, isq)?,
                 "PhiForCausalLM" => Phi2::load_config(&cfile, isq)?,
                 "Phi3ForCausalLM" => Phi::load_config(&cfile, isq)?,
@@ -490,6 +528,8 @@ impl DefaultLoader {
             let paths: Vec<PathBuf> = paths.get_weight_filenames();
             let shared_vb =
                 unsafe { candle_nn::var_builder::ShardedSafeTensors::var_backend(&paths).unwrap() };
+            config.fp8_kvcache = Some(kv_cache_dtype == DType::U8);
+            info!("Model {:?}", config);
 
             info!("Loading {} model.", arch);
             let handle = progress_worker(
@@ -568,7 +608,7 @@ impl DefaultLoader {
 
                     let (model, sep) = match arch.as_str() {
                         "LlamaForCausalLM" => (
-                            LLMModel::Llama(
+                            LLMModel::Llama(Arc::new(
                                 Llama::load(
                                     vb,
                                     &config,
@@ -578,40 +618,32 @@ impl DefaultLoader {
                                     Arc::clone(&reporter),
                                 )
                                 .unwrap(),
-                            ),
+                            )),
                             SeparatorStyle::Llama3,
                         ),
                         "PhiForCausalLM" => (
-                            LLMModel::Phi2(
+                            LLMModel::Phi2(Arc::new(
                                 Phi2::new(vb, &config, dtype, &device, comm, Arc::clone(&reporter))
                                     .unwrap(),
-                            ),
+                            )),
                             SeparatorStyle::Phi,
                         ),
                         "Phi3ForCausalLM" => (
-                            LLMModel::Phi3(
+                            LLMModel::Phi3(Arc::new(
                                 Phi::new(vb, &config, dtype, &device, comm, Arc::clone(&reporter))
                                     .unwrap(),
-                            ),
+                            )),
                             SeparatorStyle::Phi,
                         ),
                         "Qwen2ForCausalLM" | "Qwen3ForCausalLM" => (
-                            LLMModel::Qwen(
-                                Qwen::new(
-                                    matches!(arch.as_str(), "qwen3" | "Qwen3ForCausalLM"),
-                                    vb,
-                                    &config,
-                                    dtype,
-                                    &device,
-                                    comm,
-                                    Arc::clone(&reporter),
-                                )
-                                .unwrap(),
-                            ),
+                            LLMModel::Qwen(Arc::new(
+                                Qwen::new(vb, &config, dtype, &device, comm, Arc::clone(&reporter))
+                                    .unwrap(),
+                            )),
                             SeparatorStyle::Qwen,
                         ),
                         "Qwen2MoeForCausalLM" | "Qwen3MoeForCausalLM" => (
-                            LLMModel::Qwen3MoE(
+                            LLMModel::Qwen3MoE(Arc::new(
                                 Qwen3MoE::new(
                                     vb,
                                     &config,
@@ -621,11 +653,11 @@ impl DefaultLoader {
                                     Arc::clone(&reporter),
                                 )
                                 .unwrap(),
-                            ),
+                            )),
                             SeparatorStyle::Qwen,
                         ),
                         "Gemma2ForCausalLM" => (
-                            LLMModel::Gemma(
+                            LLMModel::Gemma(Arc::new(
                                 Gemma::new(
                                     vb,
                                     &config,
@@ -635,11 +667,11 @@ impl DefaultLoader {
                                     Arc::clone(&reporter),
                                 )
                                 .unwrap(),
-                            ),
+                            )),
                             SeparatorStyle::Gemma,
                         ),
                         "Gemma3ForConditionalGeneration" => (
-                            LLMModel::Gemma3(
+                            LLMModel::Gemma3(Arc::new(
                                 Gemma3::new(
                                     vb,
                                     &config,
@@ -649,11 +681,11 @@ impl DefaultLoader {
                                     Arc::clone(&reporter),
                                 )
                                 .unwrap(),
-                            ),
+                            )),
                             SeparatorStyle::Gemma,
                         ),
                         "MistralForCausalLM" | "Mistral3ForConditionalGeneration" => (
-                            LLMModel::Mistral(
+                            LLMModel::Mistral(Arc::new(
                                 Mistral::new(
                                     vb,
                                     &config,
@@ -663,18 +695,18 @@ impl DefaultLoader {
                                     Arc::clone(&reporter),
                                 )
                                 .unwrap(),
-                            ),
+                            )),
                             SeparatorStyle::Mistral,
                         ),
                         "yi" => (
-                            LLMModel::Yi(
+                            LLMModel::Yi(Arc::new(
                                 Yi::new(vb, &config, dtype, &device, comm, Arc::clone(&reporter))
                                     .unwrap(),
-                            ),
+                            )),
                             SeparatorStyle::Yi,
                         ),
                         "StableLmForCausalLM" => (
-                            LLMModel::StableLM(
+                            LLMModel::StableLM(Arc::new(
                                 StableLM::new(
                                     vb,
                                     &config,
@@ -684,18 +716,18 @@ impl DefaultLoader {
                                     Arc::clone(&reporter),
                                 )
                                 .unwrap(),
-                            ),
+                            )),
                             SeparatorStyle::StableLM,
                         ),
                         "Glm4ForCausalLM" => (
-                            LLMModel::GLM4(
+                            LLMModel::GLM4(Arc::new(
                                 GLM4::new(vb, &config, dtype, &device, comm, Arc::clone(&reporter))
                                     .unwrap(),
-                            ),
+                            )),
                             SeparatorStyle::Llama,
                         ),
                         "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" => (
-                            LLMModel::DeepSeek(
+                            LLMModel::DeepSeek(Arc::new(
                                 DeepSeek::load(
                                     vb,
                                     &config,
@@ -705,7 +737,7 @@ impl DefaultLoader {
                                     Arc::clone(&reporter),
                                 )
                                 .unwrap(),
-                            ),
+                            )),
                             SeparatorStyle::Llama3,
                         ),
                         _ => panic!("Model not supported!"),
@@ -735,6 +767,11 @@ impl DefaultLoader {
             (models, devices, config, sep_style[0].clone())
         };
 
+        info!(
+            "Using FP8 KV Cache? {}, cache dtype {:?}",
+            kv_cache_dtype == DType::U8,
+            kv_cache_dtype
+        );
         warn!("Done loading.");
 
         //max and min number of tokens generated per request
@@ -767,6 +804,7 @@ impl DefaultLoader {
                 let logits_processor = {
                     LogitsProcessor::new(
                         SAMPLING_SEED,
+                        None,
                         None,
                         None,
                         None,
@@ -906,30 +944,37 @@ impl DefaultLoader {
                     }
                 }
                 tracing::warn!("stop_token_ids {:?}", stop_token_ids);
-                Box::new(DefaultPipeline {
-                    model,
-                    tokenizer,
-                    logits_processor,
-                    conversation: DefaultConversation::new(
-                        config.architectures.as_ref().unwrap()[0].clone(),
-                        chat_template.clone(),
-                        Vec::default(),
-                        sep_style.clone(),
-                        bos_token.clone(),
-                        eos_token.clone(),
-                        ("user".to_string(), "assistant".to_string()),
-                        DefaultConversationSeparators {
-                            sep: " ".to_string(),
-                            sep2: Some(" </s></s>".to_string()),
-                        },
-                    ),
-                    name: config.architectures.as_ref().unwrap()[0].clone(),
-                    dtype,
-                    device: devices[rank].clone(),
-                    stop_token_ids,
-                    rank,
-                    stream_decoders: RwLock::new(HashMap::new()),
-                })
+
+                let conversation = DefaultConversation::new(
+                    config.architectures.as_ref().unwrap()[0].clone(),
+                    chat_template.clone(),
+                    Vec::default(),
+                    sep_style.clone(),
+                    bos_token.clone(),
+                    eos_token.clone(),
+                    ("user".to_string(), "assistant".to_string()),
+                    DefaultConversationSeparators {
+                        sep: " ".to_string(),
+                        sep2: Some(" </s></s>".to_string()),
+                    },
+                );
+
+                Box::new(DefaultPipeline::new(
+                        model,
+                        tokenizer,
+                        logits_processor,
+                        &config,
+                        conversation,
+                        dtype,
+                        &devices[rank],
+                        stop_token_ids,
+                        rank,
+                        #[cfg(all(feature = "cuda", feature = "graph"))]
+                        block_size,
+                        #[cfg(all(feature = "cuda", feature = "graph"))]
+                        max_num_seqs,
+                    ).unwrap()
+                )
             })
             .collect();
 
@@ -938,20 +983,76 @@ impl DefaultLoader {
 }
 
 impl DefaultPipeline {
+    pub fn new(
+        model: LLMModel,
+        tokenizer: Tokenizer,
+        logits_processor: LogitsProcessor,
+        config: &Config,
+        conversation: DefaultConversation,
+        dtype: DType,
+        device: &Device,
+        stop_token_ids: Vec<u32>,
+        rank: usize,
+        #[cfg(all(feature = "gcu", feature = "graph"))] block_size: usize,
+        #[cfg(all(feature = "gcu", feature = "graph"))] max_num_seqs: usize,
+    ) -> Result<Self> {
+        #[cfg(all(feature = "gcu", feature = "graph"))]
+        let wrapper = crate::graph_model_wrapper!(
+            model,
+            device,
+            Llama,
+            Phi2,
+            Phi3,
+            Qwen,
+            Qwen3MoE,
+            Gemma,
+            Gemma3,
+            Mistral,
+            Yi,
+            StableLM,
+            GLM4,
+            DeepSeek,
+            LlamaGGUF,
+            Phi3GGUF,
+            QWenGGUF,
+            QWenGGUFMoE,
+            GLM4GGUF,
+        );
+        Ok(Self {
+            model,
+            tokenizer,
+            logits_processor,
+            conversation,
+            name: config.architectures.as_ref().unwrap()[0].clone(),
+            dtype,
+            device: device.clone(),
+            stop_token_ids,
+            rank,
+            stream_decoders: RwLock::new(HashMap::new()),
+            #[cfg(all(feature = "gcu", feature = "graph"))]
+            capturer: GraphCapturer::new(
+                wrapper,
+                max_num_seqs,
+                config.max_seq_len,
+                block_size,
+                config.hidden_size,
+            ),
+        })
+    }
+
     pub fn forward(
         &self,
         input_tokens: Tensor,
-        input_positions: &[Vec<usize>],
+        input_positions: &Tensor,
         kv_cache: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        let input_tokens = if input_tokens.shape().dims().len() < 2 {
-            input_tokens
-                .reshape((1, input_tokens.shape().dims()[0]))
-                .unwrap()
-        } else {
-            input_tokens
-        };
+        #[cfg(all(feature = "gcu", feature = "graph"))]
+        if !input_metadata.is_prefill && self.capturer.is_captured(input_tokens.dim(0)?) {
+            return self
+                .capturer
+                .replay(&input_tokens, &input_positions, &input_metadata);
+        }
 
         match &self.model {
             LLMModel::Llama(llama) => {
@@ -1013,9 +1114,16 @@ impl DefaultPipeline {
         logits: &Tensor,
         groups: &VecDeque<Arc<SequenceGroup>>,
     ) -> Result<Vec<TokenOrFinishReason>> {
-        let (tokens_generated, custom_stop_tokens, panalties, reference_tokens): (
+        let (
+            tokens_generated,
+            custom_stop_tokens,
+            frequency_panalties,
+            presence_panalties,
+            reference_tokens,
+        ): (
             Vec<i32>,
             Vec<Vec<String>>,
+            Vec<f32>,
             Vec<f32>,
             Vec<Vec<u32>>,
         ) = groups
@@ -1039,12 +1147,13 @@ impl DefaultPipeline {
                     _ => vec![],
                 };
 
-                let ref_tokens = if sampling_params.repetition_penalty.unwrap_or(1.) != 1.
-                    && sampling_params.repeat_last_n.unwrap_or(64) < generated
+                let ref_tokens = if (sampling_params.frequency_penalty != 0.
+                    || sampling_params.presence_penalty != 0.)
+                    && sampling_params.repeat_last_n.unwrap_or(128) < generated
                 {
                     let start_at = tokens
                         .len()
-                        .saturating_sub(sampling_params.repeat_last_n.unwrap_or(64));
+                        .saturating_sub(sampling_params.repeat_last_n.unwrap_or(128));
                     tokens[start_at..].to_vec()
                 } else {
                     vec![]
@@ -1056,27 +1165,34 @@ impl DefaultPipeline {
                         generated as i32
                     },
                     custom_stop_token,
-                    sampling_params.repetition_penalty.unwrap_or(1.0),
+                    sampling_params.frequency_penalty,
+                    sampling_params.presence_penalty,
                     ref_tokens,
                 )
             })
-            .collect::<Vec<(i32, Vec<String>, f32, Vec<u32>)>>()
+            .collect::<Vec<(i32, Vec<String>, f32, f32, Vec<u32>)>>()
             .into_iter()
             .fold(
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-                |mut acc, (gen, stop, penalty, ref_t)| {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+                |mut acc, (gen, stop, penalty1, penalty2, ref_t)| {
                     acc.0.push(gen);
                     acc.1.push(stop);
-                    acc.2.push(penalty);
-                    acc.3.push(ref_t);
+                    acc.2.push(penalty1);
+                    acc.3.push(penalty2);
+                    acc.4.push(ref_t);
                     acc
                 },
             );
 
-        let logits = if panalties.iter().any(|&v| v != 1.0 && v != 0.) {
-            self.logits_processor
-                .apply_batch_repeat_penalty(logits, panalties, reference_tokens)
-                .unwrap()
+        let logits = if frequency_panalties.iter().any(|&v| v != 1.0 && v != 0.)
+            || presence_panalties.iter().any(|&v| v != 1.0 && v != 0.)
+        {
+            self.logits_processor.apply_batch_repeat_penalty(
+                logits,
+                frequency_panalties,
+                presence_panalties,
+                reference_tokens,
+            )?
         } else {
             logits.to_owned()
         };
@@ -1090,17 +1206,14 @@ impl DefaultPipeline {
                 None
             };
 
-        let next_tokens = self
-            .logits_processor
-            .sample(&logits, &sampling_params)
-            .unwrap();
+        let next_tokens = self.logits_processor.sample(&logits, &sampling_params)?;
         let result: Vec<TokenOrFinishReason> = next_tokens
             .into_par_iter()
             .enumerate()
             .map(|(i, next_token)| {
                 let group_id = group_ids[i];
                 let mut text = "".to_string();
-                let mut decoder_map = self.stream_decoders.write().unwrap();
+                let mut decoder_map = self.stream_decoders.write();
                 match decoder_map.get_mut(&group_id) {
                     Some(decoder) => {
                         if let Some(output) = decoder.step(next_token) {
@@ -1196,12 +1309,17 @@ impl DefaultPipeline {
     }
 
     pub fn reset_decoder(&mut self) {
-        let mut map = self.stream_decoders.write().unwrap();
+        let mut map = self.stream_decoders.write();
         map.clear();
     }
 
     pub fn rank(&self) -> usize {
         self.rank
+    }
+
+    #[cfg(all(feature = "gcu", feature = "graph"))]
+    pub fn warmup_capture(&mut self, kv_caches: Option<&Vec<(Tensor, Tensor)>>) -> Result<()> {
+        self.capturer.capture(&self.device, kv_caches)
     }
 }
 

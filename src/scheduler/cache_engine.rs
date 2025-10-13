@@ -223,21 +223,21 @@ impl CacheEngine {
 }
 
 impl CacheEngine {
+    #[cfg(not(feature = "gcu"))]
     pub fn swap_in(&self, src_to_dst: HashMap<usize, usize>) -> Result<()> {
         for i in 0..self.num_layers {
             let (src_key_cache, src_value_cache) = self.cpu_cache.get(i).unwrap();
             let mut gpu_cache = self.get_kv_cache();
             let (dst_key_cache, dst_value_cache) = gpu_cache.get_mut(i).unwrap();
             // Swap (copy) key blocks
-            #[cfg(not(feature = "gcu"))]
             swap_blocks(src_key_cache.clone(), dst_key_cache, src_to_dst.clone())?;
             // Swap (copy) key blocks
-            #[cfg(not(feature = "gcu"))]
             swap_blocks(src_value_cache.clone(), dst_value_cache, src_to_dst.clone())?;
         }
         Ok(())
     }
 
+    #[cfg(not(feature = "gcu"))]
     pub fn swap_out(&mut self, src_to_dst: HashMap<usize, usize>) -> Result<()> {
         for i in 0..self.num_layers {
             let gpu_cache = self.get_kv_cache();
@@ -246,14 +246,14 @@ impl CacheEngine {
 
             let (dst_key_cache, dst_value_cache) = self.cpu_cache.get_mut(i).unwrap();
             // Swap (copy) key blocks
-            #[cfg(not(feature = "gcu"))]
             swap_blocks(src_key_cache.clone(), dst_key_cache, src_to_dst.clone())?;
             // Swap (copy) key blocks
-            #[cfg(not(feature = "gcu"))]
             swap_blocks(src_value_cache.clone(), dst_value_cache, src_to_dst.clone())?;
         }
         Ok(())
     }
+
+    #[cfg(not(feature = "gcu"))]
     #[allow(unused_unsafe)]
     pub fn copy(&mut self, src_to_dst: HashMap<usize, Vec<usize>>) -> Result<()> {
         let mut gpu_cache = self.get_kv_cache();
@@ -264,7 +264,6 @@ impl CacheEngine {
 
         // NOTE(EricLBuehler): This may synchronize the CPU and GPU
         unsafe {
-            #[cfg(not(feature = "gcu"))]
             copy_blocks(key_caches, value_caches, src_to_dst)?;
         }
         Ok(())

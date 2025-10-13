@@ -8,6 +8,8 @@ pub mod backend;
 pub mod openai;
 pub mod paged_attention;
 pub mod scheduler;
+pub use paged_attention::input_metadata::InputMetadata;
+pub use paged_attention::PagedAttention;
 
 pub fn hub_load_local_safetensors(
     path: &String,

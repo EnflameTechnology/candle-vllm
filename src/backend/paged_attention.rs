@@ -7,16 +7,21 @@ use candle::GcuStorage;
 use candle::MetalStorage;
 use candle::{CpuStorage, DType, Layout, Result, Shape, Storage, Tensor};
 use candle_core as candle;
-#[allow(dead_code)]
+#[allow(unused_variables)]
 struct PagedAttention {
     softmax_scale: f32,
     softcapping: f32,
     key_cache: Tensor,
     value_cache: Tensor,
+    k_scales: Option<Tensor>,
+    v_scales: Option<Tensor>,
     block_tables: Tensor,
     context_lens: Tensor,
     alibi_slopes: Option<Tensor>,
+    cu_query_lens: Option<Tensor>,
+    num_query_tokens: usize,
     max_context_len: usize,
+    sliding_window: i32,
 }
 
 impl PagedAttention {
@@ -545,26 +550,42 @@ impl candle::CustomOp1 for PagedAttention {
 /// * `softmax_scale` - scaling factor
 ///
 /// The resulting tensor has dimensions `(num_sequences, num_heads_q, head_size)`.
+#[allow(unused_variables)]
 pub fn paged_attention(
     q: &Tensor,
     key_cache: &Tensor,
     value_cache: &Tensor,
+    k_scales: Option<&Tensor>,
+    v_scales: Option<&Tensor>,
     block_tables: &Tensor,
     context_lens: &Tensor,
     alibi_slopes: Option<&Tensor>,
     max_context_len: usize,
     softmax_scale: f32,
     softcapping: f32,
+    cu_query_lens: Option<Tensor>,
+    sliding_window: Option<usize>,
 ) -> Result<Tensor> {
+    let sliding_window = if let Some(sliding_window) = sliding_window {
+        sliding_window as i32
+    } else {
+        -1
+    };
+    let num_query_tokens = q.dim(0)?;
     let op = PagedAttention {
         softmax_scale,
         key_cache: key_cache.to_owned(),
         value_cache: value_cache.to_owned(),
+        k_scales: k_scales.to_owned().cloned(),
+        v_scales: v_scales.to_owned().cloned(),
         block_tables: block_tables.to_owned(),
         context_lens: context_lens.to_owned(),
         alibi_slopes: alibi_slopes.to_owned().cloned(),
         max_context_len,
         softcapping,
+        cu_query_lens: cu_query_lens.to_owned(),
+        num_query_tokens,
+        sliding_window,
     };
     q.apply_op1(op)
 }
@@ -573,6 +594,8 @@ struct ReshapeCache {
     value: Tensor,
     key_cache: Tensor,
     value_cache: Tensor,
+    k_scales: Option<Tensor>,
+    v_scales: Option<Tensor>,
     slot_mapping: Tensor,
 }
 
@@ -921,20 +944,26 @@ impl candle::InplaceOp1 for ReshapeCache {
 ///   with `x` being the size of an element in bytes.
 /// * `value_cache` - Value cache paged tensor of shape `(num_blocks, num_heads, head_size, block_size)`.
 /// * `slot_mapping` - Mapping associating a slot to each token of shape `(num_tokens)`.
+#[allow(unused_variables)]
 pub fn reshape_and_cache(
     key: &Tensor,
     value: &Tensor,
     key_cache: &Tensor,
     value_cache: &Tensor,
+    k_scales: Option<&Tensor>,
+    v_scales: Option<&Tensor>,
     slot_mapping: &Tensor,
 ) -> Result<()> {
     #[cfg(feature = "gcu")]
     return candle_nn::ops::reshape_and_cache(key, value, key_cache, value_cache, slot_mapping);
+
     #[cfg(not(feature = "gcu"))]
     let op = ReshapeCache {
         value: value.to_owned(),
         key_cache: key_cache.to_owned(),
         value_cache: value_cache.to_owned(),
+        k_scales: k_scales.to_owned().cloned(),
+        v_scales: v_scales.to_owned().cloned(),
         slot_mapping: slot_mapping.to_owned(),
     };
     #[cfg(not(feature = "gcu"))]

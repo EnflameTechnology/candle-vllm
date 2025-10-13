@@ -23,6 +23,7 @@
 - 支持`多GPU`推理（包括`多进程`和`多线程`模式）。
 - 支持`多节点`推理（使用MPI运行）。
 - 支持分块Prefilling (默认块大小8K)
+- 支持CUDA Graph
 
 ## 支持的模型
 - 目前，candle-vllm支持以下模型结构的推理服务。
@@ -77,8 +78,11 @@ export PATH=$PATH:/usr/local/cuda/bin/
 #CUDA平台：单节点（单机单卡或单机多卡）编译命令
 cargo build --release --features cuda,nccl
 
+#CUDA平台：单节点（+CUDA Graph）编译命令
+cargo build --release --features cuda,nccl,graph
+
 #CUDA平台：单节点（使用flash attention kernel，适用于长上下文推理，需要CUDA_ARCH >= 800）编译命令
-cargo build --release --features cuda,nccl,flash-attn
+cargo build --release --features cuda,nccl,graph,flash-attn
 
 #CUDA平台：多节点（多机推理）编译命令
 sudo apt update
@@ -91,25 +95,27 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #同时包含flash att
 
 ### 构建/运行参数
 
-- [`ENV_PARAM`] cargo run [`BUILD_PARAM`] -- [`PROGRAM_PARAM`] [`MODEL_ID/MODEL_WEIGHT_PATH`]
+- [`ENV_PARAM`] cargo run [`BUILD_PARAM`] -- [`PROGRAM_PARAM`] [`MODEL_ID/MODEL_WEIGHT_PATH`] [`CACHE CONFIG`]
   <details open>
     <summary>显示详情</summary>
 
     **示例:**
 
     ```shell
-    [RUST_LOG=warn] cargo run [--release --features cuda,nccl] -- [--log --dtype bf16 --p 2000 --d 0,1 --mem 4096 --isq q4k --prefill-chunk-size 8192 --penalty 1.1] [--w /home/weights/Qwen3-30B-A3B-Instruct-2507]
+    [RUST_LOG=warn] cargo run [--release --features cuda,nccl] -- [--log --dtype bf16 --p 2000 --d 0,1 --mem 4096 --isq q4k --prefill-chunk-size 8192 --frequency-penalty 1.1 --presence-penalty 1.1] [--w /home/weights/Qwen3-30B-A3B-Instruct-2507] [--fp8-kvcache]
     ```
 
     `ENV_PARAM`: RUST_LOG=warn
 
     `BUILD_PARAM`: --release --features cuda,nccl
 
-    `PROGRAM_PARAM`：--log --dtype bf16 --p 2000 --d 0,1 --mem 4096 --isq q4k --prefill-chunk-size 8192 --penalty 1.1
+    `PROGRAM_PARAM`：--log --dtype bf16 --p 2000 --d 0,1 --mem 4096 --isq q4k --prefill-chunk-size 8192 --frequency-penalty 1.1 --presence-penalty 1.1
 
     `MODEL_ID/MODEL_WEIGHT_PATH`: --w /home/weights/Qwen3-30B-A3B-Instruct-2507
 
-    其中，`--p`: 服务端口; `--d`: 设备序列号; `--w`: 权重路径 (safetensors路径); `--f`: 权重文件 (GGUF模型使用); `--m`: Huggingface model-id; `--isq`将权重在加载过程中量化为`q4k`格式；`--prefill-chunk-size`指定分块prefill时的块大小（默认8K，`0`为禁用），`--penalty` 重复输出惩罚项 (1.0 : 无惩罚 至 2.0 : 最大惩罚)，`--mem` (`kvcache-mem-gpu`) 参数控制KV Cache缓存，长文本或批量推理量请增大缓存。
+    `CACHE CONFIG`: --fp8-kvcache
+
+    其中，`--p`: 服务端口; `--d`: 设备序列号; `--w`: 权重路径 (safetensors路径); `--f`: 权重文件 (GGUF模型使用); `--m`: Huggingface model-id; `--isq`将权重在加载过程中量化为`q4k`格式；`--prefill-chunk-size`指定分块prefill时的块大小（默认8K，`0`为禁用），`--frequency-penalty`和`presence-penalty`为重复输出惩罚项 (取值-2.0到2.0)，`--mem` (`kvcache-mem-gpu`) 参数控制KV Cache缓存，长文本或批量推理量请增大缓存; `--fp8-kvcache` 参数用于启用FP8 KV Cache缓存。
   </details>
 
 ## 如何运行？
@@ -609,7 +615,7 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #同时包含flash att
 
     对于聊天流式传输，需要在聊天请求中将`stream`标志设置为`True`。
 
-    你可以传递`penalty`和`temperature`参数给模型以**防止潜在的重复**，例如：
+    你可以传递`frequency-penalty`、`presence-penalty`和`temperature`参数给模型以**防止潜在的重复**，例如：
 
     ```
     cargo run --release --features cuda -- --w /home/mistral_7b/

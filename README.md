@@ -23,6 +23,7 @@ Efficient, easy-to-use platform for inference and serving local LLMs including a
 - Support `Multi-GPU` inference (both `multi-process` and  `multi-threaded` mode)
 - Support `Multi-node` inference with MPI runner
 - Support Chunked Prefilling (default chunk size 8K)
+- Support CUDA Graph
 
 ## Supported Models
 - Currently, candle-vllm supports chat serving for the following model structures.
@@ -77,8 +78,11 @@ export PATH=$PATH:/usr/local/cuda/bin/
 #CUDA: single-node compilation (single gpu, or multi-gpus on single machine)
 cargo build --release --features cuda,nccl
 
+#CUDA: single-node compilation (+CUDA Graph)
+cargo build --release --features cuda,nccl,graph
+
 #CUDA: single-node compilation with flash attention (takes few minutes for the first build, faster inference for long-context, requires CUDA_ARCH >= 800)
-cargo build --release --features cuda,nccl,flash-attn
+cargo build --release --features cuda,nccl,graph,flash-attn
 
 #CUDA: multinode compilation with MPI (multi-gpus, multiple machines)
 sudo apt update
@@ -91,25 +95,27 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
 
 ### Build/Run Parameters
 
-- [`ENV_PARAM`] cargo run [`BUILD_PARAM`] -- [`PROGRAM_PARAM`] [`MODEL_ID/MODEL_WEIGHT_PATH`]
+- [`ENV_PARAM`] cargo run [`BUILD_PARAM`] -- [`PROGRAM_PARAM`] [`MODEL_ID/MODEL_WEIGHT_PATH`] [`CACHE CONFIG`]
   <details open>
     <summary>Show details</summary>
 
     **Example:**
 
     ```shell
-    [RUST_LOG=warn] cargo run [--release --features cuda,nccl] -- [--log --dtype bf16 --p 2000 --d 0,1 --mem 4096 --isq q4k --prefill-chunk-size 8192 --penalty 1.1] [--w /home/weights/Qwen3-30B-A3B-Instruct-2507]
+    [RUST_LOG=warn] cargo run [--release --features cuda,nccl] -- [--log --dtype bf16 --p 2000 --d 0,1 --mem 4096 --isq q4k --prefill-chunk-size 8192 --frequency-penalty 1.1 --presence-penalty 1.1] [--w /home/weights/Qwen3-30B-A3B-Instruct-2507] [--fp8-kvcache]
     ```
 
     `ENV_PARAM`: RUST_LOG=warn
 
     `BUILD_PARAM`: --release --features cuda,nccl
 
-    `PROGRAM_PARAM`：--log --dtype bf16 --p 2000 --d 0,1 --mem 4096 --isq q4k --prefill-chunk-size 8192 --penalty 1.1
+    `PROGRAM_PARAM`：--log --dtype bf16 --p 2000 --d 0,1 --mem 4096 --isq q4k --prefill-chunk-size 8192 --frequency-penalty 1.1 --presence-penalty 1.1
 
     `MODEL_ID/MODEL_WEIGHT_PATH`: --w /home/weights/Qwen3-30B-A3B-Instruct-2507 (or `--m` specify model-id)
 
-    where, `--p`: server port; `--d`: device ids; `--w`: weight path (safetensors folder); `--f`: weight file (for gguf); `--m`: huggingface model-id; `--isq q4k`: convert weights into `q4k` format during model loading; `--prefill-chunk-size` chunk the prefill into size defined in this flag (default 8K, `0` for disable); `--penalty` repetition penalty (1.0 : no penalty to 2.0 : maximum penalty); `--mem` (`kvcache-mem-gpu`) is the key parameter to control KV cache usage (increase this for large batch).
+    `CACHE CONFIG`: --fp8-kvcache
+
+    where, `--p`: server port; `--d`: device ids; `--w`: weight path (safetensors folder); `--f`: weight file (for gguf); `--m`: huggingface model-id; `--isq q4k`: convert weights into `q4k` format during model loading; `--prefill-chunk-size` chunk the prefill into size defined in this flag (default 8K, `0` for disable); `--frequency-penalty` and `presence-penalty` repetition penalty (value from -2.0 to 2.0); `--mem` (`kvcache-mem-gpu`) is the key parameter to control KV cache usage (increase this for large batch); `--fp8-kvcache` used to enable fp8 kvcache.
   </details>
 
 

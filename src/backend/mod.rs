@@ -45,12 +45,6 @@ use candle_core::{
     CudaDevice,
 };
 
-#[cfg(feature = "gcu")]
-use candle_core::{
-    gcu_backend::ubridge::prelude::GcuFunction as CudaFunction, GcuDevice as CudaDevice,
-};
-
-use candle_core::DType;
 #[cfg(not(feature = "gcu"))]
 pub use gptq::*;
 
@@ -61,3 +55,6 @@ pub mod custom_ops;
 #[cfg(feature = "eccl")]
 pub mod heartbeat;
 pub mod progress;
+
+#[cfg(all(feature = "gcu", feature = "graph"))]
+pub mod graph;

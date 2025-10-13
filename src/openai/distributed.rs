@@ -1,4 +1,4 @@
-use super::models::linear::{qlinear, QLinear};
+use super::models::linear::qlinear;
 use crate::openai::models::linear::{linear_no_bias_x as linear, LinearX as Linear};
 use crate::openai::models::QuantConfig;
 #[cfg(feature = "eccl")]
@@ -125,9 +125,9 @@ impl CustomOp1 for AllReduce {
     ) -> Result<(candle_core::CudaStorage, Shape)> {
         use candle_core::backend::BackendStorage;
         use candle_core::cuda_backend::cudarc::driver::DeviceSlice;
+        use candle_core::cuda_backend::cudarc::nccl::safe::ReduceOp;
         use candle_core::cuda_backend::WrapErr;
         use candle_core::DType;
-        use cudarc::nccl::safe::ReduceOp;
         use half::{bf16, f16};
 
         let elem_count = l.shape().elem_count();

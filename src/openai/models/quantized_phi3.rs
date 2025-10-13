@@ -1,15 +1,16 @@
 use super::rotary_emb::ScalingRotaryEmbedding;
 use super::Config;
 use crate::backend::progress::{ProgressLike, ProgressReporter};
-use crate::paged_attention::input_metadata::InputMetadata;
-use crate::paged_attention::PagedAttention;
+use crate::openai::models::mask::get_attention_casual_mask;
+use crate::{InputMetadata, PagedAttention};
 use candle_core::quantized::gguf_file;
 use candle_core::quantized::QTensor;
-use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{Embedding, RmsNorm};
 use either::Either;
+use parking_lot::RwLock;
 use std::iter::zip;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 struct QLinear {
@@ -76,12 +77,12 @@ impl LayerWeights {
     fn forward_attn(
         &self,
         x: &Tensor,
-        mask: Option<&Tensor>,
-        input_positions: &[Vec<usize>],
+        mask: Option<&Vec<Tensor>>,
+        input_positions: &Tensor,
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        let (b_sz, seq_len, _) = x.dims3()?;
+        let (seq_len, _) = x.dims2()?;
         let qkv = self.attn_qkv.forward(x)?;
 
         let query_pos = self.n_head * self.head_dim;
@@ -97,24 +98,18 @@ impl LayerWeights {
             )?
             .to_dtype(self.dtype)?;
 
-        let (q, k, v) = if seq_len == 1 {
-            //no need transpose for seq_len == 1, change reshape dim
-            let q = q.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
-            let k = k.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
-            let v = v.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
-            (q, k, v)
-        } else {
-            let q = q
-                .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
-                .transpose(1, 2)?;
-            let k = k
-                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-                .transpose(1, 2)?;
-            let v = v
-                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-                .transpose(1, 2)?;
-            (q.contiguous()?, k.contiguous()?, v.contiguous()?)
-        };
+        let q = q
+            .reshape((1, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = k
+            .reshape((1, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = v
+            .reshape((1, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
 
         let (q, k) = self.rotary_emb.apply_rotary_emb(&q, &k, input_positions)?;
         let (q, k) = (q.to_dtype(self.dtype)?, k.to_dtype(self.dtype)?);
@@ -130,7 +125,7 @@ impl LayerWeights {
                 input_metadata,
                 None,
             )?
-            .reshape((b_sz, seq_len, ()))?;
+            .reshape((seq_len, ()))?;
 
         let y = self.attn_output.forward(&y.to_dtype(x.dtype())?)?;
         Ok(y)
@@ -159,6 +154,7 @@ impl GGUFPhi3 {
         max_seq_len: usize,
         original_max_position_embeddings: Option<usize>,
         partial_rotary_factor: Option<f32>,
+        kv_cache_dtype: DType,
     ) -> Config {
         Config {
             architectures: Some(vec!["phi3".to_string()]),
@@ -193,6 +189,7 @@ impl GGUFPhi3 {
             quantization_config: None,
             moe_config: None,
             quant: Some("gguf".to_string()),
+            fp8_kvcache: Some(kv_cache_dtype == DType::U8),
         }
     }
 
@@ -201,6 +198,7 @@ impl GGUFPhi3 {
         reader: &mut R,
         device: &Device,
         dtype: DType,
+        kv_cache_dtype: DType,
         progress_reporter: Arc<RwLock<ProgressReporter>>,
     ) -> Result<Self> {
         let md_get = |s: &str| match ct.metadata.get(s) {
@@ -267,6 +265,7 @@ impl GGUFPhi3 {
             max_seq_len,
             original_max_position_embeddings,
             partial_rotary_factor,
+            kv_cache_dtype,
         );
         let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, &cfg, device, true)?);
 
@@ -305,11 +304,12 @@ impl GGUFPhi3 {
                     None,
                     device.clone(),
                     None,
+                    cfg.fp8_kvcache.unwrap_or(false),
                 )?,
                 rotary_emb: rotary_emb.clone(),
                 dtype,
             });
-            reporter.write().unwrap().set_progress(layer_idx + 1);
+            reporter.write().set_progress(layer_idx + 1);
         }
         Ok(Self {
             tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
@@ -325,23 +325,28 @@ impl GGUFPhi3 {
     pub fn forward(
         &self,
         xs: &Tensor,
-        input_positions: &[Vec<usize>],
+        input_positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        let (b_sz, seq_len) = xs.dims2()?;
-        let mask = if seq_len <= 1 {
-            None
+        let seqlens = if input_metadata.cu_seqlens_q.is_some() {
+            input_metadata
+                .cu_seqlens_q
+                .as_ref()
+                .unwrap()
+                .to_vec1::<u32>()?[1..]
+                .into()
         } else {
-            super::get_attention_casual_mask(
-                &self.device,
-                self.dtype,
-                b_sz,
-                seq_len,
-                input_positions,
-                self.cfg.sliding_window,
-            )
+            Vec::new()
         };
+        let attention_mask = get_attention_casual_mask(
+            &self.device,
+            self.dtype,
+            input_positions,
+            &seqlens,
+            self.cfg.sliding_window,
+            input_metadata.is_prefill,
+        );
         let mut xs = self.tok_embeddings.forward(xs)?;
 
         if let Some(kv_caches) = kv_caches {
@@ -350,7 +355,7 @@ impl GGUFPhi3 {
                 let ys = xs.apply(&layer.attn_norm)?;
                 let ys = layer.forward_attn(
                     &ys,
-                    mask.as_ref(),
+                    attention_mask.as_ref(),
                     input_positions,
                     Some((k_cache, v_cache)),
                     input_metadata,
@@ -367,7 +372,7 @@ impl GGUFPhi3 {
                 let ys = xs.apply(&layer.attn_norm)?;
                 let ys = layer.forward_attn(
                     &ys,
-                    mask.as_ref(),
+                    attention_mask.as_ref(),
                     input_positions,
                     None,
                     input_metadata,
@@ -379,11 +384,13 @@ impl GGUFPhi3 {
                 xs = (ys + residual)?
             }
         }
-        let xs = xs
-            .i((.., seq_len - 1, ..))?
-            .contiguous()?
-            .apply(&self.output_norm)?;
-        self.output.forward(&xs)
+        if !seqlens.is_empty() {
+            let indices: Vec<_> = seqlens.iter().map(|x| x - 1 as u32).collect();
+            let batch = indices.len();
+            xs = xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?;
+        }
+        let xs = self.output_norm.forward(&xs)?;
+        self.output.forward(&xs)?.to_dtype(DType::F32)
     }
 
     pub fn get_config(&self) -> &Config {

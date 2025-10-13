@@ -1,7 +1,6 @@
-use super::{Config, ScalingValue};
-use candle::{DType, Device, IndexOp, Result, Tensor, D};
+use crate::openai::models::{Config, ScalingValue};
+use candle::{DType, Device, Result, Tensor, D};
 use candle_core as candle;
-use std::iter::zip;
 pub use std::rc::Rc;
 #[derive(Debug, Clone)]
 pub struct DefaultRotaryEmbedding {
@@ -36,7 +35,7 @@ impl DefaultRotaryEmbedding {
             .matmul(&theta.reshape((1, theta.elem_count()))?)?;
         let cos = idx_theta.cos()?.to_dtype(dtype)?;
         let sin = idx_theta.sin()?.to_dtype(dtype)?;
-        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
+        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?; //must be contiguous tensor;
         Ok(Self {
             cos,
             sin,
@@ -52,76 +51,66 @@ impl DefaultRotaryEmbedding {
 }
 
 impl DefaultRotaryEmbedding {
+    #[cfg(feature = "gcu")]
     pub fn apply_rotary_emb(
         &self,
         q: &Tensor,
         k: &Tensor,
-        input_positions: &[Vec<usize>],
+        positions: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        let (b_size, _h, seq_len, _n_embd) = q.dims4()?;
-        if q.device().is_gcu() {
-            let mut _input_positions = Vec::<i32>::new();
-            for seqlen_offset in input_positions {
-                _input_positions.push(seqlen_offset[0] as i32);
-            }
-            return candle_nn::apply_rotary_emb_qkv(
-                &q,
-                &k,
-                &self.cos_sin,
-                &self.sin,
-                &_input_positions,
-                self.rotary_dim.unwrap_or(0),
-                true,
-                self.is_gpt_neox,
-            );
-        }
+        candle_nn::apply_rotary_emb_qkv(
+            &q,
+            &k,
+            &self.cos_sin,
+            &self.sin,
+            positions,
+            self.rotary_dim.unwrap_or(0),
+            true,
+            self.is_gpt_neox,
+        )
+    }
 
-        let mut q_embeds = Vec::new();
-        let mut k_embeds = Vec::new();
-        let rope_func = if self.is_gpt_neox {
+    #[cfg(not(feature = "gcu"))]
+    pub fn apply_rotary_emb(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        positions: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let cos = self.cos.index_select(positions, 0)?;
+        let sin = self.sin.index_select(positions, 0)?;
+        let func = if self.is_gpt_neox {
             candle_nn::rotary_emb::rope
         } else {
             candle_nn::rotary_emb::rope_i
         };
 
-        if self.rotary_dim.is_none() {
-            for (b, seqlen_offset) in zip(0..b_size, input_positions) {
-                let cos = self.cos.narrow(0, seqlen_offset[0], seq_len)?;
-                let sin = self.sin.narrow(0, seqlen_offset[0], seq_len)?;
-                let x_q = q.narrow(0, b, 1)?;
-                let x_k = k.narrow(0, b, 1)?;
-                let q_embed = rope_func(&x_q, &cos, &sin)?;
-                let k_embed = rope_func(&x_k, &cos, &sin)?;
-                q_embeds.push(q_embed);
-                k_embeds.push(k_embed);
-            }
-            Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
-        } else {
-            let rotary_dim = self.rotary_dim.unwrap();
-            let mut q_embeds = Vec::new();
-            for (b, seqlen_offset) in zip(0..b_size, input_positions) {
-                let (s, e) = (seqlen_offset[0], seqlen_offset[0] + seq_len);
-                let cos = self.cos.i((s..e, ..))?.contiguous()?;
-                let sin = self.sin.i((s..e, ..))?.contiguous()?;
-                let q_rot = q.i((b, .., .., ..rotary_dim))?.unsqueeze(0)?.contiguous()?;
-                let q_pass = q.i((b, .., .., rotary_dim..))?.unsqueeze(0)?;
-                let q_rot = rope_func(&q_rot, &cos, &sin)?;
-                let embed = Tensor::cat(&[&q_rot, &q_pass], D::Minus1)?.contiguous()?;
-                q_embeds.push(embed);
+        let (q_embed, k_embed) = if let Some(rotary_dim) = self.rotary_dim {
+            let q_rot = q.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?;
+            let q_pass = q
+                .narrow(D::Minus1, rotary_dim, q.dim(D::Minus1)? - rotary_dim)?
+                .contiguous()?;
+            let q_rot = func(&q_rot, &cos, &sin)?;
+            let q_embed = Tensor::cat(&[&q_rot, &q_pass], D::Minus1)?;
 
-                let k_rot = k.i((b, .., .., ..rotary_dim))?.unsqueeze(0)?.contiguous()?;
-                let k_pass = k.i((b, .., .., rotary_dim..))?.unsqueeze(0)?;
-                let k_rot = rope_func(&k_rot, &cos, &sin)?;
-                let k_embed = Tensor::cat(&[&k_rot, &k_pass], D::Minus1)?.contiguous()?;
-                k_embeds.push(k_embed);
-            }
-            Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
-        }
+            let k_rot = k.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?;
+            let k_pass = k
+                .narrow(D::Minus1, rotary_dim, k.dim(D::Minus1)? - rotary_dim)?
+                .contiguous()?;
+            let k_rot = func(&k_rot, &cos, &sin)?;
+            let k_embed = Tensor::cat(&[&k_rot, &k_pass], D::Minus1)?;
+            (q_embed, k_embed)
+        } else {
+            let q_embed = func(&q, &cos, &sin)?;
+            let k_embed = func(&k, &cos, &sin)?;
+            (q_embed, k_embed)
+        };
+        Ok((q_embed, k_embed))
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct ScalingRotaryEmbedding(DefaultRotaryEmbedding);
+pub struct ScalingRotaryEmbedding(pub DefaultRotaryEmbedding);
 
 impl ScalingRotaryEmbedding {
     pub fn new(dtype: DType, cfg: &Config, dev: &Device, is_gpt_neox: bool) -> Result<Self> {
@@ -174,8 +163,7 @@ impl ScalingRotaryEmbedding {
                             .matmul(&inv_freq.reshape((1, inv_freq.elem_count()))?)?;
                         let cos = idx_theta.cos()?.to_dtype(dtype)?;
                         let sin = idx_theta.sin()?.to_dtype(dtype)?;
-                        let cos_sin =
-                            Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
+                        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?; //must be contiguous tensor;
                         Self(DefaultRotaryEmbedding {
                             sin,
                             cos,
@@ -231,8 +219,7 @@ impl ScalingRotaryEmbedding {
                             let freqs = t.matmul(&inv_freq)?;
                             let sin = freqs.sin()?.to_dtype(dtype)?;
                             let cos = freqs.cos()?.to_dtype(dtype)?;
-                            let cos_sin =
-                                Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
+                            let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?; //must be contiguous tensor;
                             Self(DefaultRotaryEmbedding {
                                 sin,
                                 cos,
@@ -293,7 +280,7 @@ impl ScalingRotaryEmbedding {
                     let freqs = t.matmul(&inv_freq)?;
                     let sin = freqs.sin()?.to_dtype(dtype)?;
                     let cos = freqs.cos()?.to_dtype(dtype)?;
-                    let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
+                    let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?; //must be contiguous tensor;
                     Self(DefaultRotaryEmbedding {
                         sin,
                         cos,
@@ -338,8 +325,7 @@ impl ScalingRotaryEmbedding {
                                 *factor as f32,
                             )?;
                             let cos_sin =
-                                Tensor::cat(&[&embed.cos, &embed.sin], candle::D::Minus1)?
-                                    .contiguous()?; //must be contiguous tensor;
+                                Tensor::cat(&[&embed.cos, &embed.sin], candle::D::Minus1)?; //must be contiguous tensor;
                             Self(DefaultRotaryEmbedding {
                                 sin: embed.sin,
                                 cos: embed.cos,
@@ -377,7 +363,7 @@ impl ScalingRotaryEmbedding {
         &self,
         q: &Tensor,
         k: &Tensor,
-        input_positions: &[Vec<usize>],
+        input_positions: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
         self.0.apply_rotary_emb(q, k, input_positions)
     }

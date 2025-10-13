@@ -44,7 +44,7 @@ impl LogicalTokenBlock {
     }
 }
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Hash, PartialEq, Debug, Eq)]
 pub struct _PhysicalTokenBlock {
     pub block_id: usize,
     block_size: usize,
@@ -52,6 +52,7 @@ pub struct _PhysicalTokenBlock {
     is_gpu: bool,
 }
 
+#[derive(Debug)]
 pub struct PhysicalTokenBlock(pub Mutex<_PhysicalTokenBlock>);
 
 impl PhysicalTokenBlock {

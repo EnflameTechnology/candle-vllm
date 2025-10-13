@@ -8,21 +8,22 @@ use crate::openai::distributed::{
     embedding, rms_norm, AllReduce, Comm, ReplicatedLinear, TensorParallelColumnLinear,
     TensorParallelRowLinear, VarBuilder,
 };
+use crate::openai::models::mask::get_attention_casual_mask;
+use crate::openai::models::rotary_emb::DefaultRotaryEmbedding;
 use crate::openai::models::DeepSeekMoEConfig;
-use crate::paged_attention::input_metadata::InputMetadata;
-use crate::paged_attention::PagedAttention;
+use crate::{InputMetadata, PagedAttention};
 use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_core as candle;
 use candle_nn::{Activation, Embedding, Module, RmsNorm};
+use parking_lot::RwLock;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::f32::consts::PI;
 use std::iter::{zip, FromIterator};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
-use tracing::warn;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 #[doc(hidden)]
 #[macro_export]
 macro_rules! serde_default_fn {
@@ -91,9 +92,7 @@ pub struct DeepSeekConfig {
 
 #[derive(Debug, Clone)]
 pub struct DeepSeekV2RotaryEmbedding {
-    sin: Tensor,
-    cos: Tensor,
-    cos_sin: Tensor,
+    rotary_emb: DefaultRotaryEmbedding,
 }
 
 impl DeepSeek {
@@ -193,6 +192,7 @@ impl DeepSeek {
             quantization_config: config.quantization_config.clone(),
             moe_config: Some(MoEConfig::DeepSeekMoE(moe_config)),
             quant,
+            fp8_kvcache: None,
         };
         Ok(config)
     }
@@ -223,9 +223,17 @@ impl DeepSeekV2RotaryEmbedding {
 
         let sin = freqs.sin()?.to_device(dev)?;
         let cos = freqs.cos()?.to_device(dev)?;
-        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
+        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?; //must be contiguous tensor;
 
-        Ok(Self { sin, cos, cos_sin })
+        Ok(Self {
+            rotary_emb: DefaultRotaryEmbedding {
+                cos,
+                sin,
+                cos_sin,
+                is_gpt_neox: false,
+                rotary_dim: None,
+            },
+        })
     }
 
     fn yarn_find_correction_dim(
@@ -315,9 +323,17 @@ impl DeepSeekV2RotaryEmbedding {
             Self::yarn_get_mscale(factor, mscale) / Self::yarn_get_mscale(factor, mscale_all_dim);
         let sin = (freqs.sin()? * mscale as f64)?.to_device(dev)?;
         let cos = (freqs.cos()? * mscale as f64)?.to_device(dev)?;
-        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?.contiguous()?; //must be contiguous tensor;
+        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?; //must be contiguous tensor;
 
-        Ok(Self { sin, cos, cos_sin })
+        Ok(Self {
+            rotary_emb: DefaultRotaryEmbedding {
+                cos,
+                sin,
+                cos_sin,
+                is_gpt_neox: false,
+                rotary_dim: None,
+            },
+        })
     }
 
     pub fn new(cfg: &DeepSeekV2RopeConfig, dtype: DType, dev: &Device) -> Result<Self> {
@@ -353,39 +369,9 @@ impl DeepSeekV2RotaryEmbedding {
         &self,
         q: &Tensor,
         k: &Tensor,
-        input_positions: &[Vec<usize>],
+        input_positions: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        let (batch, _h, seq_len, _n_embd) = q.dims4()?;
-        if q.device().is_gcu() {
-            let mut _input_positions = Vec::<i32>::new();
-            for seqlen_offset in input_positions {
-                _input_positions.push(seqlen_offset[0] as i32);
-            }
-            candle_nn::apply_rotary_emb_qkv(
-                &q,
-                &k,
-                &self.cos_sin,
-                &self.sin,
-                &_input_positions,
-                0,
-                true,
-                false,
-            )
-        } else {
-            let mut q_embeds = Vec::new();
-            let mut k_embeds = Vec::new();
-            for (b, seqlen_offset) in zip(0..batch, input_positions) {
-                let sin = self.sin.narrow(0, seqlen_offset[0], seq_len)?;
-                let cos = self.cos.narrow(0, seqlen_offset[0], seq_len)?;
-                let q_cur = q.narrow(0, b, 1)?.contiguous()?;
-                let k_cur = k.narrow(0, b, 1)?.contiguous()?;
-                let q_embed = candle_nn::rotary_emb::rope_i(&q_cur, &cos, &sin)?;
-                let k_embed = candle_nn::rotary_emb::rope_i(&k_cur, &cos, &sin)?;
-                q_embeds.push(q_embed);
-                k_embeds.push(k_embed);
-            }
-            Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
-        }
+        self.rotary_emb.apply_rotary_emb(q, k, input_positions)
     }
 }
 
@@ -540,6 +526,7 @@ impl Attention {
                 cfg.sliding_window,
                 vb.device().clone(),
                 None,
+                cfg.fp8_kvcache.unwrap_or(false),
             )?,
             moe_cfg,
         })
@@ -548,15 +535,15 @@ impl Attention {
     fn forward(
         &self,
         xs: &Tensor,
-        attention_mask: Option<&Tensor>,
-        input_positions: &[Vec<usize>],
+        attention_mask: Option<&Vec<Tensor>>,
+        input_positions: &Tensor,
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        let (bs, seq_len, _) = xs.dims3()?;
+        let (seq_len, _) = xs.dims2()?;
         let (q_nope, mut q_pe) = {
             let q = self.q.forward(xs)?;
-            let q = q.reshape((bs, seq_len, self.num_attention_heads, self.q_head_dim))?;
+            let q = q.reshape((1, seq_len, self.num_attention_heads, self.q_head_dim))?;
             let (q_nope, q_pe) = q.split2(
                 &[self.moe_cfg.qk_nope_head_dim, self.moe_cfg.qk_rope_head_dim],
                 D::Minus1,
@@ -572,14 +559,14 @@ impl Attention {
             D::Minus1,
         )?;
         let mut k_pe = k_pe
-            .reshape((bs, seq_len, 1, self.moe_cfg.qk_rope_head_dim))?
+            .reshape((1, seq_len, 1, self.moe_cfg.qk_rope_head_dim))?
             .transpose(1, 2)?;
         let kv = {
             let kv = self
                 .kv_b_proj
                 .forward(&self.kv_a_layernorm.forward(&compressed_kv)?)?;
             kv.reshape((
-                bs,
+                1,
                 seq_len,
                 self.num_attention_heads,
                 self.moe_cfg.qk_nope_head_dim + self.moe_cfg.v_head_dim,
@@ -595,9 +582,9 @@ impl Attention {
 
         (q_pe, k_pe) = self.rotary_emb.forward(&q_pe, &k_pe, input_positions)?;
 
-        let q = Tensor::cat(&[q_nope, q_pe], D::Minus1)?.contiguous()?;
+        let q = Tensor::cat(&[q_nope, q_pe], D::Minus1)?;
         let k_pe = k_pe.repeat((1, q.dim(1)?, 1, 1))?;
-        let k = Tensor::cat(&[k_nope, k_pe], D::Minus1)?.contiguous()?;
+        let k = Tensor::cat(&[k_nope, k_pe], D::Minus1)?;
 
         if self.q_head_dim != self.moe_cfg.v_head_dim {
             v = v
@@ -620,19 +607,18 @@ impl Attention {
             y = y.narrow(D::Minus1, 0, self.moe_cfg.v_head_dim)?;
         }
 
-        y = y.reshape((bs, seq_len, ()))?;
+        y = y.reshape((seq_len, ()))?;
 
         self.o_proj.forward(&y)
     }
 }
 
-use std::cell::{Cell, RefCell};
 struct Mlp {
-    gate: RefCell<ReplicatedLinear>,
-    up: RefCell<ReplicatedLinear>,
-    down: RefCell<ReplicatedLinear>,
+    gate: RwLock<ReplicatedLinear>,
+    up: RwLock<ReplicatedLinear>,
+    down: RwLock<ReplicatedLinear>,
     act: Activation,
-    preloaded: Cell<bool>,
+    preloaded: AtomicBool,
     can_be_offloaded: bool,
 }
 
@@ -676,37 +662,37 @@ impl Mlp {
             down.offload()?;
         }
         Ok(Self {
-            gate: RefCell::new(gate),
-            up: RefCell::new(up),
-            down: RefCell::new(down),
-            preloaded: Cell::new(!offload),
+            gate: RwLock::new(gate),
+            up: RwLock::new(up),
+            down: RwLock::new(down),
+            preloaded: AtomicBool::new(!offload),
             can_be_offloaded: offload,
             act: cfg.hidden_act.unwrap(),
         })
     }
 
     pub fn reload(&self) {
-        if !self.preloaded.get() {
-            let _ = self.gate.borrow_mut().reload();
-            let _ = self.up.borrow_mut().reload();
-            let _ = self.down.borrow_mut().reload();
-            self.preloaded.set(true);
+        if !self.preloaded.load(Ordering::SeqCst) {
+            let _ = self.gate.write().reload();
+            let _ = self.up.write().reload();
+            let _ = self.down.write().reload();
+            self.preloaded.store(true, Ordering::SeqCst);
         }
     }
 
     pub fn offload(&self) {
-        if self.can_be_offloaded && self.preloaded.get() {
-            let _ = self.gate.borrow_mut().offload();
-            let _ = self.up.borrow_mut().offload();
-            let _ = self.down.borrow_mut().offload();
-            self.preloaded.set(false);
+        if self.can_be_offloaded && self.preloaded.load(Ordering::SeqCst) {
+            let _ = self.gate.write().offload();
+            let _ = self.up.write().offload();
+            let _ = self.down.write().offload();
+            self.preloaded.store(false, Ordering::SeqCst);
         }
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let lhs = self.gate.borrow().forward(xs)?.apply(&self.act)?;
-        let rhs = self.up.borrow().forward(xs)?;
-        self.down.borrow().forward(&(&lhs * &rhs)?)
+        let lhs = self.gate.read().forward(xs)?.apply(&self.act)?;
+        let rhs = self.up.read().forward(xs)?;
+        self.down.read().forward(&(&lhs * &rhs)?)
     }
 }
 
@@ -747,10 +733,9 @@ impl MoeGate {
 
     /// (topk_idx, topk_weight)
     fn forward(&self, xs: &Tensor) -> Result<(Tensor, Tensor)> {
-        let (bs, seq_len, h) = xs.dims3()?;
+        let (seq_len, _) = xs.dims2()?;
         let moe_cfg = &self.moe_cfg;
         // Compute gating score
-        let xs = xs.reshape(((), h))?;
         let logits = xs
             .to_dtype(DType::F32)?
             .broadcast_matmul(&self.weight.t()?)?;
@@ -776,11 +761,11 @@ impl MoeGate {
                     candle_core::bail!("Expected e_score_correction_bias")
                 };
                 let scores_for_choice = scores
-                    .reshape((bs * seq_len, ()))?
+                    .reshape((seq_len, ()))?
                     .broadcast_add(&e_score_correction_bias.unsqueeze(0)?)?;
                 // (n, n_group)
                 let group_scores = scores_for_choice
-                    .reshape((bs * seq_len, moe_cfg.n_group, ()))?
+                    .reshape((seq_len, moe_cfg.n_group, ()))?
                     .topk(2)?
                     .values
                     .sum(D::Minus1)?;
@@ -798,11 +783,11 @@ impl MoeGate {
                 let score_mask = group_mask
                     .unsqueeze(D::Minus1)?
                     .expand((
-                        bs * seq_len,
+                        seq_len,
                         moe_cfg.n_group,
                         self.n_routed_experts / moe_cfg.n_group,
                     ))?
-                    .reshape((bs * seq_len, ()))?;
+                    .reshape((seq_len, ()))?;
                 // (n, e)
                 // Invert the mask
                 let tmp_scores = scores_for_choice.broadcast_mul(&score_mask)?;
@@ -812,7 +797,7 @@ impl MoeGate {
             TopkMethod::GroupLimitedGreedy => {
                 // (n, n_group)
                 let group_scores = scores
-                    .reshape((bs * seq_len, moe_cfg.n_group, ()))?
+                    .reshape((seq_len, moe_cfg.n_group, ()))?
                     .max(D::Minus1)?;
                 // (n, topk_group)
                 let group_idx = group_scores.topk_unsorted(moe_cfg.topk_group)?.indices;
@@ -828,11 +813,11 @@ impl MoeGate {
                 let score_mask = group_mask
                     .unsqueeze(D::Minus1)?
                     .expand((
-                        bs * seq_len,
+                        seq_len,
                         moe_cfg.n_group,
                         self.n_routed_experts / moe_cfg.n_group,
                     ))?
-                    .reshape((bs * seq_len, ()))?;
+                    .reshape((seq_len, ()))?;
                 // (n, e)
                 // Invert the mask
                 let tmp_scores = masked_fill(&score_mask, &(1. - &score_mask.ne(0.)?)?, 0.)?;
@@ -1004,13 +989,8 @@ impl Moe {
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let identity = xs.clone();
-        let orig_shape = xs.shape();
         let (topk_idx, topk_weight) = self.gate.forward(xs)?;
-        let xs = xs.reshape(((), xs.dim(D::Minus1)?))?;
-
-        let mut y = self
-            .moe_infer(&xs, &topk_idx, &topk_weight)?
-            .reshape(orig_shape)?;
+        let mut y = self.moe_infer(&xs, &topk_idx, &topk_weight)?;
         if let Some(ref shared_experts) = self.shared_experts {
             y = (y + shared_experts.forward(&identity)?)?;
         }
@@ -1086,8 +1066,8 @@ impl DecoderLayer {
     fn forward(
         &self,
         xs: &Tensor,
-        attention_mask: Option<&Tensor>,
-        input_positions: &[Vec<usize>],
+        attention_mask: Option<&Vec<Tensor>>,
+        input_positions: &Tensor,
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
@@ -1164,7 +1144,7 @@ impl DeepSeek {
                 comm.clone(),
             )?;
             layers.push(layer);
-            reporter.write().unwrap().set_progress(layer_idx + 1);
+            reporter.write().set_progress(layer_idx + 1);
         }
 
         Ok(Self {
@@ -1181,28 +1161,34 @@ impl DeepSeek {
     pub fn forward(
         &self,
         x: &Tensor,
-        input_positions: &[Vec<usize>],
+        input_positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        let (bs, seq_len) = x.dims2()?;
-        let mut x = self.embed_tokens.forward(x)?;
-        let attention_mask = if seq_len == 1 {
-            None
+        let seqlens = if input_metadata.cu_seqlens_q.is_some() {
+            input_metadata
+                .cu_seqlens_q
+                .as_ref()
+                .unwrap()
+                .to_vec1::<u32>()?[1..]
+                .into()
         } else {
-            super::get_attention_casual_mask(
-                &self.device,
-                self.dtype,
-                bs,
-                seq_len,
-                input_positions,
-                self.cfg.sliding_window,
-            )
+            Vec::new()
         };
+        let attention_mask = get_attention_casual_mask(
+            &self.device,
+            self.dtype,
+            input_positions,
+            &seqlens,
+            self.cfg.sliding_window,
+            input_metadata.is_prefill,
+        );
+        let mut xs = self.embed_tokens.forward(x)?;
+
         if let Some(kv_caches) = kv_caches {
             for ((k_cache, v_cache), block) in zip(kv_caches.iter(), &self.layers) {
-                x = block.forward(
-                    &x,
+                xs = block.forward(
+                    &xs,
                     attention_mask.as_ref(),
                     input_positions,
                     Some((k_cache, v_cache)),
@@ -1211,8 +1197,8 @@ impl DeepSeek {
             }
         } else {
             for block in &self.layers {
-                x = block.forward(
-                    &x,
+                xs = block.forward(
+                    &xs,
                     attention_mask.as_ref(),
                     input_positions,
                     None,
@@ -1220,11 +1206,13 @@ impl DeepSeek {
                 )?;
             }
         }
-        let xs = x
-            .i((.., seq_len - 1, ..))?
-            .contiguous()?
-            .apply(&self.norm)?;
-        self.lm_head.forward(&xs)
+        if !seqlens.is_empty() {
+            let indices: Vec<_> = seqlens.iter().map(|x| x - 1 as u32).collect();
+            let batch = indices.len();
+            xs = xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?;
+        }
+        let xs = self.norm.forward(&xs)?;
+        self.lm_head.forward(&xs)?.to_dtype(DType::F32)
     }
 
     pub fn get_config(&self) -> &Config {

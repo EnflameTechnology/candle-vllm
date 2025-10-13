@@ -784,6 +784,7 @@ impl QLinear {
 }
 
 impl Module for QLinear {
+    #[allow(unused_variables)]
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match (
             &self.inner,
