@@ -46,7 +46,7 @@ struct Args {
     max_num_seqs: usize,
 
     /// Size of a block
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 32)]
     block_size: usize,
 
     /// if weight_path is passed, it will ignore the model_id
