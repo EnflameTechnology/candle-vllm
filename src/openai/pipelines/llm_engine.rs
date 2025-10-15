@@ -47,7 +47,7 @@ struct PreparedInputs {
 }
 
 const _PAD_SLOT_ID: i64 = -1;
-const PREFILL_CHUNK_SIZE: usize = 8192;
+const PREFILL_CHUNK_SIZE: usize = 4096;
 
 #[allow(unused)]
 pub struct LLMEngine {
