@@ -5,6 +5,7 @@ use crate::openai::pipelines::TokenOrFinishReason;
 use crate::openai::streaming::ChatResponse;
 use crate::openai::TaskData;
 use crate::scheduler::Scheduler;
+#[allow(unused_imports)]
 use crate::{
     openai::{
         models::Config,
@@ -865,48 +866,6 @@ impl LLMEngine {
         Ok(())
     }
 
-    fn prepare_block_tables(
-        &self,
-        groups: &VecDeque<Arc<SequenceGroup>>,
-        device: &Device,
-    ) -> Result<Tensor> {
-        let len = groups.len();
-
-        let mut max_len = 0;
-        for group in groups {
-            let seq = group.get_seqs().values().nth(0).unwrap();
-            let table = self
-                .scheduler
-                .block_engine
-                .block_tables
-                .get(&seq.deref().get_id())
-                .unwrap();
-            if table.len() > max_len {
-                max_len = table.len();
-            }
-        }
-
-        let mut flat: Vec<u32> = Vec::with_capacity(len * max_len);
-        for group in groups {
-            let seq = group.get_seqs().values().nth(0).unwrap();
-            let table = self
-                .scheduler
-                .block_engine
-                .block_tables
-                .get(&seq.deref().get_id())
-                .unwrap();
-            let table = table
-                .iter()
-                .map(|block| block.deref_mut().block_id as u32)
-                .collect::<Vec<_>>();
-            let table_len = table.len();
-            flat.extend(table);
-            flat.extend(std::iter::repeat(0).take(max_len - table_len));
-        }
-
-        Tensor::from_vec(flat, (len, max_len), device)
-    }
-
     //Revised based on https://github.com/guoqingbao/vllm.rs/blob/main/src/core/runner.rs#L392
     fn prepare_prompt(
         &self,
@@ -931,7 +890,6 @@ impl LLMEngine {
                     max_context_len = seq_len + self.cache_config.block_size;
                 }
                 let num_cached_tokens = seq.deref().get_num_cached_tokens();
-                let chunk_size = self.prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE);
                 let num_tokens = if chunk_size > 0 {
                     std::cmp::min(chunk_size, seq_len - num_cached_tokens)
                 } else {

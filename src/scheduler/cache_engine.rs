@@ -1,9 +1,8 @@
 use crate::openai::models::Config;
 use candle_core::{DType, Device, Result, Tensor};
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard},
-};
+#[cfg(not(feature = "gcu"))]
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[cfg(not(feature = "gcu"))]
 use crate::backend::{copy_blocks, swap_blocks};
@@ -34,6 +33,7 @@ impl CacheConfig {
 
 pub type KVCache = (Tensor, Tensor);
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct CacheEngine {
     gpu_cache: Arc<Mutex<Vec<KVCache>>>,

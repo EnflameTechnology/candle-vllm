@@ -1,14 +1,12 @@
 use crate::backend::{paged_attention, reshape_and_cache};
-#[cfg(feature = "gcu")]
-use candle_core::gcu_backend::ubridge::prelude::StreamTrait;
 use candle_core::{Device, Result, Tensor};
 mod attn_bias;
 pub(crate) mod input_metadata;
 pub(crate) mod utils;
 use self::input_metadata::InputMetadata;
 
-const KV_SCALE_UPDATE_ITERATION: i32 = 128;
-use std::sync::atomic::{AtomicI32, Ordering};
+// const KV_SCALE_UPDATE_ITERATION: i32 = 128;
+use std::sync::atomic::AtomicI32;
 
 #[allow(dead_code)]
 pub struct PagedAttention {

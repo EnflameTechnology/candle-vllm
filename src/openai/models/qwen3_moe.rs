@@ -133,6 +133,7 @@ struct Moe {
 }
 
 impl Moe {
+    #[allow(dead_code)]
     fn new(cfg: &Config, vb: VarBuilder, comm: Rc<Comm>) -> Result<Self> {
         let moe_cfg = if let Some(MoEConfig::QwenMoE(moe_cfg)) = &cfg.moe_config {
             moe_cfg.clone()
@@ -178,7 +179,7 @@ impl Moe {
         // Select top-k experts
         #[cfg(feature = "gcu")]
         let TopKOutput {
-            values: mut routing_weights,
+            values: routing_weights,
             indices: experts_per_tok,
         } = routing_weights.topk(self.num_experts_per_tok)?;
 
@@ -498,6 +499,7 @@ impl FusedMoe {
     }
 }
 
+#[allow(dead_code)]
 enum MoeOrMlp {
     Moe(Moe),
     FusedMoe(FusedMoe),

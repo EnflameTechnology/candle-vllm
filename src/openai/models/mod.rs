@@ -20,7 +20,7 @@ pub mod yi;
 use crate::openai::distributed::Comm;
 use crate::paged_attention::input_metadata::InputMetadata;
 use crate::paged_attention::PagedAttention;
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 use either::Either;
 pub use layers::{attention, mask, mlp, rotary_emb};
 use serde::Deserialize;
