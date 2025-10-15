@@ -443,7 +443,7 @@ impl ReplicatedLinear {
             cfg.bits == 4,
             "Only 4bit quantized weight can be loaded as dequantized!"
         );
-        let mut q_liner = qlinear(
+        let q_liner = qlinear(
             in_dim,
             out_dim,
             vb,

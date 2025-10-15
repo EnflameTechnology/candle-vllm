@@ -2,6 +2,7 @@
 use super::{
     Config, DeepSeekRopeScaling, MoEConfig, QuantConfig, ScoringFunc, TokenID, TopkMethod,
 };
+#[allow(unused_imports)]
 use crate::backend::custom_ops::moe::{masked_fill, NonZeroOp, SplitOp, TopKLastDimOp, TopKOutput};
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::openai::distributed::{
@@ -696,6 +697,7 @@ impl Mlp {
     }
 }
 
+#[allow(dead_code)]
 struct MoeGate {
     weight: Tensor,
     top_k: usize,
@@ -733,6 +735,7 @@ impl MoeGate {
 
     /// (topk_idx, topk_weight)
     fn forward(&self, xs: &Tensor) -> Result<(Tensor, Tensor)> {
+        #[cfg(not(feature = "gcu"))]
         let (seq_len, _) = xs.dims2()?;
         let moe_cfg = &self.moe_cfg;
         // Compute gating score

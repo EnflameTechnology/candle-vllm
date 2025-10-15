@@ -1,5 +1,5 @@
 use crate::openai::models::{Config, ScalingValue};
-use candle::{DType, Device, Result, Tensor, D};
+use candle::{DType, Device, Result, Tensor};
 use candle_core as candle;
 pub use std::rc::Rc;
 #[derive(Debug, Clone)]
@@ -77,6 +77,7 @@ impl DefaultRotaryEmbedding {
         k: &Tensor,
         positions: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
+        use candle::D;
         let cos = self.cos.index_select(positions, 0)?;
         let sin = self.sin.index_select(positions, 0)?;
         let func = if self.is_gpt_neox {

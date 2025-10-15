@@ -70,6 +70,5 @@ pub fn new_device(ordinal: usize) -> Result<Device> {
             #[cfg(feature = "gcu")]
             return Device::new_gcu(ordinal);
         }
-        Ok(Device::Cpu)
     }
 }
