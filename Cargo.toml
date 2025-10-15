@@ -13,11 +13,11 @@ anyhow = "1.0.75"
 rand = "0.9.0"
 rayon="1.10.0"
 hyper = { version = "0.14", features = ["full"] }
-candle-core = { path = "../candle-gcu/candle/candle-core/", version = "0.8.1" }
-candle-examples = { path = "../candle-gcu/candle/candle-examples/", version = "0.8.1" }
-candle-nn = { path = "../candle-gcu/candle/candle-nn/", version = "0.8.1" }
-candle-transformers = { path = "../candle-gcu/candle/candle-transformers/", version = "0.8.1" }
-candle-flash-attn = { path = "../candle-gcu/candle/candle-flash-attn/", version = "0.8.1", optional = true }
+candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="e58a0c3" }
+candle-examples = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="e58a0c3" }
+candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="e58a0c3" }
+candle-transformers = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="e58a0c3" }
+candle-flash-attn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="e58a0c3", optional = true }
 dyn-fmt = "0.4.0"
 serde = { version = "1.0.190", features = ["serde_derive"] }
 tokenizers = "0.21.2"
