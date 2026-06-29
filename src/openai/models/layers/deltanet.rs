@@ -423,6 +423,8 @@ impl GatedDeltaNet {
         let k_w = conv_weight.narrow(0, k_start, key_dim)?;
         let v_w = conv_weight.narrow(0, v_start, value_dim)?;
         let conv_weight = Tensor::cat(&[&q_w, &k_w, &v_w], 0)?;
+        #[cfg(feature = "gcu")]
+        let conv_weight = conv_weight.squeeze(1)?.t()?.contiguous()?;
 
         let conv_bias = vb.get((conv_dim_global,), "conv1d.bias").ok();
         let conv_bias = if let Some(cb) = conv_bias {
@@ -521,22 +523,38 @@ impl GatedDeltaNet {
         };
         let mixed_qkv = Tensor::cat(&[&q, &k, &v], 1)?;
 
-        let (kv_conv, prefill_conv_state) = if is_prefill {
-            let mut conv_state = mamba_cache.get_batch_conv_state(self.gdn_layer_idx, seq_slots)?;
+        let kv_conv = if is_prefill {
             let cu_seqlens = input_metadata
                 .cu_seqlens_q
                 .as_ref()
                 .expect("cu_seqlens_q must be present in prefill!");
 
+            #[cfg(feature = "gcu")]
             let out = gdn::causal_conv1d_fwd(
                 &mixed_qkv,
                 &self.conv_weight,
                 self.conv_bias.as_ref(),
-                &mut conv_state,
+                mamba_cache.conv_state_mut(self.gdn_layer_idx),
+                seq_slots,
                 Some(cu_seqlens),
-                true, // SiLU activation
+                true,
             )?;
-            (out, Some(conv_state))
+            #[cfg(not(feature = "gcu"))]
+            let out = {
+                let mut conv_state =
+                    mamba_cache.get_batch_conv_state(self.gdn_layer_idx, seq_slots)?;
+                let o = gdn::causal_conv1d_fwd(
+                    &mixed_qkv,
+                    &self.conv_weight,
+                    self.conv_bias.as_ref(),
+                    &mut conv_state,
+                    Some(cu_seqlens),
+                    true,
+                )?;
+                mamba_cache.set_batch_conv_state(self.gdn_layer_idx, seq_slots, &conv_state)?;
+                o
+            };
+            out
         } else {
             if token_count != slot_count {
                 candle_core::bail!(
@@ -545,19 +563,15 @@ impl GatedDeltaNet {
                     slot_count
                 );
             }
-            let out = gdn::causal_conv1d_update_slots(
+            gdn::causal_conv1d_update_slots(
                 &mixed_qkv,
                 &self.conv_weight,
                 self.conv_bias.as_ref(),
                 mamba_cache.conv_state_mut(self.gdn_layer_idx),
                 seq_slots,
                 true,
-            )?;
-            (out, None)
+            )?
         };
-        if let Some(conv_state) = prefill_conv_state {
-            mamba_cache.set_batch_conv_state(self.gdn_layer_idx, seq_slots, &conv_state)?;
-        }
 
         // Split convolved output back into q', k', v'
         let q_conv = kv_conv.narrow(1, 0, self.key_dim)?;
@@ -565,10 +579,15 @@ impl GatedDeltaNet {
         let v_conv = kv_conv.narrow(1, self.key_dim * 2, self.value_dim)?;
 
         // Fused GDN gating
-        let (a_expanded, b_expanded) = (a.unsqueeze(0)?, b.unsqueeze(0)?); // [1, seq_len, num_heads]
-        let (g, beta) =
-            gdn::fused_gdn_gating(&self.a_log, &a_expanded, &b_expanded, &self.dt_bias)?;
-        let (g, beta) = (g.squeeze(0)?, beta.squeeze(0)?);
+        #[cfg(feature = "gcu")]
+        let (g, beta) = gdn::fused_gdn_gating(&self.a_log, &a, &b, &self.dt_bias)?;
+        #[cfg(not(feature = "gcu"))]
+        let (g, beta) = {
+            let (a_expanded, b_expanded) = (a.unsqueeze(0)?, b.unsqueeze(0)?);
+            let (g, beta) =
+                gdn::fused_gdn_gating(&self.a_log, &a_expanded, &b_expanded, &self.dt_bias)?;
+            (g.squeeze(0)?, beta.squeeze(0)?)
+        };
 
         let q = q_conv.reshape((token_count, self.num_k_heads, self.head_k_dim))?;
         let k = k_conv.reshape((token_count, self.num_k_heads, self.head_k_dim))?;

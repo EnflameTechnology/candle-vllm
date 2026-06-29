@@ -660,7 +660,9 @@ async fn main() -> Result<()> {
     }
 
     #[cfg(all(feature = "gcu", feature = "graph"))]
-    LLMEngine::graph_capture(&server_data.model).unwrap();
+    if !args.disable_cuda_graph {
+        LLMEngine::graph_capture(&server_data.model).unwrap();
+    }
 
     let cors_layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])

@@ -350,6 +350,19 @@ impl QuantizedGatedDeltaNet {
                 .as_ref()
                 .expect("cu_seqlens_q must be present in prefill!");
 
+            #[cfg(feature = "gcu")]
+            let out = {
+                gdn::causal_conv1d_fwd(
+                    &mixed_qkv,
+                    &self.conv_weight,
+                    self.conv_bias.as_ref(),
+                    &mut conv_state,
+                    &seq_slots,
+                    Some(cu_seqlens),
+                    true,
+                )?
+            };
+            #[cfg(not(feature = "gcu"))]
             let out = gdn::causal_conv1d_fwd(
                 &mixed_qkv,
                 &self.conv_weight,

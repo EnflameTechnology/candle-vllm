@@ -22,8 +22,8 @@ anyhow = "1.0.75"
 rand = "0.9.0"
 rayon="1.10.0"
 hyper = { version = "0.14", features = ["full"] }
-candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="a851a1d" }
-candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="a851a1d" }
+candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="ab2b2d6" }
+candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="ab2b2d6" }
 dyn-fmt = "0.4.0"
 safetensors = "0.4"
 serde = { version = "1.0.190", features = ["serde_derive"] }
@@ -45,7 +45,7 @@ dirs = "5.0.1"
 minijinja = { version = "2.10.2", features = ["builtins", "json"] }
 minijinja-contrib = { version = "2.10.2", features = ["pycompat"] }
 thiserror = "1.0.58"
-attention-rs = { git = "https://github.com/guoqingbao/attention.rs", version="0.6.0", rev="a4d9158" }
+attention-rs = { git = "https://github.com/guoqingbao/attention.rs", version="0.6.0", rev="5033300" }
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 lazy_static = {version = "1.4.0"}
 once_cell = "1.20.2"
@@ -63,7 +63,7 @@ itertools = "0.13.0"
 chrono = "0.4.41"
 which = "8.0.0"
 ahash = "0.8.11"
-rustchatui = { git = "https://github.com/guoqingbao/rustchatui.git", rev = "fb19bef" }
+rustchatui = { git = "https://github.com/guoqingbao/rustchatui.git", rev = "b15a1f3" }
 base64 = "0.22.1"
 bytes = "1.5"
 reqwest = { version = "0.12.24", features = ["blocking", "json", "rustls-tls"]}
