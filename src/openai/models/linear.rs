@@ -18,6 +18,7 @@
 //! # Ok(()) }
 //! ```
 use super::QuantConfig;
+#[cfg(not(feature = "gcu"))]
 use crate::backend::gptq::{gptq_matmul, marlin_weight_repack};
 use crate::candle::Module;
 use crate::candle::{
@@ -28,6 +29,8 @@ use crate::openai::distributed::shard;
 use candle_core::quantized;
 pub use candle_nn::var_builder::Shard;
 pub use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
+#[cfg(feature = "gcu")]
+use candle_nn::{gptq_matmul, marlin_weight_repack};
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -106,13 +109,13 @@ impl Linear {
         self.workspace.as_ref()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "gcu"))]
     pub fn reload(&mut self) -> Result<()> {
         self.weight = self.weight.reload()?;
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "gcu"))]
     pub fn offload(&mut self) -> Result<()> {
         self.weight = self.weight.offload()?;
         Ok(())
@@ -658,7 +661,7 @@ impl QLinear {
                         transposed_weight: false,
                     };
                 };
-                let qtensor = QTensor::quantize_owned(weight, actual_ggml_dtype).unwrap();
+                let qtensor = QTensor::quantize(&weight, actual_ggml_dtype).unwrap();
                 QLinear::from_qparts_x(qtensor, qbias, dtype, false)
             }
         }
@@ -736,7 +739,7 @@ impl QLinear {
         self.bias.as_mut()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "gcu"))]
     pub fn offload(&mut self) -> Result<()> {
         let w = match &self.inner {
             QMatMul::Tensor(qw) => qw.offload()?,
@@ -748,7 +751,7 @@ impl QLinear {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "gcu"))]
     pub fn reload(&mut self) -> Result<()> {
         let w = match &self.inner {
             QMatMul::Tensor(qw) => qw.reload()?,
@@ -1253,7 +1256,7 @@ impl LinearX {
         }
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "gcu"))]
     pub fn offload(&mut self) -> Result<()> {
         match self {
             LinearX::Linear(ln) => ln.offload(),
@@ -1264,7 +1267,7 @@ impl LinearX {
         }
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "gcu"))]
     pub fn reload(&mut self) -> Result<()> {
         match self {
             LinearX::Linear(ln) => ln.reload(),

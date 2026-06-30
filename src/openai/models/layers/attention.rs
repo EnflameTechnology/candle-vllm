@@ -1,6 +1,6 @@
 use super::quantized_var_builder::VarBuilder as QVarBuilder;
 use super::rotary_emb::ScalingRotaryEmbedding;
-#[cfg(feature = "nccl")]
+#[cfg(feature = "eccl")]
 use crate::openai::distributed::AllReduce;
 use crate::openai::distributed::{
     rms_norm_sharded, rms_norm_x, shard, Comm, MergedParallelColumnLinear, Rc,
@@ -818,7 +818,7 @@ pub struct QuantizedAttention {
     attn: PagedAttention,
     rotary_emb: Arc<ScalingRotaryEmbedding>,
     dtype: DType,
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     all_reduce: Option<AllReduce>,
 }
 
@@ -938,7 +938,7 @@ impl QuantizedAttention {
             )?,
             rotary_emb: rotary_emb.clone(),
             dtype,
-            #[cfg(feature = "nccl")]
+            #[cfg(feature = "eccl")]
             all_reduce: if world_size > 1 {
                 Some(AllReduce::new(comm))
             } else {
@@ -1094,7 +1094,7 @@ impl QuantizedAttention {
         };
 
         let mut y = self.attention_wo.forward(&y.to_dtype(DType::F32)?)?;
-        #[cfg(feature = "nccl")]
+        #[cfg(feature = "eccl")]
         if let Some(all_reduce) = &self.all_reduce {
             y = all_reduce.apply(&y.to_dtype(self.dtype)?)?;
             y = y.to_dtype(DType::F32)?;

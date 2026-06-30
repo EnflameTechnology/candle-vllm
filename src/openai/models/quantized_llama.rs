@@ -3,7 +3,7 @@ use super::{
     attention::QuantizedAttention, rotary_emb::ScalingRotaryEmbedding, Config, KvCacheDtype,
 };
 use crate::backend::progress::{ProgressLike, ProgressReporter};
-#[cfg(feature = "nccl")]
+#[cfg(feature = "eccl")]
 use crate::openai::distributed::AllReduce;
 use crate::openai::distributed::{Comm, Rc, VocabParallelLinear};
 use crate::openai::models::layers::qrmsnorm::QRmsNorm;
@@ -21,9 +21,9 @@ struct Mlp {
     feed_forward_w1: QMatMul,
     feed_forward_w2: QMatMul,
     feed_forward_w3: QMatMul,
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     all_reduce: Option<AllReduce>,
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     dtype: DType,
 }
 
@@ -35,7 +35,7 @@ impl Mlp {
         let mut y = self
             .feed_forward_w2
             .forward(&(candle_nn::ops::silu(&w1)? * w3)?)?;
-        #[cfg(feature = "nccl")]
+        #[cfg(feature = "eccl")]
         if let Some(all_reduce) = &self.all_reduce {
             y = all_reduce.apply(&y.to_dtype(self.dtype)?)?;
             y = y.to_dtype(DType::F32)?;
@@ -202,7 +202,6 @@ impl GGUFLLaMa {
             moe_config: None,
             isq_quant: None,
             kvcache_dtype: KvCacheDtype::Auto,
-            fp8_kvcache: None,
             extra_config_json: None,
             is_f16_mode: false,
         }
@@ -333,13 +332,13 @@ impl GGUFLLaMa {
                     feed_forward_w1: QMatMul::from_arc(feed_forward_w1)?,
                     feed_forward_w2: QMatMul::from_arc(feed_forward_w2)?,
                     feed_forward_w3: QMatMul::from_arc(feed_forward_w3)?,
-                    #[cfg(feature = "nccl")]
+                    #[cfg(feature = "eccl")]
                     all_reduce: if world_size > 1 {
                         Some(AllReduce::new(comm.clone()))
                     } else {
                         None
                     },
-                    #[cfg(feature = "nccl")]
+                    #[cfg(feature = "eccl")]
                     dtype,
                 })
             } else {
@@ -355,9 +354,9 @@ impl GGUFLLaMa {
                         feed_forward_w1: QMatMul::from_arc(feed_forward_w1)?,
                         feed_forward_w2: QMatMul::from_arc(feed_forward_w2)?,
                         feed_forward_w3: QMatMul::from_arc(feed_forward_w3)?,
-                        #[cfg(feature = "nccl")]
+                        #[cfg(feature = "eccl")]
                         all_reduce: None,
-                        #[cfg(feature = "nccl")]
+                        #[cfg(feature = "eccl")]
                         dtype,
                     })
                 }

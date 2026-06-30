@@ -98,7 +98,7 @@ pub fn gguf_shard_qtensor(
     } else {
         target
     };
-    Ok(Arc::new(QTensor::quantize_owned(local, wdtype)?))
+    Ok(Arc::new(QTensor::quantize(&local, wdtype)?))
 }
 
 /// Shard MoE expert weight tensors with vllm.rs-aligned dtype selection.
@@ -1563,7 +1563,7 @@ impl VocabParallelLinear {
             } else {
                 ws.dtype()
             };
-            Arc::new(QTensor::quantize_owned(padded, wdtype)?)
+            Arc::new(QTensor::quantize(&padded, wdtype)?)
         } else {
             ws
         };

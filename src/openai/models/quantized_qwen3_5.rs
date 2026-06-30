@@ -2,7 +2,7 @@ use super::layers::quantized_var_builder::VarBuilder as QVarBuilder;
 use super::rotary_emb::ScalingRotaryEmbedding;
 use super::{attention::QuantizedAttention, Config, KvCacheDtype, Qwen3HybridConfig};
 use crate::backend::progress::{ProgressLike, ProgressReporter};
-#[cfg(feature = "nccl")]
+#[cfg(feature = "eccl")]
 use crate::openai::distributed::AllReduce;
 use crate::openai::distributed::{Comm, Rc, VocabParallelLinear};
 use crate::openai::models::layers::qrmsnorm::QRmsNorm;
@@ -83,9 +83,9 @@ struct Mlp {
     feed_forward_w1: QMatMul,
     feed_forward_w2: QMatMul,
     feed_forward_w3: QMatMul,
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     all_reduce: Option<AllReduce>,
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     dtype: DType,
 }
 
@@ -97,7 +97,7 @@ impl Mlp {
         let mut y = self
             .feed_forward_w2
             .forward(&(candle_nn::ops::silu(&w1)? * w3)?)?;
-        #[cfg(feature = "nccl")]
+        #[cfg(feature = "eccl")]
         if let Some(all_reduce) = &self.all_reduce {
             y = all_reduce.apply(&y.to_dtype(self.dtype)?)?;
             y = y.to_dtype(DType::F32)?;
@@ -169,8 +169,8 @@ impl QuantizedGatedDeltaNet {
             } else {
                 orig_dtype
             };
-            QMatMul::from_arc(Arc::new(candle_core::quantized::QTensor::quantize_owned(
-                restored, wdtype,
+            QMatMul::from_arc(Arc::new(candle_core::quantized::QTensor::quantize(
+                &restored, wdtype,
             )?))?
         } else {
             QMatMul::from_arc(prefix_vb.get_no_shape("attn_qkv.weight")?)?
@@ -188,8 +188,8 @@ impl QuantizedGatedDeltaNet {
             } else {
                 orig_dtype
             };
-            QMatMul::from_arc(Arc::new(candle_core::quantized::QTensor::quantize_owned(
-                w, wdtype,
+            QMatMul::from_arc(Arc::new(candle_core::quantized::QTensor::quantize(
+                &w, wdtype,
             )?))?
         } else {
             QMatMul::from_arc(prefix_vb.get_no_shape("attn_gate.weight")?)?
@@ -206,8 +206,8 @@ impl QuantizedGatedDeltaNet {
             } else {
                 orig_dtype
             };
-            QMatMul::from_arc(Arc::new(candle_core::quantized::QTensor::quantize_owned(
-                w, wdtype,
+            QMatMul::from_arc(Arc::new(candle_core::quantized::QTensor::quantize(
+                &w, wdtype,
             )?))?
         } else {
             QMatMul::from_arc(prefix_vb.get_no_shape("ssm_beta.weight")?)?
@@ -224,8 +224,8 @@ impl QuantizedGatedDeltaNet {
             } else {
                 orig_dtype
             };
-            QMatMul::from_arc(Arc::new(candle_core::quantized::QTensor::quantize_owned(
-                w, wdtype,
+            QMatMul::from_arc(Arc::new(candle_core::quantized::QTensor::quantize(
+                &w, wdtype,
             )?))?
         } else {
             QMatMul::from_arc(prefix_vb.get_no_shape("ssm_alpha.weight")?)?
@@ -244,8 +244,8 @@ impl QuantizedGatedDeltaNet {
             } else {
                 orig_dtype
             };
-            QMatMul::from_arc(Arc::new(candle_core::quantized::QTensor::quantize_owned(
-                v, wdtype,
+            QMatMul::from_arc(Arc::new(candle_core::quantized::QTensor::quantize(
+                &v, wdtype,
             )?))?
         } else {
             QMatMul::from_arc(prefix_vb.get_no_shape("ssm_out.weight")?)?
@@ -463,21 +463,12 @@ impl QuantizedGatedDeltaNet {
                 .as_ref()
                 .expect("cu_seqlens_q must be present in prefill!");
             let global_state = mamba_cache.recurrent_state_mut(self.gdn_layer_idx);
-            if self.num_k_heads != self.num_v_heads {
-                gdn::gated_delta_rule_recurrence_varlen_gqa(
-                    &q,
-                    &k,
-                    &v,
-                    &g,
-                    &beta,
-                    global_state,
-                    seq_slots,
-                    cu_seqlens,
-                    self.scale as f32,
-                    None,
-                )?
-            } else {
-                let (q, k) = (self.repeat_kv_heads(q)?, self.repeat_kv_heads(k)?);
+            {
+                let (q, k) = if self.num_k_heads != self.num_v_heads {
+                    (self.repeat_kv_heads(q)?, self.repeat_kv_heads(k)?)
+                } else {
+                    (q, k)
+                };
                 let q_scaled = (&q * self.scale)?;
                 gdn::gated_delta_rule_recurrence_varlen(
                     &q_scaled,
@@ -488,7 +479,6 @@ impl QuantizedGatedDeltaNet {
                     global_state,
                     seq_slots,
                     cu_seqlens,
-                    None,
                 )?
             }
         } else {
@@ -695,7 +685,6 @@ impl GGUFQWen3_5 {
             moe_config: None,
             isq_quant: None,
             kvcache_dtype: KvCacheDtype::Auto,
-            fp8_kvcache: None,
             extra_config_json,
             is_f16_mode: false,
         }
@@ -852,13 +841,13 @@ impl GGUFQWen3_5 {
                     feed_forward_w1: QMatMul::from_arc(feed_forward_w1)?,
                     feed_forward_w2: QMatMul::from_arc(feed_forward_w2)?,
                     feed_forward_w3: QMatMul::from_arc(feed_forward_w3)?,
-                    #[cfg(feature = "nccl")]
+                    #[cfg(feature = "eccl")]
                     all_reduce: if world_size > 1 {
                         Some(AllReduce::new(comm.clone()))
                     } else {
                         None
                     },
-                    #[cfg(feature = "nccl")]
+                    #[cfg(feature = "eccl")]
                     dtype,
                 }
             };

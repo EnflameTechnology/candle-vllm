@@ -331,7 +331,7 @@ async fn main() -> Result<()> {
         num_shards = local_world_size * args.num_nodes;
     }
 
-    #[cfg(feature = "nccl")]
+    #[cfg(any(feature = "nccl", feature = "eccl"))]
     let multi_node_config = if is_multi_node {
         Some(candle_vllm::openai::communicator::MultiNodeConfig {
             num_nodes: args.num_nodes,
@@ -343,6 +343,8 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    #[cfg(not(any(feature = "nccl", feature = "eccl")))]
+    let multi_node_config: Option<candle_vllm::openai::communicator::MultiNodeConfig> = None;
 
     let multi_process = if num_shards > 1 || is_multi_node {
         if args.multithread && !is_multi_node {

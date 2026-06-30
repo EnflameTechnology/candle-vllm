@@ -64,6 +64,8 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
+#[allow(unused)]
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 pub use std::rc::Rc;
 use std::{path::PathBuf, sync::Arc};
@@ -779,7 +781,7 @@ impl DefaultLoader {
                 .map_err(candle_core::Error::wrap)?;
             let gguf_rank = local_rank.unwrap_or(0);
             let gguf_world_size = pipeline_num_shards;
-            #[cfg(feature = "nccl")]
+            #[cfg(feature = "eccl")]
             let gguf_comm: crate::openai::distributed::Rc<
                 crate::openai::distributed::Comm,
             > = {
@@ -793,17 +795,17 @@ impl DefaultLoader {
                 let global_ws = global_world_size.unwrap_or(gguf_world_size);
                 Rc::new(
                     Comm::from_rank(
-                        device.as_cuda_device().unwrap().cuda_device(),
+                        device.as_gcu_device().unwrap().gcu_device(),
                         global_r,
                         global_ws,
                         id,
                     )
-                    .expect("Failed to create NCCL communicator for GGUF"),
+                    .expect("Failed to create ECCL communicator for GGUF"),
                 )
             };
-            #[cfg(not(feature = "nccl"))]
+            #[cfg(not(feature = "eccl"))]
             let gguf_comm =
-                crate::openai::distributed::Rc::new(crate::openai::distributed::Comm::default());
+                crate::openai::distributed::Rc::new(crate::openai::distributed::Comm::default())?;
 
             let (model, config, sep_style) = match arch.as_str() {
                 "llama" => {
@@ -1095,7 +1097,9 @@ impl DefaultLoader {
                 config.apply_runtime_rope_overrides(self.yarn_scaling_factor);
             }
             let weight_filenames: Vec<PathBuf> = paths.get_weight_filenames();
-            config.fp8_kvcache = Some(kv_cache_dtype == DType::U8);
+            if kv_cache_dtype == DType::U8 {
+                config.kvcache_dtype = crate::openai::models::KvCacheDtype::Fp8;
+            }
 
             if let Some(qcfg) = &mut config.quantization_config {
                 qcfg.normalize_compressed_tensors();

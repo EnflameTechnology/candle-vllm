@@ -3,7 +3,7 @@ use super::quantized_qwen3_5::{parse_gguf_hybrid_config, QuantizedGatedDeltaNet}
 use super::rotary_emb::ScalingRotaryEmbedding;
 use super::{attention::QuantizedAttention, Config, KvCacheDtype, MoEConfig, QwenMoEConfig};
 use crate::backend::progress::{ProgressLike, ProgressReporter};
-#[cfg(feature = "nccl")]
+#[cfg(feature = "eccl")]
 use crate::openai::distributed::AllReduce;
 use crate::openai::distributed::{Comm, Rc, VocabParallelLinear};
 use crate::openai::models::layers::moe::sort_expert_assignments;
@@ -25,9 +25,9 @@ struct Mlp {
     feed_forward_w1: QMatMul,
     feed_forward_w2: QMatMul,
     feed_forward_w3: QMatMul,
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     all_reduce: Option<AllReduce>,
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     dtype: DType,
 }
 
@@ -39,7 +39,7 @@ impl Mlp {
         let mut y = self
             .feed_forward_w2
             .forward(&(candle_nn::ops::silu(&w1)? * w3)?)?;
-        #[cfg(feature = "nccl")]
+        #[cfg(feature = "eccl")]
         if let Some(all_reduce) = &self.all_reduce {
             y = all_reduce.apply(&y.to_dtype(self.dtype)?)?;
             y = y.to_dtype(DType::F32)?;
@@ -58,13 +58,13 @@ struct FusedMoe {
     routed_scaling_factor: Option<f64>,
     num_experts_per_tok: usize,
     e_score_correction_bias: Option<Tensor>,
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     all_reduce: Option<AllReduce>,
     dtype: DType,
-    #[cfg(not(feature = "nccl"))]
+    #[cfg(not(feature = "eccl"))]
     #[allow(dead_code)]
     world_size: usize,
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     world_size: usize,
 }
 
@@ -134,7 +134,7 @@ impl FusedMoe {
         if ys.dtype() != self.dtype {
             ys = ys.to_dtype(self.dtype)?;
         }
-        #[cfg(feature = "nccl")]
+        #[cfg(feature = "eccl")]
         if self.world_size > 1 {
             if let Some(all_reduce) = &self.all_reduce {
                 ys = all_reduce.apply(&ys)?;
@@ -270,7 +270,6 @@ impl GGUFQWen3_5MoE {
             moe_config: Some(MoEConfig::QwenMoE(moe_cfg.clone())),
             isq_quant: None,
             kvcache_dtype: KvCacheDtype::Auto,
-            fp8_kvcache: None,
             extra_config_json,
             is_f16_mode: false,
         }
@@ -482,7 +481,7 @@ impl GGUFQWen3_5MoE {
                     routed_scaling_factor: moe_cfg.routed_scaling_factor,
                     num_experts_per_tok: moe_cfg.num_experts_per_tok,
                     e_score_correction_bias: bias,
-                    #[cfg(feature = "nccl")]
+                    #[cfg(feature = "eccl")]
                     all_reduce: if world_size > 1 {
                         Some(AllReduce::new(comm.clone()))
                     } else {
@@ -505,13 +504,13 @@ impl GGUFQWen3_5MoE {
                         feed_forward_w1: QMatMul::from_arc(feed_forward_w1)?,
                         feed_forward_w2: QMatMul::from_arc(feed_forward_w2)?,
                         feed_forward_w3: QMatMul::from_arc(feed_forward_w3)?,
-                        #[cfg(feature = "nccl")]
+                        #[cfg(feature = "eccl")]
                         all_reduce: if world_size > 1 {
                             Some(AllReduce::new(comm.clone()))
                         } else {
                             None
                         },
-                        #[cfg(feature = "nccl")]
+                        #[cfg(feature = "eccl")]
                         dtype,
                     }
                 };
@@ -554,13 +553,13 @@ impl GGUFQWen3_5MoE {
                             feed_forward_w1: QMatMul::from_arc(feed_forward_w1)?,
                             feed_forward_w2: QMatMul::from_arc(feed_forward_w2)?,
                             feed_forward_w3: QMatMul::from_arc(feed_forward_w3)?,
-                            #[cfg(feature = "nccl")]
+                            #[cfg(feature = "eccl")]
                             all_reduce: if world_size > 1 {
                                 Some(AllReduce::new(comm.clone()))
                             } else {
                                 None
                             },
-                            #[cfg(feature = "nccl")]
+                            #[cfg(feature = "eccl")]
                             dtype,
                         }
                     };

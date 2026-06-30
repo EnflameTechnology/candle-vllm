@@ -263,7 +263,7 @@ impl VarBuilder {
                 } else {
                     orig_dtype
                 };
-                Ok(Arc::new(QTensor::quantize_owned(local, wdtype)?))
+                Ok(Arc::new(QTensor::quantize(&local, wdtype)?))
             }
         }
     }

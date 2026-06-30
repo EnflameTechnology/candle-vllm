@@ -3,7 +3,7 @@ use super::rotary_emb::ScalingRotaryEmbedding;
 use super::Config;
 use super::KvCacheDtype;
 use crate::backend::progress::{ProgressLike, ProgressReporter};
-#[cfg(feature = "nccl")]
+#[cfg(feature = "eccl")]
 use crate::openai::distributed::AllReduce;
 use crate::openai::distributed::{Comm, Rc, VocabParallelLinear};
 use crate::openai::models::mask::get_attention_causal_mask;
@@ -53,9 +53,9 @@ struct Mlp {
     ffn_up: QLinear,
     ffn_down: QLinear,
     i_size: usize,
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     all_reduce: Option<AllReduce>,
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     dtype: DType,
 }
 
@@ -67,7 +67,7 @@ impl Mlp {
         let up_states = up_states.narrow(D::Minus1, self.i_size, self.i_size)?;
         let mut y = (up_states * gate.silu()?)?;
         y = y.apply(&self.ffn_down)?;
-        #[cfg(feature = "nccl")]
+        #[cfg(feature = "eccl")]
         if let Some(all_reduce) = &self.all_reduce {
             y = all_reduce.apply(&y.to_dtype(self.dtype)?)?;
             y = y.to_dtype(DType::F32)?;
@@ -94,7 +94,7 @@ struct LayerWeights {
     attn: PagedAttention,
     rotary_emb: Arc<ScalingRotaryEmbedding>,
     dtype: DType,
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     all_reduce: Option<AllReduce>,
 }
 
@@ -154,7 +154,7 @@ impl LayerWeights {
             .reshape((seq_len, ()))?;
 
         let mut y = self.attn_output.forward(&y.to_dtype(x.dtype())?)?;
-        #[cfg(feature = "nccl")]
+        #[cfg(feature = "eccl")]
         if let Some(all_reduce) = &self.all_reduce {
             y = all_reduce.apply(&y.to_dtype(self.dtype)?)?;
             y = y.to_dtype(DType::F32)?;
@@ -221,7 +221,6 @@ impl GGUFPhi3 {
             moe_config: None,
             isq_quant: None,
             kvcache_dtype: KvCacheDtype::Auto,
-            fp8_kvcache: None,
             extra_config_json: None,
             is_f16_mode: false,
         }
@@ -340,13 +339,13 @@ impl GGUFPhi3 {
                 ffn_up,
                 ffn_down,
                 i_size: local_i_size,
-                #[cfg(feature = "nccl")]
+                #[cfg(feature = "eccl")]
                 all_reduce: if world_size > 1 {
                     Some(AllReduce::new(comm.clone()))
                 } else {
                     None
                 },
-                #[cfg(feature = "nccl")]
+                #[cfg(feature = "eccl")]
                 dtype,
             };
             let attn_norm = rms_norm(prefix_vb.get_no_shape("attn_norm.weight")?, rms_eps)?;
@@ -381,7 +380,7 @@ impl GGUFPhi3 {
                 )?,
                 rotary_emb: rotary_emb.clone(),
                 dtype,
-                #[cfg(feature = "nccl")]
+                #[cfg(feature = "eccl")]
                 all_reduce: if world_size > 1 {
                     Some(AllReduce::new(comm.clone()))
                 } else {

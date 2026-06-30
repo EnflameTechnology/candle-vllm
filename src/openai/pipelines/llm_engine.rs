@@ -44,7 +44,7 @@ use crate::{
     },
     scheduler::{
         cache_engine::{CacheConfig, CacheEngine},
-        sequence::{_Sequence, Sequence, SequenceGroup},
+        sequence::{Sequence, SequenceGroup, _Sequence},
         SchedulerConfig, SchedulerOutput,
     },
     InputMetadata,
@@ -1443,7 +1443,7 @@ impl LLMEngine {
         Self::count_text_tokens(pipeline, &reasoning_text)
     }
 
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     fn broadcast_mamba_prefix_capture(&self, seq_id: usize, hash: u64, preserve: bool) -> bool {
         if !self.multi_process {
             return true;
@@ -1471,12 +1471,12 @@ impl LLMEngine {
         }
     }
 
-    #[cfg(not(feature = "nccl"))]
+    #[cfg(not(feature = "eccl"))]
     fn broadcast_mamba_prefix_capture(&self, _seq_id: usize, _hash: u64, _preserve: bool) -> bool {
         true
     }
 
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     fn broadcast_mamba_prefix_has(&self, hash: u64) -> bool {
         if !self.multi_process {
             return true;
@@ -1497,12 +1497,12 @@ impl LLMEngine {
         }
     }
 
-    #[cfg(not(feature = "nccl"))]
+    #[cfg(not(feature = "eccl"))]
     fn broadcast_mamba_prefix_has(&self, _hash: u64) -> bool {
         true
     }
 
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     fn broadcast_mamba_prefix_restore(&self, seq_id: usize, hash: u64) -> bool {
         if !self.multi_process {
             return true;
@@ -1526,7 +1526,7 @@ impl LLMEngine {
         }
     }
 
-    #[cfg(not(feature = "nccl"))]
+    #[cfg(not(feature = "eccl"))]
     fn broadcast_mamba_prefix_restore(&self, _seq_id: usize, _hash: u64) -> bool {
         true
     }

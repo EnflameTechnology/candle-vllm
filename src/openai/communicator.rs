@@ -214,7 +214,7 @@ impl DaemonManager {
     /// Create a TCP-based multi-node coordinator (replaces MPI).
     /// Master (node_rank=0) generates NCCL ID, listens for workers;
     /// Workers connect and receive the NCCL ID.
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     pub fn new_multi_node(config: &MultiNodeConfig) -> (Self, Id) {
         let (id, tcp_worker_streams, tcp_master_stream) = if config.is_master() {
             let id = Id::new().unwrap();
@@ -835,9 +835,9 @@ pub fn init_subprocess(
                 daemon_manager.unwrap(),
             )
         } else if let Some(mn_config) = multi_node_config {
-            #[cfg(not(feature = "nccl"))]
-            panic!("Multi-node inference requires the `nccl` feature to be enabled!");
-            #[cfg(feature = "nccl")]
+            #[cfg(not(feature = "eccl"))]
+            panic!("Multi-node inference requires the `eccl` feature to be enabled!");
+            #[cfg(feature = "eccl")]
             {
                 info!(
                     "Running multi-node via TCP! node_rank={}, num_nodes={}, local_gpus={}",

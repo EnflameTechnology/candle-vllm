@@ -3,7 +3,7 @@ use super::{
     attention::QuantizedAttention, rotary_emb::ScalingRotaryEmbedding, Config, KvCacheDtype,
 };
 use crate::backend::progress::{ProgressLike, ProgressReporter};
-#[cfg(feature = "nccl")]
+#[cfg(feature = "eccl")]
 use crate::openai::distributed::AllReduce;
 use crate::openai::distributed::{Comm, Rc, VocabParallelLinear};
 use crate::openai::models::layers::qrmsnorm::QRmsNorm;
@@ -20,9 +20,9 @@ use std::sync::Arc;
 struct Mlp {
     ffn_gate_up: QMatMul,
     ffn_down: QMatMul,
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     all_reduce: Option<AllReduce>,
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     dtype: DType,
 }
 
@@ -38,7 +38,7 @@ impl Mlp {
         let mut y = self
             .ffn_down
             .forward(&(candle_nn::ops::silu(&gate)? * up_states)?)?;
-        #[cfg(feature = "nccl")]
+        #[cfg(feature = "eccl")]
         if let Some(all_reduce) = &self.all_reduce {
             y = all_reduce.apply(&y.to_dtype(self.dtype)?)?;
             y = y.to_dtype(DType::F32)?;
@@ -128,7 +128,6 @@ impl GGUFGLM4 {
             moe_config: None,
             isq_quant: None,
             kvcache_dtype: KvCacheDtype::Auto,
-            fp8_kvcache: None,
             extra_config_json: None,
             is_f16_mode: false,
         }
@@ -239,13 +238,13 @@ impl GGUFGLM4 {
                 Mlp {
                     ffn_gate_up: QMatMul::from_arc(ffn_gate_up)?,
                     ffn_down: QMatMul::from_arc(ffn_down)?,
-                    #[cfg(feature = "nccl")]
+                    #[cfg(feature = "eccl")]
                     all_reduce: if world_size > 1 {
                         Some(AllReduce::new(comm.clone()))
                     } else {
                         None
                     },
-                    #[cfg(feature = "nccl")]
+                    #[cfg(feature = "eccl")]
                     dtype,
                 }
             };
