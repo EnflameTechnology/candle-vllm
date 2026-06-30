@@ -174,6 +174,10 @@ struct Args {
     /// YARN RoPE scaling factor (explicit override, no auto-calculation)
     #[arg(long)]
     yarn_scaling_factor: Option<f64>,
+
+    /// Disable reasoning/thinking by default (request.thinking defaults to false instead of true)
+    #[arg(long, default_value_t = false)]
+    disable_reasoning: bool,
 }
 
 fn config_log(logger: ftail::Ftail, log_enable: bool, log_file: String) -> Result<()> {
@@ -224,6 +228,8 @@ async fn main() -> Result<()> {
             .with_max_level(tracing::Level::INFO)
             .init();
     }
+
+    candle_vllm::set_disable_reasoning(args.disable_reasoning);
 
     let loader = Box::new(DefaultLoader::new(
         args.model_id,

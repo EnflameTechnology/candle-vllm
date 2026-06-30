@@ -239,7 +239,7 @@ impl GatedDeltaNet {
         &self,
         mixed_qkvz: &Tensor,
         mixed_ba: &Tensor,
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let seq_len = mixed_qkvz.dim(0)?;
         let qkvz_group_dim =
             self.head_k_dim + self.head_k_dim + self.kv_group_size * self.head_v_dim * 2;
@@ -260,20 +260,24 @@ impl GatedDeltaNet {
         let b = mixed_ba.narrow(2, 0, self.kv_group_size)?;
         let a = mixed_ba.narrow(2, self.kv_group_size, self.kv_group_size)?;
 
+        let mixed_qkv = Tensor::cat(
+            &[
+                &query.reshape((seq_len, self.key_dim))?,
+                &key.reshape((seq_len, self.key_dim))?,
+                &value.reshape((seq_len, self.value_dim))?,
+            ],
+            1,
+        )?;
+
         Ok((
-            query.reshape((seq_len, self.key_dim))?,
-            key.reshape((seq_len, self.key_dim))?,
-            value.reshape((seq_len, self.value_dim))?,
+            mixed_qkv,
             z.reshape((seq_len, self.value_dim))?,
             b.reshape((seq_len, self.num_v_heads))?,
             a.reshape((seq_len, self.num_v_heads))?,
         ))
     }
 
-    fn project_inputs(
-        &self,
-        xs: &Tensor,
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    fn project_inputs(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let xs = &if xs.dtype() != self.projection_dtype {
             xs.to_dtype(self.projection_dtype)?
         } else {
@@ -294,18 +298,11 @@ impl GatedDeltaNet {
                 in_proj_b,
                 in_proj_a,
             } => {
-                let proj_qkv = in_proj_qkv.forward(xs)?;
-                let q = proj_qkv.narrow(1, 0, self.key_dim)?.contiguous()?;
-                let k = proj_qkv
-                    .narrow(1, self.key_dim, self.key_dim)?
-                    .contiguous()?;
-                let v = proj_qkv
-                    .narrow(1, self.key_dim * 2, self.value_dim)?
-                    .contiguous()?;
+                let mixed_qkv = in_proj_qkv.forward(xs)?;
                 let z = in_proj_z.forward(xs)?;
                 let b = in_proj_b.forward(xs)?;
                 let a = in_proj_a.forward(xs)?;
-                Ok((q, k, v, z, b, a))
+                Ok((mixed_qkv, z, b, a))
             }
             GdnProjection::SplitQkvZaMerged {
                 in_proj_qkv,
@@ -320,14 +317,11 @@ impl GatedDeltaNet {
                         qkv.len()
                     );
                 }
-                let q = qkv[0].clone();
-                let k = qkv[1].clone();
-                let v = qkv[2].clone();
-                // z/b/a are projected from the original hidden states, not q/k/v chunks.
+                let mixed_qkv = Tensor::cat(&[&qkv[0], &qkv[1], &qkv[2]], 1)?;
                 let z = in_proj_z.forward(xs)?;
                 let b = in_proj_b.forward(xs)?;
                 let a = in_proj_a.forward(xs)?;
-                Ok((q, k, v, z, b, a))
+                Ok((mixed_qkv, z, b, a))
             }
         }
     }
@@ -507,21 +501,18 @@ impl GatedDeltaNet {
         let (token_count, _hidden) = xs.dims2()?;
         let is_prefill = input_metadata.is_prefill;
 
-        let (q, k, v, z, b, a) = self.project_inputs(xs)?;
+        let (mixed_qkv, z, b, a) = self.project_inputs(xs)?;
 
-        let (q, k, v, z, b, a) = if q.dtype() != self.kernel_dtype {
+        let (mixed_qkv, z, b, a) = if mixed_qkv.dtype() != self.kernel_dtype {
             (
-                q.to_dtype(self.kernel_dtype)?,
-                k.to_dtype(self.kernel_dtype)?,
-                v.to_dtype(self.kernel_dtype)?,
+                mixed_qkv.to_dtype(self.kernel_dtype)?,
                 z.to_dtype(self.kernel_dtype)?,
                 b.to_dtype(self.kernel_dtype)?,
                 a.to_dtype(self.kernel_dtype)?,
             )
         } else {
-            (q, k, v, z, b, a)
+            (mixed_qkv, z, b, a)
         };
-        let mixed_qkv = Tensor::cat(&[&q, &k, &v], 1)?;
 
         let kv_conv = if is_prefill {
             let cu_seqlens = input_metadata

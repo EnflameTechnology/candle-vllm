@@ -270,6 +270,20 @@ pub fn stream_as_reasoning_content() -> bool {
     })
 }
 
+static DISABLE_REASONING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_disable_reasoning(val: bool) {
+    DISABLE_REASONING.store(val, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn disable_reasoning() -> bool {
+    DISABLE_REASONING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn default_thinking_enabled() -> bool {
+    !disable_reasoning()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DeviceMemoryReport {
     pub total_bytes: usize,

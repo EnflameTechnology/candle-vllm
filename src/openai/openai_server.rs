@@ -108,7 +108,9 @@ async fn get_gen_prompt(
         }
     }
 
-    let enable_thinking = request.thinking.unwrap_or(true);
+    let enable_thinking = request
+        .thinking
+        .unwrap_or(crate::default_thinking_enabled());
     let prompt = conversation.get_prompt(enable_thinking, &tool_config.tools);
 
     Ok((prompt, image_data))
