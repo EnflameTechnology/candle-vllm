@@ -157,6 +157,7 @@ impl CacheEngine {
 
         let per_layer_config = model_config.gemma4_per_layer_cache_config();
         let use_flash_layout = cfg!(any(
+            feature = "flash",
             feature = "flashattn",
             feature = "flashinfer",
             feature = "metal"

@@ -3,20 +3,20 @@ use super::{
 };
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::openai::distributed::{
-    embedding, rms_norm_with_dtype, Comm, TensorParallelColumnLinear, TensorParallelRowLinear,
-    VarBuilder, VocabParallelLinear,
+    embedding, Comm, TensorParallelColumnLinear, TensorParallelRowLinear, VarBuilder,
+    VocabParallelLinear,
 };
 use crate::openai::models::layers::deepstack::ApplyDeepStack;
-use crate::openai::models::layers::moe::FusedMoe;
 #[allow(unused)]
-use crate::openai::models::layers::moe::{FusedMoeFp8, FusedMoeISQ, FusedMoeMxfp4, FusedMoeNvfp4};
+use crate::openai::models::layers::moe::{
+    FusedMoe, FusedMoeFp8, FusedMoeISQ, FusedMoeMxfp4, FusedMoeNvfp4,
+};
+use crate::openai::models::layers::others::{rms_norm, NormX};
 use crate::openai::models::linear::LinearX as Linear;
 use crate::openai::models::mask::get_attention_causal_mask;
 use crate::openai::models::QwenMoEConfig;
 use candle::{DType, Device, Module, Result, Tensor};
 use candle_core as candle;
-
-use candle_nn::RmsNorm;
 use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -176,8 +176,8 @@ struct DecoderLayer {
     mlp: MoeOrMlp,
     shared_gate: Option<Linear>,
     shared_expert: Option<Mlp>,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
+    input_layernorm: NormX,
+    post_attention_layernorm: NormX,
 }
 
 impl DecoderLayer {
@@ -315,17 +315,19 @@ impl DecoderLayer {
         } else {
             dtype
         };
-        let input_layernorm = rms_norm_with_dtype(
+        let input_layernorm = rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("input_layernorm"),
             norm_dtype,
+            false,
         )?;
-        let post_attention_layernorm = rms_norm_with_dtype(
+        let post_attention_layernorm = rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
             norm_dtype,
+            false,
         )?;
 
         //shared experts weights in Qwen2 MoE models
@@ -385,7 +387,7 @@ impl DecoderLayer {
                 .forward(&xs, attention_mask, input_positions, cache, input_metadata)?;
         let xs = (xs + residual)?;
         let residual = &xs;
-        let xs = xs.apply(&self.post_attention_layernorm)?;
+        let xs = self.post_attention_layernorm.forward(&xs)?;
         //shared experts for Qwen2 MoE models
         let shared_output = match (&self.shared_gate, &self.shared_expert) {
             (Some(shared_gate), Some(shared_expert)) => {
@@ -407,7 +409,7 @@ impl DecoderLayer {
 pub struct Qwen3MoE {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
-    norm: RmsNorm,
+    norm: NormX,
     lm_head: VocabParallelLinear,
     device: Device,
     dtype: DType,
@@ -467,11 +469,12 @@ impl Qwen3MoE {
         } else {
             dtype
         };
-        let norm = rms_norm_with_dtype(
+        let norm = rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb_m.pp("norm"),
             norm_dtype,
+            false,
         )?;
         let lm_head = VocabParallelLinear::load_no_bias(
             cfg.hidden_size,

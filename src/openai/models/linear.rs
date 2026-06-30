@@ -18,7 +18,6 @@
 //! # Ok(()) }
 //! ```
 use super::QuantConfig;
-#[cfg(not(feature = "gcu"))]
 use crate::backend::gptq::{gptq_matmul, marlin_weight_repack};
 use crate::candle::Module;
 use crate::candle::{
@@ -29,11 +28,10 @@ use crate::openai::distributed::shard;
 use candle_core::quantized;
 pub use candle_nn::var_builder::Shard;
 pub use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
-#[cfg(feature = "gcu")]
-use candle_nn::{gptq_matmul, marlin_weight_repack};
 
 use std::cell::Cell;
 use std::sync::Arc;
+use tracing::warn;
 
 thread_local! {
     static LINEAR_IS_PREFILL: Cell<bool> = const { Cell::new(false) };
@@ -108,13 +106,13 @@ impl Linear {
         self.workspace.as_ref()
     }
 
-    #[cfg(any(feature = "cuda", feature = "gcu"))]
+    #[cfg(feature = "cuda")]
     pub fn reload(&mut self) -> Result<()> {
         self.weight = self.weight.reload()?;
         Ok(())
     }
 
-    #[cfg(any(feature = "cuda", feature = "gcu"))]
+    #[cfg(feature = "cuda")]
     pub fn offload(&mut self) -> Result<()> {
         self.weight = self.weight.offload()?;
         Ok(())
@@ -124,7 +122,6 @@ impl Linear {
 //Revised to improve performance for batched matmul
 //Remember use this linear layer throughout all of the models
 impl Module for Linear {
-    #[cfg(not(feature = "gcu"))]
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let w = match *x.dims() {
             [b1, seq_len, _, _] => {
@@ -165,20 +162,6 @@ impl Module for Linear {
                 }
             }
             _ => x.matmul(&w)?,
-        };
-
-        match &self.bias {
-            None => Ok(x),
-            Some(bias) => x.broadcast_add(bias),
-        }
-    }
-
-    #[cfg(feature = "gcu")]
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = match *x.dims() {
-            [b1, b2, _, _] => x.matmul(&self.weight.broadcast_left((b1, b2))?.t()?)?,
-            [bsize, _, _] => x.matmul(&self.weight.broadcast_left(bsize)?.t()?)?,
-            _ => x.matmul(&self.weight.t()?)?,
         };
 
         match &self.bias {
@@ -341,9 +324,8 @@ pub fn qlinear(
                         && cfg.quant_method == "gptq")
                 {
                     //only model with 4-bit and desc_act==false can be repacked to marlin format
-                    #[cfg(not(feature = "gcu"))]
                     if cfg.quant_method == "marlin" {
-                        tracing::warn!("The current GPTQ model does no compatible with marlin format because one of the following conditions: !cfg.sym || cfg.bits != 4 || (cfg.group_size != 128 && cfg.group_size != -1) || (cfg.desc_act == true)");
+                        warn!("The current GPTQ model does no compatible with marlin format because one of the following conditions: !cfg.sym || cfg.bits != 4 || (cfg.group_size != 128 && cfg.group_size != -1) || (cfg.desc_act == true)");
                     }
                     //conventional gptq format
                     Ok(Linear {
@@ -447,6 +429,72 @@ pub struct QLinear {
 }
 
 impl QLinear {
+    fn ggml_dtype_from_str(quant: &str) -> quantized::GgmlDType {
+        use quantized::GgmlDType;
+        match quant.to_lowercase().as_str() {
+            "q40" | "q4_0" => GgmlDType::Q4_0,
+            "q4" | "q41" | "q4_1" => GgmlDType::Q4_1,
+            "q50" | "q5_0" => GgmlDType::Q5_0,
+            "q5" | "q51" | "q5_1" => GgmlDType::Q5_1,
+            "q8" | "q80" | "q8_0" => GgmlDType::Q8_0,
+            "q2k" | "q2_k" => GgmlDType::Q2K,
+            "q3k" | "q3_k" => GgmlDType::Q3K,
+            "q4k" | "q4_k" => GgmlDType::Q4K,
+            "q5k" | "q5_k" => GgmlDType::Q5K,
+            "q6k" | "q6_k" => GgmlDType::Q6K,
+            _ => {
+                tracing::warn!("ISQ: unknown quant type '{}', defaulting to Q4K", quant);
+                GgmlDType::Q4K
+            }
+        }
+    }
+
+    fn compatible_ggml_dtype(
+        weight: &Tensor,
+        ggml_dtype: quantized::GgmlDType,
+    ) -> Result<Option<quantized::GgmlDType>> {
+        use quantized::GgmlDType;
+        let last_dim = weight.dim(candle_core::D::Minus1)?;
+        if last_dim % ggml_dtype.block_size() == 0 {
+            Ok(Some(ggml_dtype))
+        } else if last_dim % GgmlDType::Q8_0.block_size() == 0 {
+            tracing::warn!(
+                "ISQ: weight {:?} incompatible with {:?} (block_size {}), \
+                falling back to Q8_0 (block_size {})",
+                weight.shape(),
+                ggml_dtype,
+                ggml_dtype.block_size(),
+                GgmlDType::Q8_0.block_size()
+            );
+            Ok(Some(GgmlDType::Q8_0))
+        } else {
+            tracing::warn!(
+                "ISQ: weight {:?} incompatible with any GGUF dtype, keeping unquantized",
+                weight.shape()
+            );
+            Ok(None)
+        }
+    }
+
+    pub fn native_quantize_supported(
+        last_dim: usize,
+        quant: &str,
+        device: &Device,
+    ) -> Result<bool> {
+        use quantized::GgmlDType;
+        let ggml_dtype = Self::ggml_dtype_from_str(quant);
+        let actual_ggml_dtype = if last_dim % ggml_dtype.block_size() == 0 {
+            Some(ggml_dtype)
+        } else if last_dim % GgmlDType::Q8_0.block_size() == 0 {
+            Some(GgmlDType::Q8_0)
+        } else {
+            None
+        };
+        Ok(actual_ggml_dtype
+            .map(|dtype| QTensor::supports_native_quantize(device, dtype))
+            .unwrap_or(false))
+    }
+
     pub fn new<R: std::io::Read + std::io::Seek>(
         ct: &gguf_file::Content,
         r: &mut R,
@@ -551,6 +599,22 @@ impl QLinear {
         }
     }
 
+    pub fn from_arc_qtensor(w: Arc<QTensor>, dtype: DType) -> Self {
+        Self {
+            inner: QMatMul::QTensor(w),
+            bias: None,
+            scales: None,
+            qzeros: None,
+            g_idx: None,
+            workspace: None,
+            group_size: 0,
+            bits: 0,
+            dtype,
+            is_awq: false,
+            transposed_weight: false,
+        }
+    }
+
     pub fn from_linear_x(
         linear: Linear,
         quant: String,
@@ -572,62 +636,68 @@ impl QLinear {
                 )
             }
             None => {
-                use quantized::GgmlDType;
-                let ggml_dtype = match quant.as_str() {
-                    "q4_0" | "q40" => GgmlDType::Q4_0,
-                    "q4_1" | "q4" | "q41" => GgmlDType::Q4_1,
-                    "q5_0" | "q50" => GgmlDType::Q5_0,
-                    "q5_1" | "q5" | "q51" => GgmlDType::Q5_1,
-                    "q8_0" | "q8" | "q80" => GgmlDType::Q8_0,
-                    "q2k" | "q2_k" => GgmlDType::Q2K,
-                    "q3k" | "q3_k" => GgmlDType::Q3K,
-                    "q4k" | "q4_k" => GgmlDType::Q4K,
-                    "q5k" | "q5_k" => GgmlDType::Q5K,
-                    "q6k" | "q6_k" => GgmlDType::Q6K,
-                    _ => panic!("Unsupported GGML data type!"),
-                };
-                let weight = linear.weight();
+                let ggml_dtype = Self::ggml_dtype_from_str(quant.as_str());
+                let weight = linear.weight().clone();
                 let qbias = linear.bias().cloned();
                 let dtype = weight.dtype();
-                let last_dim = weight.dim(candle_core::D::Minus1).unwrap();
-                let actual_ggml_dtype = if last_dim % ggml_dtype.block_size() != 0 {
-                    if last_dim % GgmlDType::Q8_0.block_size() == 0 {
-                        tracing::warn!(
-                            "ISQ: weight {:?} incompatible with {:?} (block_size {}), \
-                            falling back to Q8_0 (block_size {})",
-                            weight.shape(),
-                            ggml_dtype,
-                            ggml_dtype.block_size(),
-                            GgmlDType::Q8_0.block_size()
-                        );
-                        GgmlDType::Q8_0
-                    } else {
-                        tracing::warn!(
-                            "ISQ: weight {:?} incompatible with any GGUF dtype, keeping unquantized",
-                            weight.shape()
-                        );
-                        let inner = QMatMul::Tensor(weight.clone());
-                        return QLinear {
-                            inner,
-                            bias: qbias,
-                            scales: None,
-                            qzeros: None,
-                            g_idx: None,
-                            workspace: None,
-                            group_size: 0,
-                            bits: 0,
-                            dtype,
-                            is_awq: false,
-                            transposed_weight: false,
-                        };
-                    }
-                } else {
-                    ggml_dtype
+                let Some(actual_ggml_dtype) =
+                    Self::compatible_ggml_dtype(&weight, ggml_dtype).unwrap()
+                else {
+                    let inner = QMatMul::Tensor(weight);
+                    return QLinear {
+                        inner,
+                        bias: qbias,
+                        scales: None,
+                        qzeros: None,
+                        g_idx: None,
+                        workspace: None,
+                        group_size: 0,
+                        bits: 0,
+                        dtype,
+                        is_awq: false,
+                        transposed_weight: false,
+                    };
                 };
-                let qtensor = QTensor::quantize(weight, actual_ggml_dtype).unwrap();
+                let qtensor = QTensor::quantize_owned(weight, actual_ggml_dtype).unwrap();
                 QLinear::from_qparts_x(qtensor, qbias, dtype, false)
             }
         }
+    }
+
+    pub fn from_linear_x_on_device(
+        linear: Linear,
+        quant: String,
+        quant_config: &Option<QuantConfig>,
+        device: &Device,
+    ) -> Self {
+        if quant_config.is_some() {
+            return Self::from_linear_x(linear, quant, quant_config);
+        }
+        let ggml_dtype = Self::ggml_dtype_from_str(quant.as_str());
+        let weight = linear.weight();
+        let qbias = linear
+            .bias()
+            .map(|b| b.to_device(device).unwrap().to_dtype(DType::F32).unwrap());
+        let dtype = weight.dtype();
+        let Some(actual_ggml_dtype) = Self::compatible_ggml_dtype(weight, ggml_dtype).unwrap()
+        else {
+            let inner = QMatMul::Tensor(weight.to_device(device).unwrap());
+            return QLinear {
+                inner,
+                bias: qbias,
+                scales: None,
+                qzeros: None,
+                g_idx: None,
+                workspace: None,
+                group_size: 0,
+                bits: 0,
+                dtype,
+                is_awq: false,
+                transposed_weight: false,
+            };
+        };
+        let qtensor = QTensor::quantize_on_device(weight, actual_ggml_dtype, device).unwrap();
+        QLinear::from_qparts_x(qtensor, qbias, dtype, false)
     }
 
     pub fn from_old_and_qmatmul(inner: QMatMul, old: &Self) -> Self {
@@ -666,7 +736,7 @@ impl QLinear {
         self.bias.as_mut()
     }
 
-    #[cfg(any(feature = "cuda", feature = "gcu"))]
+    #[cfg(feature = "cuda")]
     pub fn offload(&mut self) -> Result<()> {
         let w = match &self.inner {
             QMatMul::Tensor(qw) => qw.offload()?,
@@ -678,7 +748,7 @@ impl QLinear {
         Ok(())
     }
 
-    #[cfg(any(feature = "cuda", feature = "gcu"))]
+    #[cfg(feature = "cuda")]
     pub fn reload(&mut self) -> Result<()> {
         let w = match &self.inner {
             QMatMul::Tensor(qw) => qw.reload()?,
@@ -784,10 +854,10 @@ impl Module for QLinear {
             (QMatMul::Tensor(qw), Some(scale), qzeros, g_idx, workspace) => {
                 //gptq (only f16/bf16 inputs for marlin format)
                 let x = match *x.dims() {
-                    [bsize, seq_len, _, _] => {
-                        let qw = &qw.broadcast_left((bsize, seq_len))?.t()?;
-                        gptq_matmul(
-                            x,
+                    [bsize, seq_len, dim1, dim2] => {
+                        let x = x.reshape((bsize * seq_len, dim1, dim2))?;
+                        let o = gptq_matmul(
+                            &x,
                             qw,
                             scale,
                             qzeros,
@@ -796,12 +866,24 @@ impl Module for QLinear {
                             self.bits,
                             self.group_size,
                             self.is_awq,
-                        )?
+                        )?;
+                        o.reshape((bsize, seq_len, dim1, ()))?
                     }
-                    [bsize, _, _] => {
-                        let qw = &qw.broadcast_left(bsize)?.t()?;
-                        gptq_matmul(
-                            x,
+                    [_, _, _] => gptq_matmul(
+                        x,
+                        qw,
+                        scale,
+                        qzeros,
+                        g_idx,
+                        workspace,
+                        self.bits,
+                        self.group_size,
+                        self.is_awq,
+                    )?,
+                    [seq_len, dim] => {
+                        let x = x.reshape((1, seq_len, dim))?;
+                        let o = gptq_matmul(
+                            &x,
                             qw,
                             scale,
                             qzeros,
@@ -810,21 +892,8 @@ impl Module for QLinear {
                             self.bits,
                             self.group_size,
                             self.is_awq,
-                        )?
-                    }
-                    [_, _] => {
-                        let qw = &qw.t()?;
-                        gptq_matmul(
-                            x,
-                            qw,
-                            scale,
-                            qzeros,
-                            g_idx,
-                            workspace,
-                            self.bits,
-                            self.group_size,
-                            self.is_awq,
-                        )?
+                        )?;
+                        o.reshape((seq_len, ()))?
                     }
                     _ => panic!("Invalid input format!"),
                 };
@@ -1184,7 +1253,7 @@ impl LinearX {
         }
     }
 
-    #[cfg(any(feature = "cuda", feature = "gcu"))]
+    #[cfg(feature = "cuda")]
     pub fn offload(&mut self) -> Result<()> {
         match self {
             LinearX::Linear(ln) => ln.offload(),
@@ -1195,7 +1264,7 @@ impl LinearX {
         }
     }
 
-    #[cfg(any(feature = "cuda", feature = "gcu"))]
+    #[cfg(feature = "cuda")]
     pub fn reload(&mut self) -> Result<()> {
         match self {
             LinearX::Linear(ln) => ln.reload(),
@@ -1513,13 +1582,20 @@ impl LnMxfp4 {
 
 impl Module for LnMxfp4 {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let input_dtype = x.dtype();
+        let x = if input_dtype == DType::F32 {
+            std::borrow::Cow::Owned(x.to_dtype(DType::BF16)?)
+        } else {
+            std::borrow::Cow::Borrowed(x)
+        };
+
         let orig_dims = x.dims().to_vec();
         let x_2d = if orig_dims.len() > 2 {
             let features = orig_dims[orig_dims.len() - 1];
             let batch_size: usize = orig_dims[..orig_dims.len() - 1].iter().product();
             x.reshape((batch_size, features))?
         } else {
-            x.clone()
+            x.into_owned()
         };
 
         let result = attention_rs::mxfp4_linear::mxfp4_matmul(
@@ -1530,10 +1606,16 @@ impl Module for LnMxfp4 {
             linear_is_prefill(),
         )?;
 
-        if orig_dims.len() > 2 {
+        let result = if orig_dims.len() > 2 {
             let mut new_dims = orig_dims[..orig_dims.len() - 1].to_vec();
             new_dims.push(result.dim(1)?);
-            result.reshape(new_dims)
+            result.reshape(new_dims)?
+        } else {
+            result
+        };
+
+        if input_dtype == DType::F32 {
+            result.to_dtype(DType::F32)
         } else {
             Ok(result)
         }

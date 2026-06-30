@@ -5,7 +5,7 @@ use candle_core::{Device, Result, Tensor};
 #[cfg(feature = "flashinfer")]
 use attention_rs::FlashInferMetadata;
 
-use super::{LLMEngine, PreparedInputs, Sequence, SequenceGroup, PREFILL_CHUNK_SIZE, _PAD_SLOT_ID};
+use super::{LLMEngine, PreparedInputs, Sequence, SequenceGroup, _PAD_SLOT_ID, PREFILL_CHUNK_SIZE};
 use crate::InputMetadata;
 
 impl LLMEngine {
@@ -148,7 +148,9 @@ impl LLMEngine {
 
                 let seqlen_q = num_tokens;
                 let use_cached_kv = num_cached_tokens > 0
-                    && ((cfg!(feature = "flashattn") || cfg!(feature = "flashinfer"))
+                    && ((cfg!(feature = "flash")
+                        || cfg!(feature = "flashattn")
+                        || cfg!(feature = "flashinfer"))
                         || self.scheduler.prefix_cache_enabled());
                 let seqlen_k = if use_cached_kv {
                     num_cached_tokens + num_tokens
@@ -358,6 +360,7 @@ impl LLMEngine {
                     params.out_dtype,
                     None,
                     Some(params.kv_dtype),
+                    false,
                 )?);
             }
 
@@ -398,6 +401,7 @@ impl LLMEngine {
             max_context_len,
             seqlens: Some(cu_seqlens_q_vec[1..].to_vec()),
             flashinfer_metadata,
+            is_mtp_verify: false,
         };
 
         Ok(PreparedInputs {
@@ -612,6 +616,7 @@ impl LLMEngine {
             max_context_len: max_context_len as usize,
             seqlens: None,
             flashinfer_metadata,
+            is_mtp_verify: false,
         };
 
         Ok(PreparedInputs {

@@ -545,6 +545,7 @@ mod graph_gcu {
                     max_context_len: self.max_model_len,
                     seqlens: None,
                     flashinfer_metadata,
+                    is_mtp_verify: false,
                 })
             };
 
