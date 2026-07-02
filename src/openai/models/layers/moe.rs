@@ -13,7 +13,7 @@ use attention_rs::moe;
 #[cfg(not(feature = "gcu"))]
 use attention_rs::moe::moe_gemm_fp8;
 use attention_rs::sort::ArgSortOp;
-use candle::{DType, Module, Result, Tensor, D};
+use candle::{DType, Module, Result, Tensor};
 use candle_core as candle;
 #[cfg(not(feature = "gcu"))]
 use candle_core::quantized::GgmlDType;
@@ -518,11 +518,7 @@ impl FusedMoe {
         ys = ys
             .to_dtype(DType::F32)?
             .reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((num_tokens * hidden_dim, self.num_experts_per_tok))?
-            .sum(D::Minus1)?
-            .reshape((num_tokens, hidden_dim))?
+            .sum(1)?
             .to_dtype(xs.dtype())?;
 
         if self.world_size > 1 {
@@ -609,11 +605,7 @@ impl FusedMoe {
         ys = ys
             .to_dtype(DType::F32)?
             .reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((num_tokens * hidden_dim, self.num_experts_per_tok))?
-            .sum(D::Minus1)?
-            .reshape((num_tokens, hidden_dim))?
+            .sum(1)?
             .to_dtype(xs.dtype())?;
 
         if self.world_size > 1 {
