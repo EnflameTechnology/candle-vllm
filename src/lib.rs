@@ -344,7 +344,10 @@ pub fn compute_workspace_budget(params: &WorkspaceBudgetParams) -> GpuMemoryBudg
             0
         };
 
-    let flash_splitk_bytes: usize = if cfg!(feature = "flash") || cfg!(feature = "flashattn") {
+    let flash_splitk_bytes: usize = if cfg!(feature = "flash")
+        || cfg!(feature = "flashattn")
+        || cfg!(all(feature = "aten", feature = "gcu"))
+    {
         let q_heads_per_shard = params.num_attention_heads / params.num_shards;
         let splits = 8usize;
         let per_layer = 64 * q_heads_per_shard * splits * (params.head_dim + 2) * 4;

@@ -160,7 +160,8 @@ impl CacheEngine {
             feature = "flash",
             feature = "flashattn",
             feature = "flashinfer",
-            feature = "metal"
+            feature = "metal",
+            all(feature = "aten", feature = "gcu")
         ));
         let block_size = cache_config.block_size;
         let element_size = dtype.size_in_bytes();
