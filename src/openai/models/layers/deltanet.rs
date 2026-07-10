@@ -33,6 +33,11 @@ enum GdnProjection {
         in_proj_b: TensorParallelColumnLinear,
         in_proj_a: TensorParallelColumnLinear,
     },
+    // Qwen3.5 TP-safe with both QKV and ZBA merged (1 matmul each).
+    SplitQkvZbaAllMerged {
+        in_proj_qkv: MergedParallelColumnLinear,
+        in_proj_zba: MergedParallelColumnLinear,
+    },
 }
 
 pub struct GatedDeltaNet {
@@ -85,6 +90,62 @@ impl GatedDeltaNet {
             }
         }
         None
+    }
+
+    /// Attempt to merge in_proj_z, in_proj_b, in_proj_a weights into a single
+    /// MergedParallelColumnLinear.  Returns Err if quantization is active
+    /// (ISQ needs per-chunk quant parameters, so merging is unsafe).
+    fn try_merge_zba(
+        vb: &VarBuilder,
+        hidden_size: usize,
+        value_dim_global: usize,
+        num_v_heads_global: usize,
+        comm: Rc<Comm>,
+        dtype: DType,
+        quantization_config: &Option<crate::openai::models::QuantConfig>,
+    ) -> Result<MergedParallelColumnLinear> {
+        use crate::openai::models::linear::{Linear, LinearX};
+
+        // Only merge when unquantized. ISQ uses per-chunk quant types.
+        if quantization_config.is_some() {
+            candle_core::bail!("ZBA merge skipped: quantization active");
+        }
+
+        let rank = comm.rank();
+        let world_size = comm.world_size();
+        let chunks: [(&str, usize); 3] = [
+            ("in_proj_z", value_dim_global),
+            ("in_proj_b", num_v_heads_global),
+            ("in_proj_a", num_v_heads_global),
+        ];
+
+        let mut local_weights = Vec::with_capacity(3);
+        let mut local_splits = Vec::with_capacity(3);
+
+        for (prefix, global_out) in &chunks {
+            let weight = vb.pp(prefix).get((*global_out, hidden_size), "weight")?;
+            let weight = if weight.dtype() != dtype {
+                weight.to_dtype(dtype)?
+            } else {
+                weight
+            };
+            let local_out = global_out / world_size;
+            let local = weight
+                .narrow(0, rank * local_out, local_out)?
+                .contiguous()?;
+            local_weights.push(local);
+            local_splits.push(local_out);
+        }
+
+        let merged_weight = Tensor::cat(&local_weights.iter().collect::<Vec<_>>(), 0)?;
+        let linear = LinearX::Linear(Linear::new(merged_weight, None));
+        let tp = TensorParallelColumnLinear::new(linear);
+
+        Ok(MergedParallelColumnLinear {
+            linears: vec![tp],
+            biases: vec![None],
+            output_splits: Some(local_splits),
+        })
     }
 
     fn load_projection(
@@ -192,6 +253,22 @@ impl GatedDeltaNet {
 
                 match split_qkv_merged {
                     Ok(in_proj_qkv) => {
+                        // Try to merge Z/B/A weights into a single matmul.
+                        // Falls back to separate linears if quantized (ISQ per-chunk).
+                        if let Ok(in_proj_zba) = Self::try_merge_zba(
+                            vb,
+                            hidden_size,
+                            value_dim_global,
+                            num_v_heads_global,
+                            comm.clone(),
+                            dtype,
+                            &quantization_config,
+                        ) {
+                            return Ok(GdnProjection::SplitQkvZbaAllMerged {
+                                in_proj_qkv,
+                                in_proj_zba,
+                            });
+                        }
                         return Ok(GdnProjection::SplitQkvZaMerged {
                             in_proj_qkv,
                             in_proj_z,
@@ -310,18 +387,22 @@ impl GatedDeltaNet {
                 in_proj_b,
                 in_proj_a,
             } => {
-                let qkv = in_proj_qkv.forward(xs)?;
-                if qkv.len() != 3 {
-                    candle_core::bail!(
-                        "Expected 3 chunks from merged in_proj_qkv, got {}",
-                        qkv.len()
-                    );
-                }
-                let mixed_qkv = Tensor::cat(&[&qkv[0], &qkv[1], &qkv[2]], 1)?;
+                let mixed_qkv = in_proj_qkv.forward_full(xs)?;
                 let z = in_proj_z.forward(xs)?;
                 let b = in_proj_b.forward(xs)?;
                 let a = in_proj_a.forward(xs)?;
                 Ok((mixed_qkv, z, b, a))
+            }
+            GdnProjection::SplitQkvZbaAllMerged {
+                in_proj_qkv,
+                in_proj_zba,
+            } => {
+                let mixed_qkv = in_proj_qkv.forward_full(xs)?;
+                let zba = in_proj_zba.forward(xs)?;
+                if zba.len() != 3 {
+                    candle_core::bail!("Expected 3 chunks from merged ZBA, got {}", zba.len());
+                }
+                Ok((mixed_qkv, zba[0].clone(), zba[1].clone(), zba[2].clone()))
             }
         }
     }
@@ -372,6 +453,11 @@ impl GatedDeltaNet {
 
         let is_quantized = config.quantization_config.is_some();
         let dtype = vb.dtype();
+        // GCU GDN kernels all accept BF16 activations natively (F32 accum internally).
+        // Only CUDA Metal backends may need F32 for f16 mode precision.
+        #[cfg(feature = "gcu")]
+        let kernel_dtype = dtype;
+        #[cfg(not(feature = "gcu"))]
         let kernel_dtype = if config.is_f16_mode {
             DType::F32
         } else {
@@ -569,30 +655,38 @@ impl GatedDeltaNet {
         let k_conv = kv_conv.narrow(1, self.key_dim, self.key_dim)?;
         let v_conv = kv_conv.narrow(1, self.key_dim * 2, self.value_dim)?;
 
-        // Fused GDN gating
-        #[cfg(feature = "gcu")]
-        let (g, beta) = gdn::fused_gdn_gating(&self.a_log, &a, &b, &self.dt_bias)?;
-        #[cfg(not(feature = "gcu"))]
-        let (g, beta) = {
-            let (a_expanded, b_expanded) = (a.unsqueeze(0)?, b.unsqueeze(0)?);
-            let (g, beta) =
-                gdn::fused_gdn_gating(&self.a_log, &a_expanded, &b_expanded, &self.dt_bias)?;
-            (g.squeeze(0)?, beta.squeeze(0)?)
-        };
-
         let q = q_conv.reshape((token_count, self.num_k_heads, self.head_k_dim))?;
         let k = k_conv.reshape((token_count, self.num_k_heads, self.head_k_dim))?;
         let v = v_conv.reshape((token_count, self.num_v_heads, self.head_v_dim))?;
-        let q = gdn::l2_norm_last_dim(&q, 1e-6)?;
-        let k = gdn::l2_norm_last_dim(&k, 1e-6)?;
 
-        let output = if is_prefill {
+        let gated_output = if is_prefill {
+            let q = gdn::l2_norm_last_dim(&q, 1e-6)?;
+            let k = gdn::l2_norm_last_dim(&k, 1e-6)?;
+
+            let (g, beta) = {
+                #[cfg(feature = "gcu")]
+                {
+                    gdn::fused_gdn_gating(&self.a_log, &a, &b, &self.dt_bias)?
+                }
+                #[cfg(not(feature = "gcu"))]
+                {
+                    let (a_expanded, b_expanded) = (a.unsqueeze(0)?, b.unsqueeze(0)?);
+                    let (g, beta) = gdn::fused_gdn_gating(
+                        &self.a_log,
+                        &a_expanded,
+                        &b_expanded,
+                        &self.dt_bias,
+                    )?;
+                    (g.squeeze(0)?, beta.squeeze(0)?)
+                }
+            };
+
             let cu_seqlens = input_metadata
                 .cu_seqlens_q
                 .as_ref()
                 .expect("cu_seqlens_q must be present in prefill!");
             let global_state = mamba_cache.recurrent_state_mut(self.gdn_layer_idx);
-            {
+            let output = {
                 let (q, k) = if self.num_k_heads != self.num_v_heads {
                     (self.repeat_kv_heads(q)?, self.repeat_kv_heads(k)?)
                 } else {
@@ -609,46 +703,54 @@ impl GatedDeltaNet {
                     seq_slots,
                     &cu_seqlens,
                 )?
-            }
+            };
+            let output = output.reshape((token_count, self.value_dim))?;
+            gdn::gated_rmsnorm_silu_mul(
+                &output,
+                &z,
+                &self.gdn_norm_weight,
+                self.gdn_norm_bias.as_ref(),
+                self.rms_norm_eps,
+                self.head_v_dim,
+            )?
         } else {
+            // Decode: L2Norm + gating + GQA recurrence + RMSNorm + SiLU(z)
+            // fused in a single Choreo kernel launch.  Replaces the five
+            // separate kernels: l2_norm_last_dim(q), l2_norm_last_dim(k),
+            // fused_gdn_gating, gated_delta_rule_decode_slots_gqa,
+            // reshape_output, and gated_rmsnorm_silu_mul.
             let batch = slot_count;
+            let q_b = q.reshape((batch, self.num_k_heads, self.head_k_dim))?;
+            let k_b = k.reshape((batch, self.num_k_heads, self.head_k_dim))?;
             let v_b = v.reshape((batch, self.num_v_heads, self.head_v_dim))?;
-            let g_b = g.reshape((batch, self.num_v_heads))?;
-            let beta_b = beta.reshape((batch, self.num_v_heads))?;
+            let a_b = a.reshape((batch, self.num_v_heads))?;
+            let b_b = b.reshape((batch, self.num_v_heads))?;
+            let z_b = z.reshape((batch, self.value_dim))?;
             let global_state = mamba_cache.recurrent_state_mut(self.gdn_layer_idx);
-            let (q, k) = (
-                self.repeat_kv_heads(q.clone())?,
-                self.repeat_kv_heads(k.clone())?,
-            );
-            let q_b = (q.reshape((batch, self.num_v_heads, self.head_k_dim))? * self.scale)?;
-            let k_b = k.reshape((batch, self.num_v_heads, self.head_k_dim))?;
-            gdn::gated_delta_rule_decode_slots(
+            gdn::gated_delta_rule_decode_l2norm_recurrence_post_fused(
                 &q_b,
                 &k_b,
                 &v_b,
-                &g_b,
-                &beta_b,
+                &a_b,
+                &b_b,
+                &self.a_log,
+                &self.dt_bias,
+                &z_b,
                 global_state,
                 seq_slots,
+                &self.gdn_norm_weight,
+                self.scale as f32,
             )?
         };
 
-        // output: [seq_len, num_v_heads, head_v_dim] -> [seq_len, value_dim]
-        let output = output.reshape((token_count, self.value_dim))?;
+        let gated_output = if gated_output.dtype() != self.projection_dtype {
+            gated_output.to_dtype(self.projection_dtype)?
+        } else {
+            gated_output
+        };
 
-        // Gated RMSNorm: norm(output) * silu(z) via fused kernel
-        let gated_output = gdn::gated_rmsnorm_silu_mul(
-            &output,
-            &z,
-            &self.gdn_norm_weight,
-            self.gdn_norm_bias.as_ref(),
-            self.rms_norm_eps,
-            self.head_v_dim,
-        )?;
+        let out = self.out_proj.forward(&gated_output)?;
 
-        let out = self
-            .out_proj
-            .forward(&gated_output.to_dtype(self.projection_dtype)?)?;
         if out.dtype() != original_dtype {
             out.to_dtype(original_dtype)
         } else {

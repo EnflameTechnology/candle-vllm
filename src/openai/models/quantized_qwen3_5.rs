@@ -483,17 +483,16 @@ impl QuantizedGatedDeltaNet {
             }
         } else {
             let batch = slot_count;
+            // GQA decode: pass q/k with num_k_heads (NOT expanded to num_v_heads).
+            // The GQA kernel fuses GQA repeat (index-based, no copy), q_scale
+            // multiplication, and exp(g) into a single kernel launch.
+            let q_b = q.reshape((batch, self.num_k_heads, self.head_k_dim))?;
+            let k_b = k.reshape((batch, self.num_k_heads, self.head_k_dim))?;
             let v_b = v.reshape((batch, self.num_v_heads, self.head_v_dim))?;
             let g_b = g.reshape((batch, self.num_v_heads))?;
             let beta_b = beta.reshape((batch, self.num_v_heads))?;
             let global_state = mamba_cache.recurrent_state_mut(self.gdn_layer_idx);
-            let (q, k) = (
-                self.repeat_kv_heads(q.clone())?,
-                self.repeat_kv_heads(k.clone())?,
-            );
-            let q_b = (q.reshape((batch, self.num_v_heads, self.head_k_dim))? * self.scale)?;
-            let k_b = k.reshape((batch, self.num_v_heads, self.head_k_dim))?;
-            gdn::gated_delta_rule_decode_slots(
+            gdn::gated_delta_rule_decode_slots_gqa(
                 &q_b,
                 &k_b,
                 &v_b,
@@ -501,6 +500,7 @@ impl QuantizedGatedDeltaNet {
                 &beta_b,
                 global_state,
                 seq_slots,
+                self.scale as f32,
             )?
         };
 
