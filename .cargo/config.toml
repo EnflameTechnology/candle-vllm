@@ -1,5 +1,2 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
-
 [env]
 ATOMIC_URL = "https://github.com/EnflameTechnology/Ubridge/releases/download/v0.1.0/"
