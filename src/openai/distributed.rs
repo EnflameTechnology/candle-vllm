@@ -487,6 +487,24 @@ impl MergedParallelColumnLinear {
         }
     }
 
+    /// Forward returning the full merged output without splitting into chunks.
+    /// Use this when downstream code needs the concatenated output anyway
+    /// (e.g. GDN mixed_qkv passed directly to conv1d), avoiding the
+    /// narrow + Tensor::cat round-trip that `forward()` would require.
+    pub fn forward_full(&self, x: &Tensor) -> Result<Tensor> {
+        if self.linears.len() == 1 {
+            let mut ys = self.linears[0].forward(x)?;
+            if let Some(Some(bias)) = self.biases.first() {
+                ys = ys.broadcast_add(bias)?;
+            }
+            return Ok(ys);
+        }
+        // Fallback: multiple linears — matmul each and cat
+        let parts = self.forward(x)?;
+        let dim = parts[0].dims().len().saturating_sub(1);
+        Tensor::cat(&parts.iter().collect::<Vec<_>>(), dim)
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Vec<Tensor>> {
         if let Some(output_splits) = &self.output_splits {
             if self.linears.len() != 1 {
@@ -512,7 +530,10 @@ impl MergedParallelColumnLinear {
             let mut outputs = Vec::with_capacity(output_splits.len());
             let mut start = 0usize;
             for split_size in output_splits {
-                outputs.push(ys.narrow(split_dim, start, *split_size)?.contiguous()?);
+                // No .contiguous() here — matmul output is already
+                // contiguous in the last dim for decode; downstream
+                // Tensor::cat handles strided views just fine.
+                outputs.push(ys.narrow(split_dim, start, *split_size)?);
                 start += *split_size;
             }
             return Ok(outputs);
@@ -1038,30 +1059,61 @@ impl MergedParallelColumnLinear {
             } else {
                 weight
             };
-            let mut chunk_start = 0;
-            for chunk_idx in 0..chunks.len() {
-                let chunk_size = chunks[chunk_idx];
-                let ws = weight.narrow(chunk_dim, chunk_start, chunk_size)?;
-                let c_chunk_size = ws.dim(0)? / comm.world_size();
-                let ws_chunk = ws
-                    .narrow(0, comm.rank() * c_chunk_size, c_chunk_size)?
-                    .contiguous()?;
-                chunk_start += chunk_size;
 
-                let ln = crate::openai::models::linear::Linear::new(ws_chunk, None);
-                let linear = if let Some(quantized_type) = quant {
+            if quant.is_none() {
+                // Fused path: merge all chunk weights into one big matrix for
+                // a single matmul, then split via output_splits.  Eliminates
+                // N separate matmul launches + downstream Tensor::cat.
+                let mut local_weights = Vec::with_capacity(chunks.len());
+                let mut local_output_splits = Vec::with_capacity(chunks.len());
+                let mut chunk_start = 0;
+                for &chunk_size in &chunks {
+                    let ws = weight.narrow(chunk_dim, chunk_start, chunk_size)?;
+                    let local_out = ws.dim(0)? / comm.world_size();
+                    let ws_chunk = ws
+                        .narrow(0, comm.rank() * local_out, local_out)?
+                        .contiguous()?;
+                    local_weights.push(ws_chunk);
+                    local_output_splits.push(local_out);
+                    chunk_start += chunk_size;
+                }
+                let merged_weight = Tensor::cat(
+                    &local_weights.iter().collect::<Vec<_>>(),
+                    0,
+                )?;
+                let linear = LinearX::Linear(Linear::new(merged_weight, None));
+                vec_linear.push(TensorParallelColumnLinear { linear, bias: None });
+                output_splits = Some(local_output_splits);
+            } else {
+                // ISQ per-chunk path: each chunk may use a different
+                // quantization precision, so they must stay separate.
+                let mut chunk_start = 0;
+                for chunk_idx in 0..chunks.len() {
+                    let chunk_size = chunks[chunk_idx];
+                    let ws = weight.narrow(chunk_dim, chunk_start, chunk_size)?;
+                    let c_chunk_size = ws.dim(0)? / comm.world_size();
+                    let ws_chunk = ws
+                        .narrow(0, comm.rank() * c_chunk_size, c_chunk_size)?
+                        .contiguous()?;
+                    chunk_start += chunk_size;
+
+                    let ln = crate::openai::models::linear::Linear::new(ws_chunk, None);
                     let quantized_type = if chunk_idx == chunks.len() - 1 {
-                        crate::openai::models::layers::isq_high_precision_quant(quantized_type)
-                            .to_string()
+                        crate::openai::models::layers::isq_high_precision_quant(
+                            quant.as_ref().unwrap(),
+                        )
+                        .to_string()
                     } else {
-                        quantized_type.clone()
+                        quant.as_ref().unwrap().clone()
                     };
-                    LinearX::QLinear(QLinear::from_linear_x(ln, quantized_type, quant_cfg))
-                } else {
-                    LinearX::Linear(ln)
-                };
-                let ln = TensorParallelColumnLinear { linear, bias: None };
-                vec_linear.push(ln);
+                    let linear = LinearX::QLinear(QLinear::from_linear_x(
+                        ln,
+                        quantized_type,
+                        quant_cfg,
+                    ));
+                    let ln = TensorParallelColumnLinear { linear, bias: None };
+                    vec_linear.push(ln);
+                }
             }
         }
 
