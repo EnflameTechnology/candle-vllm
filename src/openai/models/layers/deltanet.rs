@@ -453,11 +453,6 @@ impl GatedDeltaNet {
 
         let is_quantized = config.quantization_config.is_some();
         let dtype = vb.dtype();
-        // GCU GDN kernels all accept BF16 activations natively (F32 accum internally).
-        // Only CUDA Metal backends may need F32 for f16 mode precision.
-        #[cfg(feature = "gcu")]
-        let kernel_dtype = dtype;
-        #[cfg(not(feature = "gcu"))]
         let kernel_dtype = if config.is_f16_mode {
             DType::F32
         } else {
@@ -727,7 +722,7 @@ impl GatedDeltaNet {
             let b_b = b.reshape((batch, self.num_v_heads))?;
             let z_b = z.reshape((batch, self.value_dim))?;
             let global_state = mamba_cache.recurrent_state_mut(self.gdn_layer_idx);
-            gdn::gated_delta_rule_decode_l2norm_recurrence_post_fused(
+            gdn::gated_delta_rule_decode_recurrence_fused(
                 &q_b,
                 &k_b,
                 &v_b,
