@@ -1877,7 +1877,10 @@ impl DefaultPipeline {
                     kv_dtype: _kv_cache_dtype,
                     out_dtype: dtype,
                     page_size: block_size,
-                    num_kv_heads: kv_heads / _num_shards,
+                    num_kv_heads: crate::openai::distributed::local_num_kv_heads(
+                        kv_heads,
+                        _num_shards,
+                    ),
                     head_dim: hd,
                     num_qo_heads: config.num_attention_heads / _num_shards,
                 })
@@ -1890,10 +1893,12 @@ impl DefaultPipeline {
                 kv_dtype: _kv_cache_dtype,
                 out_dtype: dtype,
                 page_size: block_size,
-                num_kv_heads: config
-                    .num_key_value_heads
-                    .unwrap_or(config.num_attention_heads)
-                    / _num_shards,
+                num_kv_heads: crate::openai::distributed::local_num_kv_heads(
+                    config
+                        .num_key_value_heads
+                        .unwrap_or(config.num_attention_heads),
+                    _num_shards,
+                ),
                 head_dim: config.k_head_dim(),
                 num_qo_heads: config.num_attention_heads / _num_shards,
             })
@@ -1978,11 +1983,14 @@ impl DefaultPipeline {
         if !input_metadata.is_prefill {
             let input_batch = input_tokens.dim(0)?;
             let require_exact_graph = input_metadata.mamba_slot_mapping.is_some();
-            let can_replay = if require_exact_graph {
-                self.capturer.is_exact_captured(input_batch)
-            } else {
-                self.capturer.is_captured(input_batch)
-            };
+            let context_fits_graph =
+                input_metadata.max_context_len <= crate::backend::graph::GRAPH_FA_MAX_CONTEXT_LEN;
+            let can_replay = context_fits_graph
+                && if require_exact_graph {
+                    self.capturer.is_exact_captured(input_batch)
+                } else {
+                    self.capturer.is_captured(input_batch)
+                };
             if can_replay {
                 return match &self.model {
                     LLMModel::Qwen3_5(model) => {
@@ -2600,6 +2608,15 @@ impl DefaultPipeline {
 
     #[cfg(all(feature = "gcu", feature = "graph"))]
     pub fn warmup_capture(&mut self, kv_caches: Option<&Vec<(Tensor, Tensor)>>) -> Result<()> {
+        #[cfg(feature = "aten")]
+        {
+            tracing::warn!(
+                "Skipping GCU CUDA graph capture with Aten FA — topsfa flash \
+                 attention is not full-graph-safe yet; using eager decode"
+            );
+            return Ok(());
+        }
+        #[cfg(not(feature = "aten"))]
         match &self.model {
             LLMModel::Phi4(_) => Ok(()),
             LLMModel::Phi3GGUF(_) => Ok(()),

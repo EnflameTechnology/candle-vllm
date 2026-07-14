@@ -361,6 +361,7 @@ mod graph_gcu {
         pub slot_mapping: Tensor,
         pub context_lens: Tensor,
         pub block_tables: Tensor,
+        pub cu_seqlens_q: Tensor,
         #[cfg(feature = "flashinfer")]
         pub flashinfer_indptr: Tensor,
         #[cfg(feature = "flashinfer")]
@@ -435,8 +436,13 @@ mod graph_gcu {
                 device,
             )?;
             let slot_mapping = Tensor::zeros((max_bs,), DType::I64, device)?;
-            let context_lens = Tensor::zeros((max_bs,), DType::U32, device)?;
+            let context_lens = Tensor::ones((max_bs,), DType::U32, device)?;
             let block_tables = Tensor::zeros((max_bs, max_num_blocks), DType::U32, device)?;
+            let cu_seqlens_q = Tensor::from_vec(
+                (0..=max_bs as u32).collect::<Vec<_>>(),
+                (max_bs + 1,),
+                device,
+            )?;
             #[cfg(feature = "flashinfer")]
             let (flashinfer_indptr, flashinfer_indices, flashinfer_last_len, last_len_host) = {
                 let mut indptr = Vec::with_capacity(max_bs + 1);
@@ -538,11 +544,11 @@ mod graph_gcu {
                     slot_mapping: slot_mapping.narrow(0, 0, bs)?,
                     block_tables: Some(block_tables.narrow(0, 0, bs)?),
                     context_lens: Some(context_lens.narrow(0, 0, bs)?),
-                    cu_seqlens_q: None,
+                    cu_seqlens_q: Some(cu_seqlens_q.narrow(0, 0, bs + 1)?),
                     cu_seqlens_k: None,
-                    max_seqlen_q: 0,
-                    max_seqlen_k: 0,
-                    max_context_len: self.max_model_len,
+                    max_seqlen_q: 1,
+                    max_seqlen_k: graph_context_len,
+                    max_context_len: graph_context_len,
                     seqlens: None,
                     flashinfer_metadata,
                     is_mtp_verify: false,
@@ -588,6 +594,7 @@ mod graph_gcu {
                 slot_mapping,
                 context_lens,
                 block_tables,
+                cu_seqlens_q,
                 #[cfg(feature = "flashinfer")]
                 flashinfer_indptr,
                 #[cfg(feature = "flashinfer")]

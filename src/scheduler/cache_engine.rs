@@ -1,3 +1,4 @@
+use crate::openai::distributed::local_num_kv_heads;
 use crate::openai::models::{Config, KvCacheDtype};
 use candle_core::{DType, Device, Result, Tensor};
 #[cfg(not(feature = "gcu"))]
@@ -177,7 +178,7 @@ impl CacheEngine {
             }
             let mut cache = Vec::new();
             for (layer_kv_heads, layer_head_dim) in configs.iter().copied() {
-                let kv_heads = layer_kv_heads / num_shards.max(1);
+                let kv_heads = local_num_kv_heads(layer_kv_heads, num_shards);
                 if use_flash_layout && layer_head_dim <= 256 {
                     let key_blocks = Tensor::zeros(
                         (num_blocks, block_size, kv_heads, layer_head_dim),
@@ -276,7 +277,10 @@ impl CacheEngine {
         let element_size = dtype.size_in_bytes();
         let x = 16 / element_size;
         (
-            cfg.num_key_value_heads.unwrap_or(cfg.num_attention_heads) / num_shards,
+            local_num_kv_heads(
+                cfg.num_key_value_heads.unwrap_or(cfg.num_attention_heads),
+                num_shards,
+            ),
             cfg.k_head_dim() / x,
             block_size,
             x,
@@ -289,7 +293,10 @@ impl CacheEngine {
         num_shards: usize,
     ) -> (usize, usize, usize) {
         (
-            cfg.num_key_value_heads.unwrap_or(cfg.num_attention_heads) / num_shards,
+            local_num_kv_heads(
+                cfg.num_key_value_heads.unwrap_or(cfg.num_attention_heads),
+                num_shards,
+            ),
             cfg.v_head_dim(),
             block_size,
         )
@@ -307,7 +314,10 @@ impl CacheEngine {
 
         (
             block_size,
-            cfg.num_key_value_heads.unwrap_or(cfg.num_attention_heads) / num_shards,
+            local_num_kv_heads(
+                cfg.num_key_value_heads.unwrap_or(cfg.num_attention_heads),
+                num_shards,
+            ),
             head_dim,
         )
     }
@@ -382,13 +392,15 @@ impl CacheEngine {
         for layer_idx in 0..num_kv_layers {
             let (kv_heads, hd) = if let Some(ref configs) = per_layer_config {
                 let (h, d) = configs[layer_idx];
-                (h / num_shards, d)
+                (local_num_kv_heads(h, num_shards), d)
             } else {
                 (
-                    model_config
-                        .num_key_value_heads
-                        .unwrap_or(model_config.num_attention_heads)
-                        / num_shards,
+                    local_num_kv_heads(
+                        model_config
+                            .num_key_value_heads
+                            .unwrap_or(model_config.num_attention_heads),
+                        num_shards,
+                    ),
                     model_config
                         .head_dim
                         .unwrap_or(model_config.hidden_size / model_config.num_attention_heads),

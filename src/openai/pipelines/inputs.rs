@@ -509,7 +509,7 @@ impl LLMEngine {
             self.prepare_mamba_slot_mapping(&sequence_ids, false, rank, device)?;
         #[cfg(feature = "flashinfer")]
         let flashinfer_metadata = if self.flashinfer_kv_params_for_rank(rank)?.is_some() {
-            #[cfg(all(feature = "cuda", feature = "graph"))]
+            #[cfg(all(any(feature = "cuda", feature = "gcu"), feature = "graph"))]
             let use_cuda_graph = {
                 let (pipeline, _) = self.get_pipeline(rank).ok_or_else(|| {
                     candle_core::Error::msg(format!("missing pipeline for rank {rank}"))
@@ -525,7 +525,7 @@ impl LLMEngine {
                     pipeline.capturer.is_captured(length)
                 }
             };
-            #[cfg(not(all(feature = "cuda", feature = "graph")))]
+            #[cfg(not(all(any(feature = "cuda", feature = "gcu"), feature = "graph")))]
             let use_cuda_graph = false;
 
             let mut indptr = vec![0u32];
@@ -602,6 +602,12 @@ impl LLMEngine {
         };
         #[cfg(not(feature = "flashinfer"))]
         let flashinfer_metadata = None;
+        // Decode FA (topsfa varlen): one query token per seq → cu_seqlens [0,1,...,B].
+        let cu_seqlens_q = Tensor::from_vec(
+            (0..=length as u32).collect::<Vec<_>>(),
+            (length + 1,),
+            device,
+        )?;
         let input_metadata = InputMetadata {
             is_prefill: false,
             is_mla: self.config.is_mla(),
@@ -610,10 +616,10 @@ impl LLMEngine {
             slot_mapping,
             block_tables: Some(block_tables),
             context_lens: Some(context_lens),
-            cu_seqlens_q: None,
+            cu_seqlens_q: Some(cu_seqlens_q),
             cu_seqlens_k: None,
-            max_seqlen_q: 0,
-            max_seqlen_k: 0,
+            max_seqlen_q: 1,
+            max_seqlen_k: max_context_len as usize,
             max_context_len: max_context_len as usize,
             seqlens: None,
             flashinfer_metadata,

@@ -3,7 +3,7 @@ use super::rotary_emb::ScalingRotaryEmbedding;
 #[cfg(feature = "eccl")]
 use crate::openai::distributed::AllReduce;
 use crate::openai::distributed::{
-    rms_norm_sharded, rms_norm_x, shard, Comm, MergedParallelColumnLinear, Rc,
+    rms_norm_sharded, rms_norm_x, shard, tp_kv_head_sharding, Comm, MergedParallelColumnLinear, Rc,
     TensorParallelColumnLinear, TensorParallelRowLinear, VarBuilder,
 };
 use crate::openai::models::layers::qrmsnorm::QRmsNorm;
@@ -11,6 +11,7 @@ use crate::openai::models::Config;
 use crate::{InputMetadata, PagedAttention};
 use candle_core::quantized::QMatMul;
 use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_nn::var_builder::Shard;
 use candle_nn::RmsNorm;
 
 use std::sync::Arc;
@@ -199,13 +200,13 @@ impl Attention {
         quant_cfg: &Option<crate::openai::models::QuantConfig>,
         quant: &Option<String>,
         k_eq_v: bool,
+        kv_shard: Shard,
     ) -> Result<Option<QkvProjection>> {
         if quant.is_some() {
             return Ok(None);
         }
 
         let q_shard = shard(0, comm.rank(), comm.world_size());
-        let kv_shard = shard(0, comm.rank(), comm.world_size());
         let q_vb = vb.pp("q_proj");
         let k_vb = vb.pp("k_proj");
         let v_vb = if k_eq_v {
@@ -414,6 +415,8 @@ impl Attention {
         };
         let attn_output_gate = is_qwen35_or_next;
         let q_out_dim = num_heads * head_dim * if attn_output_gate { 2 } else { 1 };
+        let (local_kv_heads, kv_shard) =
+            tp_kv_head_sharding(num_kv_heads, comm.rank(), comm.world_size())?;
         let qkv_proj = if let Some(packed) = Self::try_load_packed_qkv(
             &vb,
             hidden_sz,
@@ -425,6 +428,7 @@ impl Attention {
             &cfg.quantization_config,
             &cfg.isq_quant,
             k_eq_v,
+            kv_shard,
         )? {
             packed
         } else {
@@ -437,12 +441,12 @@ impl Attention {
                 &cfg.isq_quant,
                 &cfg.quantization_config,
             )?;
-            let k_proj = TensorParallelColumnLinear::load_with_hints(
+            let k_proj = TensorParallelColumnLinear::load_with_shard(
                 hidden_sz,
                 num_kv_heads * head_dim,
                 attention_bias,
                 vb.pp("k_proj"),
-                comm.clone(),
+                kv_shard,
                 &cfg.isq_quant,
                 &cfg.quantization_config,
             )?;
@@ -461,12 +465,12 @@ impl Attention {
             } else {
                 &cfg.isq_quant
             };
-            let v_proj = TensorParallelColumnLinear::load_with_hints(
+            let v_proj = TensorParallelColumnLinear::load_with_shard(
                 hidden_sz,
                 num_kv_heads * head_dim,
                 attention_bias,
                 vb.pp(if k_eq_v { "k_proj" } else { "v_proj" }),
-                comm.clone(),
+                kv_shard,
                 v_proj_quant,
                 &cfg.quantization_config,
             )?;
@@ -511,7 +515,6 @@ impl Attention {
             )
         } else {
             let q_shard = shard(0, comm.rank(), comm.world_size());
-            let kv_shard = shard(0, comm.rank(), comm.world_size());
             let q_full = rms_norm_sharded(
                 num_heads * head_dim,
                 cfg.rms_norm_eps,
@@ -563,11 +566,8 @@ impl Attention {
         assert!(cfg.num_attention_heads >= comm.world_size());
         assert!(cfg.num_attention_heads % comm.world_size() == 0);
 
-        assert!(cfg.num_key_value_heads.unwrap() >= comm.world_size());
-        assert!(cfg.num_key_value_heads.unwrap() % comm.world_size() == 0);
-
         let attention_heads = cfg.num_attention_heads / comm.world_size();
-        let kv_heads = cfg.num_key_value_heads.unwrap() / comm.world_size();
+        let kv_heads = local_kv_heads;
         Ok(Self {
             qkv_proj,
             o_proj,

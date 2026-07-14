@@ -737,6 +737,52 @@ pub fn shard(dim: usize, rank: usize, world_size: usize) -> candle_nn::var_build
         world_size,
     }
 }
+
+/// Local KV-head count per tensor-parallel rank.
+///
+/// When `num_shards > num_kv_heads` and shards evenly cover KV heads (GQA
+/// replication), each rank still owns at least one KV head.
+pub fn local_num_kv_heads(num_kv_heads: usize, num_shards: usize) -> usize {
+    std::cmp::max(1, num_kv_heads / num_shards.max(1))
+}
+
+/// Resolve per-rank KV head count and the weight shard for K/V projections.
+///
+/// Supports:
+/// - Partitioning: `num_kv_heads % world_size == 0`
+/// - Replication: `world_size % num_kv_heads == 0` when TP exceeds KV heads
+pub fn tp_kv_head_sharding(
+    num_kv_heads: usize,
+    rank: usize,
+    world_size: usize,
+) -> Result<(usize, Shard)> {
+    let world_size = world_size.max(1);
+    if world_size == 1 {
+        return Ok((num_kv_heads, Shard::default()));
+    }
+    if num_kv_heads >= world_size {
+        if num_kv_heads % world_size != 0 {
+            candle_core::bail!(
+                "num_key_value_heads ({}) must be divisible by world_size ({})",
+                num_kv_heads,
+                world_size
+            );
+        }
+        Ok((num_kv_heads / world_size, shard(0, rank, world_size)))
+    } else {
+        if world_size % num_kv_heads != 0 {
+            candle_core::bail!(
+                "world_size ({}) must be divisible by num_key_value_heads ({}) \
+                 when tensor parallel size exceeds KV heads (GQA replication)",
+                world_size,
+                num_kv_heads
+            );
+        }
+        let num_replicas = world_size / num_kv_heads;
+        let kv_rank = rank / num_replicas;
+        Ok((1, shard(0, kv_rank, num_kv_heads)))
+    }
+}
 use crate::openai::models::QuantConfig;
 impl TensorParallelColumnLinear {
     pub fn load_with_hints(
@@ -1077,10 +1123,7 @@ impl MergedParallelColumnLinear {
                     local_output_splits.push(local_out);
                     chunk_start += chunk_size;
                 }
-                let merged_weight = Tensor::cat(
-                    &local_weights.iter().collect::<Vec<_>>(),
-                    0,
-                )?;
+                let merged_weight = Tensor::cat(&local_weights.iter().collect::<Vec<_>>(), 0)?;
                 let linear = LinearX::Linear(Linear::new(merged_weight, None));
                 vec_linear.push(TensorParallelColumnLinear { linear, bias: None });
                 output_splits = Some(local_output_splits);
@@ -1106,11 +1149,8 @@ impl MergedParallelColumnLinear {
                     } else {
                         quant.as_ref().unwrap().clone()
                     };
-                    let linear = LinearX::QLinear(QLinear::from_linear_x(
-                        ln,
-                        quantized_type,
-                        quant_cfg,
-                    ));
+                    let linear =
+                        LinearX::QLinear(QLinear::from_linear_x(ln, quantized_type, quant_cfg));
                     let ln = TensorParallelColumnLinear { linear, bias: None };
                     vec_linear.push(ln);
                 }

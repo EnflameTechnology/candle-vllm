@@ -444,7 +444,7 @@ impl LLMEngine {
         let num_seqs = payload.sequence_ids.len();
         let length = payload.input_ids.len();
 
-        #[cfg(all(feature = "cuda", feature = "graph"))]
+        #[cfg(all(any(feature = "cuda", feature = "gcu"), feature = "graph"))]
         let use_cuda_graph = if !payload.is_prefill {
             let (pipeline, _) = engine.get_pipeline(0).unwrap();
             let require_exact_graph = metadata.mamba_slot_mapping.is_some();
@@ -456,7 +456,7 @@ impl LLMEngine {
         } else {
             false
         };
-        #[cfg(not(all(feature = "cuda", feature = "graph")))]
+        #[cfg(not(all(any(feature = "cuda", feature = "gcu"), feature = "graph")))]
         let use_cuda_graph = host.use_cuda_graph;
 
         let (batch_indices, positions_fi) = if payload.is_prefill {

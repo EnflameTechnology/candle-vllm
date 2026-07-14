@@ -170,14 +170,18 @@ pub fn get_cache_config(
     } else if let Some(ref per_layer_cfg) = config.gemma4_per_layer_cache_config() {
         let mut total = 0usize;
         for &(kv_heads, head_dim) in per_layer_cfg {
-            let kv_heads_sharded = kv_heads / num_shards;
+            let kv_heads_sharded =
+                crate::openai::distributed::local_num_kv_heads(kv_heads, num_shards);
             total += block_size * kv_heads_sharded * head_dim * dsize * 2;
         }
         total
     } else {
         dsize
             * block_size
-            * (config.num_key_value_heads.unwrap() / num_shards)
+            * crate::openai::distributed::local_num_kv_heads(
+                config.num_key_value_heads.unwrap(),
+                num_shards,
+            )
             * config.k_head_dim()
             * kv_layers
             * 2
@@ -189,12 +193,16 @@ pub fn get_cache_config(
                 per_layer_cfg
                     .iter()
                     .map(|&(kv_heads, hd)| {
-                        let heads = kv_heads / num_shards;
+                        let heads =
+                            crate::openai::distributed::local_num_kv_heads(kv_heads, num_shards);
                         block_size * heads * 4 + block_size * heads * (hd / 2)
                     })
                     .sum()
             } else {
-                let heads = config.num_key_value_heads.unwrap() / num_shards;
+                let heads = crate::openai::distributed::local_num_kv_heads(
+                    config.num_key_value_heads.unwrap(),
+                    num_shards,
+                );
                 let hd = config.k_head_dim();
                 (block_size * heads * 4 + block_size * heads * (hd / 2)) * kv_layers
             }
@@ -204,12 +212,16 @@ pub fn get_cache_config(
                 per_layer_cfg
                     .iter()
                     .map(|&(kv_heads, hd)| {
-                        let heads = kv_heads / num_shards;
+                        let heads =
+                            crate::openai::distributed::local_num_kv_heads(kv_heads, num_shards);
                         block_size * heads * 4 * 2 + block_size * heads * (hd / 2) * 2
                     })
                     .sum()
             } else {
-                let heads = config.num_key_value_heads.unwrap() / num_shards;
+                let heads = crate::openai::distributed::local_num_kv_heads(
+                    config.num_key_value_heads.unwrap(),
+                    num_shards,
+                );
                 let hd = config.k_head_dim();
                 (block_size * heads * 4 * 2 + block_size * heads * (hd / 2) * 2) * kv_layers
             }
@@ -219,14 +231,18 @@ pub fn get_cache_config(
                 per_layer_cfg
                     .iter()
                     .map(|&(kv_heads, hd)| {
-                        let heads = kv_heads / num_shards;
+                        let heads =
+                            crate::openai::distributed::local_num_kv_heads(kv_heads, num_shards);
                         block_size * heads * 4 * 2
                             + block_size * heads * ((hd * 3 + 7) / 8)
                             + block_size * heads * (hd / 2)
                     })
                     .sum()
             } else {
-                let heads = config.num_key_value_heads.unwrap() / num_shards;
+                let heads = crate::openai::distributed::local_num_kv_heads(
+                    config.num_key_value_heads.unwrap(),
+                    num_shards,
+                );
                 let hd = config.k_head_dim();
                 (block_size * heads * 4 * 2
                     + block_size * heads * ((hd * 3 + 7) / 8)

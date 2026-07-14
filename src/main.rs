@@ -761,13 +761,12 @@ async fn main() -> Result<()> {
             get(|State(data): State<Arc<OpenAIServerData>>| async move {
                 let (model_name, modalities) = {
                     let engine = data.model.read();
-                    let (pipeline, _) = engine.get_pipeline(0).unwrap();
-                    let modalities = if pipeline.image_config.is_some() {
+                    let modalities = if engine.image_config().is_some() {
                         vec!["text", "image"]
                     } else {
                         vec!["text", "embedding"]
                     };
-                    (pipeline.name().to_string(), modalities)
+                    (engine.model_name().to_string(), modalities)
                 };
                 Json(json!({
                     "object": "list",
