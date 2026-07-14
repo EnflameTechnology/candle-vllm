@@ -23,8 +23,8 @@ anyhow = "1.0.75"
 rand = "0.9.0"
 rayon="1.10.0"
 hyper = { version = "0.14", features = ["full"] }
-candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="f55bca1" }
-candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="f55bca1" }
+candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="dd5d2dc" }
+candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="dd5d2dc" }
 dyn-fmt = "0.4.0"
 safetensors = "0.8"
 serde = { version = "1.0.190", features = ["serde_derive"] }
@@ -47,7 +47,7 @@ dirs = "5.0.1"
 minijinja = { version = "2.10.2", features = ["builtins", "json"] }
 minijinja-contrib = { version = "2.10.2", features = ["pycompat"] }
 thiserror = "1.0.58"
-attention-rs = { git = "https://github.com/guoqingbao/attention.rs", version="0.6.3", rev="f60b198" }
+attention-rs = { git = "https://github.com/guoqingbao/attention.rs", version="0.6.3", rev="aa39088" }
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 lazy_static = {version = "1.4.0"}
 once_cell = "1.20.2"
@@ -94,6 +94,8 @@ eccl = ["candle-core/eccl", "candle-nn/eccl"]
 nccl = ["candle-core/nccl"]
 graph = ["attention-rs/graph", "candle-core/graph"]
 
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [package.metadata.deb]
 maintainer = "Guoqing Bao"
@@ -104,7 +106,6 @@ section = "utils"
 priority = "optional"
 assets = [
     ["target/release/candle-vllm", "usr/local/bin/candle-vllm", "755"],
-    ["target/release/lib/*", "usr/local/lib/candle-vllm/", "644"],
     # Ubridge topsfb kernels: runtime fallback is {exe_dir}/kernels/ → /usr/local/bin/kernels/
     ["target/release/kernels/*.topsfb", "usr/local/bin/kernels/", "644"],
 ]
