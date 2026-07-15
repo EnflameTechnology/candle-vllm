@@ -40,7 +40,6 @@ impl CacheConfig {
 pub type KVCache = (Tensor, Tensor);
 
 #[allow(dead_code)]
-#[derive(Debug)]
 pub struct CacheEngine {
     gpu_cache: Arc<Mutex<Vec<KVCache>>>,
     cpu_cache: Vec<KVCache>,
@@ -543,6 +542,7 @@ impl CacheEngine {
         )
     }
 
+    #[cfg(not(feature = "gcu"))]
     fn swap_tensor(src: &Tensor, dst: &Tensor, mapping: &HashMap<usize, usize>) -> Result<usize> {
         let bytes_per_block = src
             .elem_count()
@@ -553,6 +553,7 @@ impl CacheEngine {
         Ok(bytes_per_block.saturating_mul(mapping.len()))
     }
 
+    #[cfg(not(feature = "gcu"))]
     fn swap_turboquant(&self, mapping: &HashMap<usize, usize>, swap_in: bool) -> Result<usize> {
         let Some(cpu_layers) = &self.cpu_turboquant_cache else {
             return Ok(0);
@@ -590,6 +591,7 @@ impl CacheEngine {
         Ok(bytes)
     }
 
+    #[cfg(not(feature = "gcu"))]
     fn log_swap(direction: &str, blocks: usize, bytes: usize, started: Instant) {
         let elapsed = started.elapsed();
         let elapsed_seconds = elapsed.as_secs_f64();

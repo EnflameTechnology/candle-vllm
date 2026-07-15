@@ -68,7 +68,7 @@ fn select_topk_indices(scores: &Tensor, topk: usize, is_prefill: bool) -> Result
     } else {
         scores.arg_sort_last_dim(false)?
     };
-    sorted_idx.narrow(D::Minus1, 0, topk)?.contiguous()
+    sorted_idx.narrow(candle::D::Minus1, 0, topk)?.contiguous()
 }
 
 #[derive(Clone, Copy, Debug)]

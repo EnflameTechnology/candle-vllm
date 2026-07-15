@@ -204,7 +204,6 @@ impl Attention {
         quant_cfg: &Option<crate::openai::models::QuantConfig>,
         quant: &Option<String>,
         k_eq_v: bool,
-        kv_shard: Shard,
     ) -> Result<Option<QkvProjection>> {
         if quant.is_some() {
             return Ok(None);
@@ -438,7 +437,6 @@ impl Attention {
             &cfg.quantization_config,
             &cfg.isq_quant,
             k_eq_v,
-            kv_shard,
         )? {
             packed
         } else {
