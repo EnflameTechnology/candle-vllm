@@ -189,6 +189,12 @@ pub enum AllocStatus {
 
 type SeqID = usize;
 
+#[derive(Clone)]
+struct PendingBlockSwap {
+    old_tables: Vec<(SeqID, BlockTable)>,
+    new_tables: Vec<(SeqID, BlockTable)>,
+}
+
 /// A BlockEngine maps each Sequence (identified by its SeqID), to physical token blocks.
 /// The physical token blocks may not match the logical token blocks because during
 /// scheduling, physical blocks are allocated to accommodate the new tokens generated.
@@ -205,6 +211,8 @@ pub struct BlockEngine {
     valid_mamba_prefix_hashes: HashSet<u64>,
     prefix_block_id_by_mamba_hash: HashMap<u64, usize>,
     mamba_hashes_by_prefix_block_id: HashMap<usize, HashSet<u64>>,
+    pending_swap_out: HashMap<usize, PendingBlockSwap>,
+    pending_swap_in: HashMap<usize, PendingBlockSwap>,
 }
 
 impl BlockEngine {
@@ -257,6 +265,8 @@ impl BlockEngine {
             valid_mamba_prefix_hashes: HashSet::new(),
             prefix_block_id_by_mamba_hash: HashMap::new(),
             mamba_hashes_by_prefix_block_id: HashMap::new(),
+            pending_swap_out: HashMap::new(),
+            pending_swap_in: HashMap::new(),
         }
     }
 
@@ -306,7 +316,7 @@ impl BlockEngine {
                 last_hash,
             } = prefix_cache.match_prefix_with_seed(&tokens, seed, seed_block);
             let full_blocks = tokens.len() / block_size;
-            let matched_blocks = if matched_blocks == full_blocks
+            let raw_matched_blocks = if matched_blocks == full_blocks
                 && tokens.len() % block_size == 0
                 && matched_blocks > 0
             {
@@ -318,12 +328,23 @@ impl BlockEngine {
                 self.require_mamba_prefix_snapshots,
                 &self.valid_mamba_prefix_hashes,
                 prefix_cache,
-                matched_blocks,
+                raw_matched_blocks,
                 last_hash,
             );
             let cached_tokens = matched_blocks * block_size;
-            let prefill_end =
-                Self::prefill_chunk_end(tokens.len(), cached_tokens, prefill_chunk_size);
+            let warmup_target = Self::mamba_warmup_target(
+                self.require_mamba_prefix_snapshots,
+                raw_matched_blocks,
+                matched_blocks,
+                block_size,
+                tokens.len(),
+            );
+            let prefill_end = Self::prefill_chunk_end_with_warmup(
+                tokens.len(),
+                cached_tokens,
+                prefill_chunk_size,
+                warmup_target,
+            );
             let required_blocks = prefill_end.div_ceil(block_size);
             required_blocks.saturating_sub(matched_blocks)
         } else {
@@ -395,12 +416,41 @@ impl BlockEngine {
     }
 
     fn prefill_chunk_end(prompt_len: usize, cached_tokens: usize, chunk_size: usize) -> usize {
+        Self::prefill_chunk_end_with_warmup(prompt_len, cached_tokens, chunk_size, None)
+    }
+
+    fn prefill_chunk_end_with_warmup(
+        prompt_len: usize,
+        cached_tokens: usize,
+        chunk_size: usize,
+        warmup_target: Option<usize>,
+    ) -> usize {
         let cached_tokens = cached_tokens.min(prompt_len);
         if chunk_size == 0 {
             prompt_len
+        } else if let Some(target_tokens) = warmup_target {
+            if target_tokens > cached_tokens && target_tokens < prompt_len {
+                cached_tokens + (target_tokens - cached_tokens).min(chunk_size)
+            } else {
+                cached_tokens + prompt_len.saturating_sub(cached_tokens).min(chunk_size)
+            }
         } else {
             cached_tokens + prompt_len.saturating_sub(cached_tokens).min(chunk_size)
         }
+    }
+
+    fn mamba_warmup_target(
+        require_mamba_prefix_snapshots: bool,
+        raw_matched_blocks: usize,
+        matched_blocks: usize,
+        block_size: usize,
+        prompt_len: usize,
+    ) -> Option<usize> {
+        if !require_mamba_prefix_snapshots || matched_blocks != 0 || raw_matched_blocks == 0 {
+            return None;
+        }
+        let raw_cached_tokens = raw_matched_blocks * block_size;
+        (raw_cached_tokens < prompt_len).then_some(raw_cached_tokens)
     }
 
     fn prefill_blocks_to_allocate_without_prefix(
@@ -513,11 +563,8 @@ impl BlockEngine {
         prefill_chunk_size: usize,
     ) -> usize {
         let seq = sequence.deref();
-        let prefill_end = Self::prefill_chunk_end(
-            seq.get_prompt_len(),
-            seq.get_num_cached_tokens(),
-            prefill_chunk_size,
-        );
+        let prefill_end =
+            seq.get_num_cached_tokens() + seq.prefill_chunk_tokens(prefill_chunk_size);
         let required_blocks = prefill_end.div_ceil(self.block_size);
         let table_len = self
             .block_tables
@@ -649,6 +696,10 @@ impl BlockEngine {
 
     pub fn prefix_cache_enabled(&self) -> bool {
         self.prefix_cache.is_some()
+    }
+
+    pub fn cpu_swap_enabled(&self) -> bool {
+        cfg!(feature = "cuda")
     }
 
     pub fn prefix_cache_blocks(&self) -> usize {
@@ -908,6 +959,7 @@ impl BlockEngine {
         self.block_tables.insert(seq_id, new_table);
         sequence.deref_mut().set_num_cached_tokens(0);
         sequence.deref_mut().set_mamba_prefix_hash(None);
+        sequence.deref_mut().clear_mamba_prefix_warmup();
         true
     }
 
@@ -982,83 +1034,142 @@ impl BlockEngine {
         sequence
             .deref_mut()
             .set_mamba_prefix_hash(Some(target_hash));
+        sequence.deref_mut().clear_mamba_prefix_warmup();
         true
     }
 
     pub fn can_swap_out_seq_group(&self, seq_group: &SequenceGroup) -> bool {
-        let mut blocks_required = 0usize;
+        if !self.cpu_swap_enabled() {
+            return false;
+        }
+        let prefix_blocks = self.prefix_block_counts(seq_group);
+        let mut blocks_required = HashSet::new();
         let mut group_refs = HashMap::new();
         for (seq_id, table) in self
             .block_tables
             .iter()
             .filter(|(id, _)| seq_group.get_seqs().contains_key(id))
         {
-            let _ = seq_id;
-            blocks_required += table.len();
-            for block in table {
-                if !block.deref_mut().is_gpu {
+            let prefix_count = prefix_blocks.get(seq_id).copied().unwrap_or(0);
+            for block in table.iter().skip(prefix_count) {
+                let inner = block.deref_mut();
+                if !inner.is_gpu {
                     return false;
                 }
-                *group_refs
-                    .entry(block.deref_mut().block_id)
-                    .or_insert(0usize) += 1;
+                blocks_required.insert(inner.block_id);
+                *group_refs.entry(inner.block_id).or_insert(0usize) += 1;
             }
         }
-        for (block_id, refs_in_group) in group_refs {
+
+        for block_id in group_refs.keys().copied() {
             let Some(block) = self
                 .block_tables
-                .iter()
-                .filter(|(id, _)| seq_group.get_seqs().contains_key(id))
-                .flat_map(|(_, table)| table.iter())
+                .values()
+                .flat_map(|table| table.iter())
                 .find(|block| block.deref_mut().block_id == block_id)
             else {
                 continue;
             };
-            if block.deref_mut().refcount > refs_in_group {
+            if block.deref_mut().refcount > group_refs[&block_id] {
                 return false;
             }
         }
-        blocks_required <= self.cpu_allocator.free_blocks.len()
+        !blocks_required.is_empty() && blocks_required.len() <= self.cpu_allocator.free_blocks.len()
     }
 
     pub fn seq_group_block_count(&self, seq_group: &SequenceGroup) -> usize {
+        self.swap_in_required_block_count(seq_group)
+    }
+
+    fn prefix_block_counts(&self, seq_group: &SequenceGroup) -> HashMap<SeqID, usize> {
+        let mut counts = HashMap::new();
+        for (seq_id, table) in self
+            .block_tables
+            .iter()
+            .filter(|(id, _)| seq_group.get_seqs().contains_key(id))
+        {
+            let seq = seq_group.get_seqs().get(seq_id);
+            let cached_blocks = if self.prefix_cache_enabled() {
+                seq.map(|seq| seq.deref().deref().get_num_cached_tokens() / self.block_size)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let mut prefix_count = cached_blocks.min(table.len());
+            // Shared blocks are never sequence-owned. This also covers shared
+            // beam-search blocks that extend beyond the cached-token boundary.
+            while prefix_count < table.len() && table[prefix_count].deref_mut().refcount > 1 {
+                prefix_count += 1;
+            }
+            counts.insert(*seq_id, prefix_count);
+        }
+        counts
+    }
+
+    pub fn swap_in_required_block_count(&self, seq_group: &SequenceGroup) -> usize {
         self.block_tables
             .iter()
             .filter(|(id, _)| seq_group.get_seqs().contains_key(id))
-            .map(|(_, table)| table.len())
-            .sum()
+            .flat_map(|(_, table)| table.iter())
+            .filter(|block| !block.deref_mut().is_gpu)
+            .map(|block| block.deref_mut().block_id)
+            .collect::<HashSet<_>>()
+            .len()
     }
 
     /// Update the block table so that the sequence does no longer reserve any GPU
-    /// physical blocks, and only has CPU physical blocks.
+    /// physical blocks for its sequence-owned suffix. Shared prefix blocks stay
+    /// on GPU when prefix caching is enabled.
     pub fn swap_out(&mut self, seq_group: &SequenceGroup) -> HashMap<usize, usize> {
-        // GPU block to a CPU block
+        let group_id = *seq_group.get_id();
+        let prefix_blocks = self.prefix_block_counts(seq_group);
         let mut new_mapping = HashMap::new();
+        let mut old_tables = Vec::new();
+        let mut new_tables = Vec::new();
         for seq_id in seq_group.get_seqs().keys() {
-            let mut new_block_table = VecDeque::new();
-            let block_table = self.block_tables.get(seq_id).unwrap();
-
-            for gpu_block in block_table {
-                let cpu_block =
-                    if let Entry::Vacant(e) = new_mapping.entry(gpu_block.deref_mut().block_id) {
-                        // Create a new block
-                        let cpu_block = self.cpu_allocator.allocate();
-                        e.insert(cpu_block.clone());
-                        cpu_block
-                    } else {
-                        // Reuse a block
-                        let cpu_block = new_mapping
-                            .get(&gpu_block.deref_mut().block_id)
-                            .unwrap()
-                            .clone();
-                        cpu_block.deref_mut().refcount += 1;
-                        cpu_block
-                    };
-                new_block_table.push_back(cpu_block);
-                self.gpu_allocator.free_block(gpu_block.clone());
+            let old_table = self.block_tables.get(seq_id).unwrap().clone();
+            let prefix_count = prefix_blocks.get(seq_id).copied().unwrap_or(0);
+            let mut new_block_table = old_table.clone();
+            for (idx, gpu_block) in old_table.iter().enumerate().skip(prefix_count) {
+                let gpu_id = gpu_block.deref_mut().block_id;
+                let cpu_block = if let Entry::Vacant(entry) = new_mapping.entry(gpu_id) {
+                    let cpu_block = self.cpu_allocator.allocate();
+                    entry.insert(cpu_block.clone());
+                    cpu_block
+                } else {
+                    let cpu_block = new_mapping.get(&gpu_id).unwrap().clone();
+                    cpu_block.deref_mut().refcount += 1;
+                    cpu_block
+                };
+                new_block_table[idx] = cpu_block;
             }
+            old_tables.push((*seq_id, old_table));
+            new_tables.push((*seq_id, new_block_table.clone()));
             self.block_tables.insert(*seq_id, new_block_table);
         }
+
+        // Release moved GPU suffix blocks immediately so the rest of this
+        // scheduling pass sees the same capacity as the pre-existing swap
+        // implementation. The pending tables let rollback restore them if
+        // the asynchronous cache copy fails.
+        for ((_, old_table), (_, new_table)) in old_tables.iter().zip(&new_tables) {
+            for old_block in old_table {
+                if !new_table
+                    .iter()
+                    .any(|new_block| Arc::ptr_eq(old_block, new_block))
+                {
+                    self.gpu_allocator.free_block(old_block.clone());
+                }
+            }
+        }
+
+        self.pending_swap_out.insert(
+            group_id,
+            PendingBlockSwap {
+                old_tables,
+                new_tables,
+            },
+        );
 
         new_mapping
             .iter()
@@ -1102,48 +1213,120 @@ impl BlockEngine {
     }
 
     pub fn can_swap_in_seq_group(&self, seq_group: &SequenceGroup) -> bool {
-        let blocks_required: usize = self
-            .block_tables
-            .iter()
-            .filter(|(id, _)| seq_group.get_seqs().contains_key(id))
-            .map(|(_, table)| table.len())
-            .sum();
-        blocks_required <= self.gpu_allocator.free_blocks.len()
+        if !self.cpu_swap_enabled() {
+            return false;
+        }
+        self.swap_in_required_block_count(seq_group) <= self.gpu_allocator.free_blocks.len()
     }
 
     /// Update the block table so that the sequence does no longer reserve any CPU
-    /// physical blocks, and only has GPU physical blocks.
+    /// physical blocks for its suffix. Shared GPU prefix blocks are retained.
     pub fn swap_in(&mut self, seq_group: &SequenceGroup) -> HashMap<usize, usize> {
-        // CPU block to a GPU block
+        let group_id = *seq_group.get_id();
         let mut new_mapping = HashMap::new();
+        let mut old_tables = Vec::new();
+        let mut new_tables = Vec::new();
         for seq_id in seq_group.get_seqs().keys() {
-            let mut new_block_table = VecDeque::new();
-            let block_table = self.block_tables.get(seq_id).unwrap();
-
-            for cpu_block in block_table {
-                let gpu_block =
-                    if let Entry::Vacant(e) = new_mapping.entry(cpu_block.deref_mut().block_id) {
-                        let gpu_block = self.gpu_allocator.allocate();
-                        e.insert(gpu_block.clone());
-                        gpu_block
-                    } else {
-                        let gpu_block = new_mapping
-                            .get(&cpu_block.deref_mut().block_id)
-                            .unwrap()
-                            .clone();
-                        gpu_block.deref_mut().refcount += 1;
-                        gpu_block
-                    };
-                new_block_table.push_back(gpu_block);
-                self.cpu_allocator.free_block(cpu_block.clone());
+            let old_table = self.block_tables.get(seq_id).unwrap().clone();
+            let mut new_block_table = old_table.clone();
+            for (idx, cpu_block) in old_table.iter().enumerate() {
+                if cpu_block.deref_mut().is_gpu {
+                    continue;
+                }
+                let cpu_id = cpu_block.deref_mut().block_id;
+                let gpu_block = if let Entry::Vacant(entry) = new_mapping.entry(cpu_id) {
+                    let gpu_block = self.gpu_allocator.allocate();
+                    entry.insert(gpu_block.clone());
+                    gpu_block
+                } else {
+                    let gpu_block = new_mapping.get(&cpu_id).unwrap().clone();
+                    gpu_block.deref_mut().refcount += 1;
+                    gpu_block
+                };
+                new_block_table[idx] = gpu_block;
             }
+            old_tables.push((*seq_id, old_table));
+            new_tables.push((*seq_id, new_block_table.clone()));
             self.block_tables.insert(*seq_id, new_block_table);
         }
+
+        self.pending_swap_in.insert(
+            group_id,
+            PendingBlockSwap {
+                old_tables,
+                new_tables,
+            },
+        );
 
         new_mapping
             .iter()
             .map(|(k, v)| (*k, v.deref_mut().block_id))
             .collect::<HashMap<_, _>>()
+    }
+
+    pub fn finalize_swap_out(&mut self, group_id: usize) {
+        self.pending_swap_out.remove(&group_id);
+    }
+
+    pub fn rollback_swap_out(&mut self, group_id: usize) {
+        let Some(pending) = self.pending_swap_out.remove(&group_id) else {
+            return;
+        };
+        for ((seq_id, old_table), (_, new_table)) in
+            pending.old_tables.iter().zip(&pending.new_tables)
+        {
+            for new_block in new_table {
+                if !old_table
+                    .iter()
+                    .any(|old_block| Arc::ptr_eq(old_block, new_block))
+                {
+                    self.cpu_allocator.free_block(new_block.clone());
+                }
+            }
+            for old_block in old_table {
+                if !new_table
+                    .iter()
+                    .any(|new_block| Arc::ptr_eq(old_block, new_block))
+                {
+                    self.retain_block(old_block);
+                }
+            }
+            self.block_tables.insert(*seq_id, old_table.clone());
+        }
+    }
+
+    pub fn finalize_swap_in(&mut self, group_id: usize) {
+        let Some(pending) = self.pending_swap_in.remove(&group_id) else {
+            return;
+        };
+        for ((_, old_table), (_, new_table)) in pending.old_tables.iter().zip(&pending.new_tables) {
+            for old_block in old_table {
+                if !new_table
+                    .iter()
+                    .any(|new_block| Arc::ptr_eq(old_block, new_block))
+                {
+                    self.cpu_allocator.free_block(old_block.clone());
+                }
+            }
+        }
+    }
+
+    pub fn rollback_swap_in(&mut self, group_id: usize) {
+        let Some(pending) = self.pending_swap_in.remove(&group_id) else {
+            return;
+        };
+        for (seq_id, old_table) in pending.old_tables {
+            let current_table = self.block_tables.remove(&seq_id).unwrap_or_default();
+            for new_block in &current_table {
+                if !old_table
+                    .iter()
+                    .any(|old_block| Arc::ptr_eq(old_block, new_block))
+                {
+                    self.gpu_allocator.free_block(new_block.clone());
+                }
+            }
+            self.block_tables.insert(seq_id, old_table);
+        }
     }
 
     fn allocate_with_prefix(&mut self, seq_group: &SequenceGroup, prefill_chunk_size: usize) {
@@ -1183,6 +1366,13 @@ impl BlockEngine {
                     raw_matched_blocks,
                     last_hash,
                 );
+                let warmup_target = Self::mamba_warmup_target(
+                    self.require_mamba_prefix_snapshots,
+                    raw_matched_blocks,
+                    matched_blocks,
+                    block_size,
+                    tokens.len(),
+                );
                 if raw_matched_blocks > 0 && matched_blocks == 0 {
                     tracing::info!(
                         "Prefix cache mamba-state miss seq {} (raw {} blocks matched, but no compatible mamba snapshot)",
@@ -1206,6 +1396,16 @@ impl BlockEngine {
                 } else {
                     seq.deref_mut().set_mamba_prefix_hash(None);
                 }
+                seq.deref_mut()
+                    .set_mamba_prefix_warmup_tokens(warmup_target);
+                if let Some(target_tokens) = warmup_target {
+                    tracing::info!(
+                        "Seq {}: scheduling mamba prefix warmup snapshot at {} cached tokens (raw {} blocks, no compatible mamba snapshot)",
+                        seq.deref().deref().get_id(),
+                        target_tokens,
+                        raw_matched_blocks
+                    );
+                }
 
                 cached_tokens = matched_blocks * block_size;
                 if matched_blocks > 0 {
@@ -1228,9 +1428,8 @@ impl BlockEngine {
                 }
             }
             seq.deref_mut().set_num_cached_tokens(cached_tokens);
-            let prompt_len = seq.deref().deref().get_prompt_len();
             let prefill_end =
-                Self::prefill_chunk_end(prompt_len, cached_tokens, prefill_chunk_size);
+                seq.deref().deref().prefill_chunk_tokens(prefill_chunk_size) + cached_tokens;
             let required_blocks = if prefill_chunk_size == 0 {
                 seq.deref().deref().get_logical_token_blocks()
             } else {
@@ -1247,9 +1446,19 @@ impl BlockEngine {
             if idx > 0 {
                 let hash = (*seqs[0]).deref().get_mamba_prefix_hash();
                 seq.deref_mut().set_mamba_prefix_hash(hash);
+                let warmup_target = (*seqs[0]).deref().active_mamba_prefix_warmup_target();
+                seq.deref_mut()
+                    .set_mamba_prefix_warmup_tokens(warmup_target);
                 for block in &table {
                     block.deref_mut().refcount += 1;
                 }
+            } else if seq
+                .deref()
+                .deref()
+                .active_mamba_prefix_warmup_target()
+                .is_none()
+            {
+                seq.deref_mut().clear_mamba_prefix_warmup();
             }
             self.block_tables
                 .insert(seq.deref().deref().get_id(), table);

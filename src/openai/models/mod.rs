@@ -15,6 +15,7 @@ pub mod mistral;
 pub mod mistral3_vl;
 pub mod phi2;
 pub mod phi4;
+pub mod quantized_deepseek;
 pub mod quantized_glm4;
 pub mod quantized_llama;
 pub mod quantized_phi3;
@@ -192,6 +193,10 @@ pub struct QuantConfig {
     pub mode: Option<String>,
     #[serde(default)]
     pub ignore: Option<Vec<String>>,
+    /// MLX NVFP4 stores eight FP4 values in each U32 weight element and uses
+    /// FP8 E4M3 block scales. This is distinct from native U8-packed NVFP4.
+    #[serde(default)]
+    pub is_mlx_nvfp4: bool,
 }
 
 impl QuantConfig {
@@ -201,6 +206,25 @@ impl QuantConfig {
             for item in ignore_list {
                 if !mods.contains(&item) {
                     mods.push(item);
+                }
+            }
+        }
+
+        // MLX exports use the compact {bits, group_size, mode} schema rather
+        // than a quant_method/format field. Keep this marker so loaders can
+        // select the U32 -> U8 repack path without affecting native NVFP4.
+        if self.quant_method.is_empty() {
+            if let Some(mode) = &self.mode {
+                if mode.eq_ignore_ascii_case("nvfp4") {
+                    self.quant_method = "nvfp4".to_string();
+                    self.is_mlx_nvfp4 = true;
+                    if self.group_size == 0 {
+                        self.group_size = 16;
+                    }
+                    if self.bits == 0 {
+                        self.bits = 4;
+                    }
+                    return;
                 }
             }
         }
@@ -376,6 +400,7 @@ impl fmt::Debug for QuantConfig {
             .field("format", &self.format)
             .field("weight_block_size", &self.weight_block_size)
             .field("modules_to_not_convert", &self.modules_to_not_convert)
+            .field("is_mlx_nvfp4", &self.is_mlx_nvfp4)
             .finish()
     }
 }
@@ -438,6 +463,14 @@ pub struct QwenMoEConfig {
     pub first_k_dense_replace: Option<usize>,
     #[serde(default)]
     pub n_shared_experts: Option<usize>,
+    #[serde(default)]
+    pub n_group: Option<usize>,
+    #[serde(default)]
+    pub topk_group: Option<usize>,
+    #[serde(default)]
+    pub scoring_func: Option<String>,
+    #[serde(default)]
+    pub topk_method: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]

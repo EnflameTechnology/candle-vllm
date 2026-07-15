@@ -17,3 +17,5 @@ XBOT.md
 .cursor/
 paged/
 build_deb.sh
+presentation/
+test_data/

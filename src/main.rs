@@ -96,8 +96,8 @@ struct Args {
     #[arg(long)]
     mamba_fraction: Option<f32>,
 
-    /// Available CPU memory for kvcache (MB)
-    #[arg(long, default_value_t = 128)]
+    /// Available CPU memory for kvcache (MB; 0 selects 0.5x the GPU KV block count)
+    #[arg(long, default_value_t = 0)]
     kvcache_mem_cpu: usize,
 
     /// Record conversation (default false, the client need to record chat history)
@@ -486,7 +486,9 @@ async fn main() -> Result<()> {
         .expect("at least one pipeline must be loaded");
     let first_config = first_pipeline.get_model_config();
     let first_model_dtype = first_pipeline.dtype;
-    let kv_fraction = args.kv_fraction.unwrap_or(0.6);
+    let kv_fraction = args
+        .kv_fraction
+        .unwrap_or(if cfg!(feature = "cuda") { 0.6 } else { 0.4 });
     let explicit_kv_fraction = args.kv_fraction.is_some();
     let prefill_chunk_size = args.prefill_chunk_size.unwrap_or(8192);
 

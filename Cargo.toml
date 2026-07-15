@@ -1,6 +1,6 @@
 [package]
 name = "candle-vllm"
-version = "0.8.6"
+version = "0.8.8"
 edition = "2021"
 default-run = "candle-vllm"
 license = "Apache-2.0"
@@ -23,8 +23,8 @@ anyhow = "1.0.75"
 rand = "0.9.0"
 rayon="1.10.0"
 hyper = { version = "0.14", features = ["full"] }
-candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="64cc242" }
-candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="64cc242" }
+candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="d91110ba" }
+candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="d91110ba" }
 dyn-fmt = "0.4.0"
 safetensors = "0.8"
 serde = { version = "1.0.190", features = ["serde_derive"] }
@@ -47,7 +47,7 @@ dirs = "5.0.1"
 minijinja = { version = "2.10.2", features = ["builtins", "json"] }
 minijinja-contrib = { version = "2.10.2", features = ["pycompat"] }
 thiserror = "1.0.58"
-attention-rs = { git = "https://github.com/guoqingbao/attention.rs", version="0.6.3", rev="1f8f3a3" }
+attention-rs = { git = "https://github.com/guoqingbao/attention.rs", version="0.6.4", rev="d1e4285" }
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 lazy_static = {version = "1.4.0"}
 once_cell = "1.20.2"
@@ -69,8 +69,8 @@ base64 = "0.22.1"
 bytes = "1.5"
 reqwest = { version = "0.12.24", features = ["blocking", "json", "rustls-tls"]}
 regex = "1.12.2"
-tool-parser = "1.2.0"
-openai-protocol = "1.6.0"
+tool-parser = "1.3.1"
+openai-protocol = "1.8.1"
 crossbeam = "0.8.4"
 colored = { version = "3.0.0" }
 local-ip-address = "0.6.5"
@@ -84,7 +84,7 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "attention-rs/cuda", "graph"]
 gcu = ["candle-core/gcu", "candle-core/async", "candle-nn/gcu", "attention-rs/gcu"]
 cutlass = ["cuda", "attention-rs/cutlass"]
 flash = ["attention-rs/flash"]
-metal = ["candle-core/metal", "candle-nn/metal", "dep:metal", "attention-rs/metal"]
+metal = ["candle-core/metal", "candle-nn/metal", "dep:metal", "attention-rs/metal", "attention-rs/metal-flash"]
 cudnn = ["candle-core/cudnn"]
 flashattn = ["attention-rs/flashattn", "aten"]
 flashinfer = ["attention-rs/flashinfer"]
@@ -109,3 +109,21 @@ assets = [
     # Ubridge topsfb kernels: runtime fallback is {exe_dir}/kernels/ → /usr/local/bin/kernels/
     ["target/release/kernels/*.topsfb", "usr/local/bin/kernels/", "644"],
 ]
+
+# Local development patches: customized candle / attention.rs / Ubridge
+[patch."https://github.com/EnflameTechnology/candle.git"]
+candle-core = { path = "../candle/candle-core" }
+candle-nn = { path = "../candle/candle-nn" }
+
+[patch."https://github.com/guoqingbao/candle.git"]
+candle-core = { path = "../candle/candle-core" }
+candle-nn = { path = "../candle/candle-nn" }
+
+[patch."https://github.com/guoqingbao/attention.rs"]
+attention-rs = { path = "../attention.rs" }
+
+[patch."https://github.com/guoqingbao/attention.rs.git"]
+attention-rs = { path = "../attention.rs" }
+
+[patch."https://github.com/EnflameTechnology/Ubridge.git"]
+ubridge = { path = "../Ubridge" }

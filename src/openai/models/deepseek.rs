@@ -1,1099 +1,456 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-use super::{
-    Config, DeepSeekRopeScaling, MoEConfig, QuantConfig, ScoringFunc, TokenID, TopkMethod,
-};
-#[allow(unused_imports)]
-use crate::backend::custom_ops::moe::{masked_fill, NonZeroOp, SplitOp, TopKLastDimOp, TopKOutput};
+use super::{Config, KvCacheDtype, MoEConfig, QuantConfig, QwenMoEConfig};
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::openai::distributed::{
-    embedding, rms_norm, AllReduce, Comm, ReplicatedLinear, TensorParallelColumnLinear,
-    TensorParallelRowLinear, VarBuilder,
+    embedding, Comm, TensorParallelColumnLinear, TensorParallelRowLinear, VarBuilder,
+    VocabParallelLinear,
 };
+use crate::openai::models::layers::mla_attention::{MlaAttention, MlaConfig};
+use crate::openai::models::layers::moe::{
+    FusedMoe, FusedMoeFp8, FusedMoeISQ, FusedMoeMxfp4, FusedMoeNvfp4,
+};
+use crate::openai::models::layers::others::{rms_norm, NormX};
+use crate::openai::models::layers::rotary_emb::ScalingRotaryEmbedding;
 use crate::openai::models::mask::get_attention_causal_mask;
-use crate::openai::models::rotary_emb::DefaultRotaryEmbedding;
-use crate::openai::models::DeepSeekMoEConfig;
-use crate::{InputMetadata, PagedAttention};
-use candle::{DType, Device, IndexOp, Result, Tensor, D};
+use crate::InputMetadata;
+use candle::{DType, Device, Module, Result, Tensor};
 use candle_core as candle;
-use candle_nn::{Activation, Embedding, Module, RmsNorm};
+use candle_nn::Embedding;
 use parking_lot::RwLock;
 use serde::Deserialize;
-use std::collections::HashSet;
-use std::f32::consts::PI;
-use std::iter::{zip, FromIterator};
+use std::iter::zip;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-#[doc(hidden)]
-#[macro_export]
-macro_rules! serde_default_fn {
-    ($t:ty, $name:ident, $v:expr) => {
-        fn $name() -> $t {
-            $v
-        }
-    };
+
+use super::TokenID;
+
+struct Mlp {
+    gate_proj: TensorParallelColumnLinear,
+    up_proj: TensorParallelColumnLinear,
+    down_proj: TensorParallelRowLinear,
+    act_fn: candle_nn::Activation,
 }
 
-serde_default_fn!(f64, routed_scaling_factor, 1.0);
-serde_default_fn!(TopkMethod, topk_method, TopkMethod::Greedy);
-serde_default_fn!(usize, moe_layer_freq, 1);
-serde_default_fn!(usize, first_k_dense_replace, 0);
-serde_default_fn!(bool, norm_topk_prob, false);
-serde_default_fn!(ScoringFunc, scoring_func, ScoringFunc::Softmax);
-serde_default_fn!(Activation, hidden_act, Activation::Silu);
-serde_default_fn!(bool, tie_word_embeddings, false);
+impl Mlp {
+    fn new(cfg: &Config, intermediate_size: usize, vb: VarBuilder, comm: Rc<Comm>) -> Result<Self> {
+        let hidden_sz = cfg.hidden_size;
+        let gate_proj = TensorParallelColumnLinear::load_with_hints(
+            hidden_sz,
+            intermediate_size,
+            false,
+            vb.pp("gate_proj"),
+            comm.clone(),
+            &cfg.isq_quant,
+            &cfg.quantization_config,
+        )?;
+        let up_proj = TensorParallelColumnLinear::load_with_hints(
+            hidden_sz,
+            intermediate_size,
+            false,
+            vb.pp("up_proj"),
+            comm.clone(),
+            &cfg.isq_quant,
+            &cfg.quantization_config,
+        )?;
+        let down_proj = TensorParallelRowLinear::load_with_hints(
+            intermediate_size,
+            hidden_sz,
+            false,
+            vb.pp("down_proj"),
+            comm,
+            &cfg.isq_quant,
+            &cfg.quantization_config,
+        )?;
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+            act_fn: cfg.hidden_act.unwrap_or(candle_nn::Activation::Silu),
+        })
+    }
+}
+
+impl Module for Mlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let lhs = self.act_fn.forward(&self.gate_proj.forward(xs)?)?;
+        let rhs = self.up_proj.forward(xs)?;
+        self.down_proj.forward(&(&lhs * &rhs)?)
+    }
+}
+
+enum MoeOrMlp {
+    FusedMoe(FusedMoe),
+    FusedMoeISQ(FusedMoeISQ),
+    FusedMoeFp8(FusedMoeFp8),
+    FusedMoeMxfp4(FusedMoeMxfp4),
+    FusedMoeNvfp4(FusedMoeNvfp4),
+    Mlp(Mlp),
+}
+
+impl MoeOrMlp {
+    fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
+        match self {
+            Self::Mlp(m) => m.forward(xs),
+            Self::FusedMoe(m) => m.forward(xs, is_prefill),
+            Self::FusedMoeISQ(m) => m.forward(xs, is_prefill),
+            Self::FusedMoeFp8(m) => m.forward(xs, is_prefill),
+            Self::FusedMoeMxfp4(m) => m.forward(xs, is_prefill),
+            Self::FusedMoeNvfp4(m) => m.forward(xs, is_prefill),
+        }
+    }
+}
+
+pub struct DeepSeekDecoderLayer {
+    self_attn: MlaAttention,
+    mlp: MoeOrMlp,
+    shared_expert: Option<Mlp>,
+    input_layernorm: NormX,
+    post_attention_layernorm: NormX,
+    rotary_emb: Arc<ScalingRotaryEmbedding>,
+}
+
+impl DeepSeekDecoderLayer {
+    pub fn new(
+        vb: VarBuilder,
+        comm: Rc<Comm>,
+        rotary_emb: Arc<ScalingRotaryEmbedding>,
+        config: &Config,
+        mla_cfg: &MlaConfig,
+        dtype: DType,
+        layer_idx: usize,
+    ) -> Result<Self> {
+        let moe_cfg = match &config.moe_config {
+            Some(MoEConfig::QwenMoE(m)) => m.clone(),
+            _ => candle::bail!("DeepSeek requires moe_config: QwenMoE"),
+        };
+
+        let self_attn = MlaAttention::new(
+            vb.pp("self_attn"),
+            comm.clone(),
+            mla_cfg,
+            config,
+            dtype,
+            layer_idx,
+        )?;
+
+        let is_moe_layer = layer_idx >= moe_cfg.first_k_dense_replace.unwrap_or(0)
+            && moe_cfg.num_experts.is_some();
+
+        let mlp = if is_moe_layer {
+            if let Some(ref quant_config) = config.quantization_config {
+                if quant_config.quant_method == "fp8" {
+                    MoeOrMlp::FusedMoeFp8(FusedMoeFp8::new(
+                        config,
+                        vb.pp("mlp").clone(),
+                        comm.clone(),
+                        dtype,
+                        quant_config,
+                    )?)
+                } else if quant_config.quant_method == "mxfp4" {
+                    MoeOrMlp::FusedMoeMxfp4(FusedMoeMxfp4::new(
+                        config,
+                        vb.pp("mlp").clone(),
+                        comm.clone(),
+                        dtype,
+                    )?)
+                } else if quant_config.quant_method == "nvfp4" {
+                    MoeOrMlp::FusedMoeNvfp4(FusedMoeNvfp4::new(
+                        config,
+                        vb.pp("mlp").clone(),
+                        comm.clone(),
+                        dtype,
+                    )?)
+                } else if config.isq_quant.is_some() {
+                    MoeOrMlp::FusedMoeISQ(FusedMoeISQ::new(
+                        config,
+                        vb.pp("mlp").clone(),
+                        comm.clone(),
+                        dtype,
+                    )?)
+                } else {
+                    MoeOrMlp::FusedMoe(FusedMoe::new(
+                        config,
+                        vb.pp("mlp").clone(),
+                        comm.clone(),
+                        dtype,
+                    )?)
+                }
+            } else if config.isq_quant.is_some() {
+                MoeOrMlp::FusedMoeISQ(FusedMoeISQ::new(
+                    config,
+                    vb.pp("mlp").clone(),
+                    comm.clone(),
+                    dtype,
+                )?)
+            } else {
+                MoeOrMlp::FusedMoe(FusedMoe::new(
+                    config,
+                    vb.pp("mlp").clone(),
+                    comm.clone(),
+                    dtype,
+                )?)
+            }
+        } else {
+            MoeOrMlp::Mlp(Mlp::new(
+                config,
+                config.intermediate_size,
+                vb.pp("mlp"),
+                comm.clone(),
+            )?)
+        };
+
+        let shared_expert = if is_moe_layer {
+            if let Some(intermediate_size) = moe_cfg.shared_expert_intermediate_size {
+                if intermediate_size > 0 {
+                    let mlp = Mlp::new(
+                        config,
+                        intermediate_size * moe_cfg.n_shared_experts.unwrap_or(1),
+                        vb.pp("mlp.shared_experts"),
+                        comm.clone(),
+                    )?;
+                    Some(mlp)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let input_layernorm = rms_norm(
+            config.hidden_size,
+            config.rms_norm_eps,
+            vb.pp("input_layernorm"),
+            DType::F32,
+            false,
+        )?;
+
+        let post_attention_layernorm = rms_norm(
+            config.hidden_size,
+            config.rms_norm_eps,
+            vb.pp("post_attention_layernorm"),
+            DType::F32,
+            false,
+        )?;
+
+        Ok(Self {
+            self_attn,
+            mlp,
+            shared_expert,
+            input_layernorm,
+            post_attention_layernorm,
+            rotary_emb,
+        })
+    }
+
+    pub fn forward(
+        &self,
+        xs: &Tensor,
+        attention_mask: Option<&Vec<Tensor>>,
+        positions: &Tensor,
+        cache: Option<(&Tensor, &Tensor)>,
+        input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        let residual = xs;
+        let xs = self.input_layernorm.forward(xs)?;
+        let rope = self.rotary_emb.clone();
+        let attn_output = self.self_attn.forward(
+            &xs,
+            &Some(rope),
+            attention_mask,
+            positions,
+            cache,
+            input_metadata,
+        )?;
+        let xs = (attn_output + residual)?;
+        let residual = &xs;
+        let xs = self.post_attention_layernorm.forward(&xs)?;
+
+        let shared_output = if let Some(shared_expert) = &self.shared_expert {
+            Some(shared_expert.forward(&xs)?)
+        } else {
+            None
+        };
+        let mlp_output = self.mlp.forward(&xs, input_metadata.is_prefill)?;
+        let out = if let Some(shared_output) = shared_output {
+            (residual + (mlp_output + shared_output)?)?
+        } else {
+            (residual + mlp_output)?
+        };
+        Ok(out)
+    }
+}
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct DeepSeekConfig {
-    pub(crate) vocab_size: usize,
-    pub(crate) hidden_size: usize,
-    pub(crate) intermediate_size: usize,
-    pub(crate) moe_intermediate_size: usize,
-    pub(crate) num_hidden_layers: usize,
-    pub(crate) num_attention_heads: usize,
-    pub(crate) num_key_value_heads: Option<usize>,
-    pub(crate) n_shared_experts: Option<usize>,
-    pub(crate) n_routed_experts: Option<usize>,
-    #[serde(default = "routed_scaling_factor")]
-    pub(crate) routed_scaling_factor: f64,
-    #[serde(default = "topk_method")]
-    topk_method: TopkMethod,
-    pub(crate) num_experts_per_tok: Option<usize>,
-    #[serde(default = "moe_layer_freq")]
-    pub(crate) moe_layer_freq: usize,
-    #[serde(default = "first_k_dense_replace")]
-    pub(crate) first_k_dense_replace: usize,
-    // k dense layers
-    #[serde(default = "norm_topk_prob")]
-    pub(crate) norm_topk_prob: bool,
-    #[serde(default = "scoring_func")]
-    scoring_func: ScoringFunc,
-    #[serde(default = "hidden_act")]
-    pub(crate) hidden_act: Activation,
-    pub(crate) max_position_embeddings: usize,
-    pub(crate) rms_norm_eps: f64,
-    #[serde(default = "tie_word_embeddings")]
-    pub(crate) tie_word_embeddings: bool,
-    pub(crate) rope_theta: f32,
-    pub(crate) rope_scaling: Option<DeepSeekRopeScaling>,
-    // pub(crate) attention_bias: bool,
-    pub(crate) q_lora_rank: Option<usize>,
-    pub(crate) qk_rope_head_dim: usize,
-    pub(crate) kv_lora_rank: usize,
-    pub(crate) v_head_dim: usize,
-    pub(crate) qk_nope_head_dim: usize,
-    pub(crate) n_group: usize,
-    pub(crate) topk_group: usize,
-    pub(crate) sliding_window: Option<usize>,
+    pub architectures: Option<Vec<String>>,
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub moe_intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: Option<usize>,
+    pub n_shared_experts: Option<usize>,
+    pub n_routed_experts: Option<usize>,
+    pub num_experts_per_tok: Option<usize>,
+    #[serde(default)]
+    pub moe_layer_freq: Option<usize>,
+    #[serde(default)]
+    pub first_k_dense_replace: Option<usize>,
+    #[serde(default)]
+    pub norm_topk_prob: bool,
+    pub routed_scaling_factor: Option<f64>,
+    pub hidden_act: Option<candle_nn::Activation>,
+    pub max_position_embeddings: usize,
+    pub rms_norm_eps: f64,
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+    pub rope_theta: Option<f64>,
+    pub rope_scaling: Option<serde_json::Value>,
+    pub attention_bias: Option<bool>,
+    pub q_lora_rank: Option<usize>,
+    pub qk_rope_head_dim: Option<usize>,
+    pub kv_lora_rank: Option<usize>,
+    pub v_head_dim: Option<usize>,
+    pub qk_nope_head_dim: Option<usize>,
+    pub n_group: Option<usize>,
+    pub topk_group: Option<usize>,
+    pub sliding_window: Option<usize>,
     pub quantization_config: Option<QuantConfig>,
-    pub bos_token_id: TokenID,
-    pub eos_token_id: TokenID,
+    pub bos_token_id: Option<TokenID>,
+    pub eos_token_id: Option<TokenID>,
 }
 
-#[derive(Debug, Clone)]
-pub struct DeepSeekV2RotaryEmbedding {
-    rotary_emb: DefaultRotaryEmbedding,
+pub struct DeepSeek {
+    embed_tokens: Embedding,
+    layers: Vec<DeepSeekDecoderLayer>,
+    norm: NormX,
+    lm_head: VocabParallelLinear,
+    device: Device,
+    config: Config,
+    dtype: DType,
+    vocab_size: usize,
 }
 
 impl DeepSeek {
     pub fn load_config(filename: &PathBuf, isq: Option<String>) -> Result<Config> {
-        let config = match std::fs::read(filename.clone()) {
-            Ok(f) => {
-                let config: DeepSeekConfig =
-                    serde_json::from_slice(&f).map_err(candle_core::Error::wrap)?;
-                config
+        let f = std::fs::read(filename.clone()).map_err(candle::Error::wrap)?;
+        let ds_cfg: DeepSeekConfig = serde_json::from_slice(&f).map_err(candle::Error::wrap)?;
+        let raw = String::from_utf8(f.clone()).map_err(candle::Error::wrap)?;
+
+        let hidden_act = ds_cfg.hidden_act.unwrap_or(candle_nn::Activation::Silu);
+
+        let num_kv_heads = ds_cfg
+            .num_key_value_heads
+            .unwrap_or(ds_cfg.num_attention_heads);
+
+        let rope_theta = ds_cfg.rope_theta.unwrap_or_else(|| {
+            // GlmMoeDsa stores rope_theta inside rope_parameters
+            if let Ok(root) = serde_json::from_slice::<serde_json::Value>(&f) {
+                if let Some(rp) = root.get("rope_parameters") {
+                    if let Some(theta) = rp.get("rope_theta").and_then(|v| v.as_f64()) {
+                        return theta;
+                    }
+                }
             }
-            Err(e) => panic!("Unable to load config file {:?}", e),
+            10000.0
+        });
+
+        let rope_scaling = ds_cfg.rope_scaling.as_ref().and_then(|v| {
+            serde_json::from_value::<
+                std::collections::HashMap<String, crate::openai::models::ScalingValue>,
+            >(v.clone())
+            .ok()
+        });
+
+        let moe_intermediate_size = ds_cfg.moe_intermediate_size;
+        let n_shared_experts = ds_cfg.n_shared_experts;
+        let shared_expert_intermediate_size = n_shared_experts.map(|n| moe_intermediate_size * n);
+
+        let qwen_moe = QwenMoEConfig {
+            moe_intermediate_size,
+            shared_expert_intermediate_size,
+            num_experts: ds_cfg.n_routed_experts,
+            mlp_only_layers: None,
+            decoder_sparse_step: None,
+            norm_topk_prob: ds_cfg.norm_topk_prob,
+            num_experts_per_tok: ds_cfg.num_experts_per_tok.unwrap_or(8),
+            routed_scaling_factor: ds_cfg.routed_scaling_factor,
+            first_k_dense_replace: ds_cfg.first_k_dense_replace,
+            n_shared_experts,
+            n_group: ds_cfg.n_group,
+            topk_group: ds_cfg.topk_group,
+            scoring_func: None,
+            topk_method: None,
         };
 
-        let num_experts_offload_per_rank = if let Ok(num_experts_offload_per_rank) =
-            std::env::var("NUM_EXPERTS_OFFLOAD_PER_RANK")
-        {
-            let number: usize = num_experts_offload_per_rank
-                .trim()
-                .parse::<usize>()
-                .expect("Failed to parse num_experts_offload_per_rank to number");
-            Some(number)
+        let isq_quant = if ds_cfg.quantization_config.is_some() {
+            None
         } else {
-            None
+            isq
         };
 
-        let moe_config = DeepSeekMoEConfig {
-            num_experts_per_tok: config.num_experts_per_tok,
-            n_routed_experts: config.n_routed_experts.unwrap_or(0),
-            moe_intermediate_size: config.moe_intermediate_size,
-            scoring_func: config.scoring_func,
-            topk_method: config.topk_method,
-            norm_topk_prob: config.norm_topk_prob,
-            routed_scaling_factor: config.routed_scaling_factor,
-            n_shared_experts: config.n_shared_experts,
-            qk_nope_head_dim: config.qk_nope_head_dim,
-            qk_rope_head_dim: config.qk_rope_head_dim,
-            v_head_dim: config.v_head_dim,
-            kv_lora_rank: config.kv_lora_rank,
-            first_k_dense_replace: config.first_k_dense_replace,
-            moe_layer_freq: config.moe_layer_freq,
-            rope_scaling: config.rope_scaling,
-            q_lora_rank: config.q_lora_rank,
-            n_group: config.n_group,
-            topk_group: config.topk_group,
-            num_experts_offload_per_rank,
-        };
+        let mut quant_config = ds_cfg.quantization_config.clone();
+        if let Some(ref mut qcfg) = quant_config {
+            qcfg.normalize_compressed_tensors();
+        }
 
-        let quant = if config.quantization_config.is_some() {
-            None
-        } else if isq.is_some() {
-            panic!("DeepSeek does not support isq quantization yet!");
-        } else {
-            None
-        };
+        let architectures = ds_cfg
+            .architectures
+            .clone()
+            .unwrap_or_else(|| vec!["DeepseekV3ForCausalLM".to_string()]);
 
-        let config = Config {
-            architectures: Some(vec!["DeepseekV3ForCausalLM".to_string()]),
-            hidden_size: config.hidden_size,
-            head_dim: Some(config.hidden_size / config.num_attention_heads),
-            intermediate_size: config.intermediate_size,
-            vocab_size: config.vocab_size,
-            num_hidden_layers: config.num_hidden_layers,
-            num_attention_heads: config.num_attention_heads,
-            num_key_value_heads: Some(
-                config
-                    .num_key_value_heads
-                    .unwrap_or(config.num_attention_heads),
-            ),
-            rms_norm_eps: config.rms_norm_eps,
-            rope_theta: f64::from(config.rope_theta),
+        let mut config = Config {
+            architectures: Some(architectures),
+            hidden_size: ds_cfg.hidden_size,
+            head_dim: Some(ds_cfg.hidden_size / ds_cfg.num_attention_heads),
+            intermediate_size: ds_cfg.intermediate_size,
+            vocab_size: ds_cfg.vocab_size,
+            num_hidden_layers: ds_cfg.num_hidden_layers,
+            num_attention_heads: ds_cfg.num_attention_heads,
+            num_key_value_heads: Some(num_kv_heads),
+            rms_norm_eps: ds_cfg.rms_norm_eps,
+            rope_theta,
             rope_local_base_freq: None,
-            bos_token_id: Some(config.bos_token_id),
-            eos_token_id: Some(config.eos_token_id),
-            max_seq_len: config.max_position_embeddings,
-            sliding_window: config.sliding_window,
+            bos_token_id: ds_cfg.bos_token_id,
+            eos_token_id: ds_cfg.eos_token_id,
+            max_seq_len: ds_cfg.max_position_embeddings,
+            sliding_window: ds_cfg.sliding_window,
             sliding_window_pattern: None,
-            hidden_act: Some(config.hidden_act),
+            hidden_act: Some(hidden_act),
             hidden_activation: None,
-            tie_word_embeddings: config.tie_word_embeddings,
-            rope_scaling: None,
-            max_position_embeddings: Some(config.max_position_embeddings),
+            tie_word_embeddings: ds_cfg.tie_word_embeddings,
+            rope_scaling,
+            max_position_embeddings: Some(ds_cfg.max_position_embeddings),
             original_max_position_embeddings: None,
-            attention_bias: Some(false),
+            attention_bias: ds_cfg.attention_bias.or(Some(false)),
             partial_rotary_factor: None,
             qk_layernorm: false,
             use_qkv_bias: None,
             custom_stop_tokens: None,
             attn_logit_softcapping: None,
             final_logit_softcapping: None,
-            quantization_config: config.quantization_config.clone(),
-            moe_config: Some(MoEConfig::DeepSeekMoE(moe_config)),
-            isq_quant: quant,
-            kvcache_dtype: Default::default(),
-            extra_config_json: None,
+            quantization_config: quant_config,
+            moe_config: Some(MoEConfig::QwenMoE(qwen_moe)),
+            isq_quant,
+            kvcache_dtype: KvCacheDtype::Auto,
+            extra_config_json: Some(raw),
             is_f16_mode: false,
         };
+
+        config.apply_rope_overrides();
+        config.max_seq_len = config.effective_max_seq_len();
         Ok(config)
     }
-}
 
-pub struct DeepSeekV2RopeConfig {
-    pub rope_scaling: Option<DeepSeekRopeScaling>,
-    pub max_position_embeddings: usize,
-    pub rope_theta: f32,
-    pub qk_rope_head_dim: usize,
-}
-
-impl DeepSeekV2RotaryEmbedding {
-    fn new_unscaled(cfg: &DeepSeekV2RopeConfig, _dtype: DType, dev: &Device) -> Result<Self> {
-        let max_seq_len = cfg.max_position_embeddings;
-        let dim = cfg.qk_rope_head_dim;
-
-        let inv_freq: Vec<_> = (0..dim)
-            .step_by(2)
-            .map(|i| 1f32 / cfg.rope_theta.powf(i as f32 / dim as f32))
-            .collect();
-        let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), &Device::Cpu)?;
-        let t = Tensor::arange(0u32, max_seq_len as u32, &Device::Cpu)?
-            .to_dtype(DType::F32)?
-            .reshape((max_seq_len, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
-
-        let sin = freqs.sin()?.to_device(dev)?;
-        let cos = freqs.cos()?.to_device(dev)?;
-        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?; //must be contiguous tensor;
-
-        Ok(Self {
-            rotary_emb: DefaultRotaryEmbedding {
-                cos,
-                sin,
-                cos_sin,
-                is_gpt_neox: false,
-                rotary_dim: None,
-            },
-        })
+    pub fn get_config(&self) -> &Config {
+        &self.config
     }
 
-    fn yarn_find_correction_dim(
-        num_rot: f32,
-        dim: usize,
-        base: f32,
-        max_position_embeddings: usize,
-    ) -> f32 {
-        (dim as f32 * (max_position_embeddings as f32 / (num_rot * 2. * PI)).ln())
-            / (2. * base.ln())
-    }
-
-    fn yarn_find_correction_range(
-        low_rot: f32,
-        high_rot: f32,
-        dim: usize,
-        base: f32,
-        max_position_embeddings: usize,
-    ) -> (f32, f32) {
-        let low =
-            Self::yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings).floor();
-        let high =
-            Self::yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings).ceil();
-        (low.max(0.), high.min(dim as f32 - 1.))
-    }
-
-    fn yarn_linear_ramp_mask(min: f32, mut max: f32, dim: usize, dev: &Device) -> Result<Tensor> {
-        if min == max {
-            max += 0.001;
-        }
-        let linear_func =
-            ((Tensor::arange(0f32, dim as f32, dev)? - min as f64)? / (max as f64 - min as f64))?;
-        linear_func.clamp(0., 1.)
-    }
-
-    pub(crate) fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
-        if scale <= 1. {
-            return 1.;
-        }
-        0.1 * mscale * scale.ln() + 1.
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_yarn(
-        cfg: &DeepSeekV2RopeConfig,
-        _dtype: DType,
-        dev: &Device,
-        original_max_position_embeddings: usize,
-        beta_fast: f32,
-        beta_slow: f32,
-        factor: f32,
-        mscale: f32,
-        mscale_all_dim: f32,
-    ) -> Result<Self> {
-        let freq_extra: Vec<_> = (0..cfg.qk_rope_head_dim)
-            .step_by(2)
-            .map(|i| 1f32 / cfg.rope_theta.powf(i as f32 / cfg.qk_rope_head_dim as f32))
-            .collect();
-        let freq_extra_len = freq_extra.len();
-        let freq_extra = Tensor::from_vec(freq_extra, freq_extra_len, &Device::Cpu)?;
-        let freq_inter: Vec<_> = (0..cfg.qk_rope_head_dim)
-            .step_by(2)
-            .map(|i| 1f32 / (factor * cfg.rope_theta.powf(i as f32 / cfg.qk_rope_head_dim as f32)))
-            .collect();
-        let freq_inter_len = freq_inter.len();
-        let freq_inter = Tensor::from_vec(freq_inter, (1, freq_inter_len), &Device::Cpu)?;
-
-        let (low, high) = Self::yarn_find_correction_range(
-            beta_fast,
-            beta_slow,
-            cfg.qk_rope_head_dim,
-            cfg.rope_theta,
-            original_max_position_embeddings,
-        );
-        let inv_freq_mask =
-            (1. - Self::yarn_linear_ramp_mask(low, high, cfg.qk_rope_head_dim / 2, &Device::Cpu)?)?;
-        let inv_freq = freq_inter
-            .broadcast_mul(&(1. - &inv_freq_mask)?)?
-            .broadcast_add(&freq_extra.broadcast_mul(&inv_freq_mask)?)?;
-
-        let t = Tensor::arange(0u32, cfg.max_position_embeddings as u32, &Device::Cpu)?
-            .to_dtype(DType::F32)?
-            .reshape((cfg.max_position_embeddings, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
-
-        let mscale =
-            Self::yarn_get_mscale(factor, mscale) / Self::yarn_get_mscale(factor, mscale_all_dim);
-        let sin = (freqs.sin()? * mscale as f64)?.to_device(dev)?;
-        let cos = (freqs.cos()? * mscale as f64)?.to_device(dev)?;
-        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?; //must be contiguous tensor;
-
-        Ok(Self {
-            rotary_emb: DefaultRotaryEmbedding {
-                cos,
-                sin,
-                cos_sin,
-                is_gpt_neox: false,
-                rotary_dim: None,
-            },
-        })
-    }
-
-    pub fn new(cfg: &DeepSeekV2RopeConfig, dtype: DType, dev: &Device) -> Result<Self> {
-        match &cfg.rope_scaling {
-            Some(DeepSeekRopeScaling::LinearOrDynamic {
-                scaling_type: _,
-                factor: _,
-            }) => candle::bail!("linear and dynamic rope are not implemented yet!"),
-            Some(DeepSeekRopeScaling::Yarn {
-                original_max_position_embeddings,
-                beta_fast,
-                beta_slow,
-                factor,
-                mscale,
-                mscale_all_dim,
-                scaling_type: _,
-            }) => Self::new_yarn(
-                cfg,
-                dtype,
-                dev,
-                *original_max_position_embeddings,
-                *beta_fast,
-                *beta_slow,
-                *factor,
-                *mscale,
-                *mscale_all_dim,
-            ),
-            None => Self::new_unscaled(cfg, dtype, dev),
-        }
-    }
-
-    pub fn forward(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        input_positions: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
-        self.rotary_emb.apply_rotary_emb(q, k, input_positions)
-    }
-}
-
-impl DeepSeekMoEConfig {
-    pub(crate) fn q_head_dim(&self) -> usize {
-        self.qk_rope_head_dim + self.qk_nope_head_dim
-    }
-
-    fn softmax_scale(&self) -> f32 {
-        let mut softmax_scale = 1.0 / (self.q_head_dim() as f32).sqrt();
-        if let Some(DeepSeekRopeScaling::Yarn {
-            mscale_all_dim,
-            factor,
-            ..
-        }) = self.rope_scaling
-        {
-            let mscale = DeepSeekV2RotaryEmbedding::yarn_get_mscale(factor, mscale_all_dim);
-            softmax_scale = softmax_scale * mscale * mscale;
-        }
-        softmax_scale
-    }
-}
-
-enum QProj {
-    Plain(TensorParallelColumnLinear),
-    Lora {
-        a: ReplicatedLinear,
-        norm: RmsNorm,
-        b: TensorParallelColumnLinear,
-    },
-}
-
-impl QProj {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Lora { a, norm, b } => b.forward(&norm.forward(&a.forward(xs)?)?),
-            Self::Plain(lin) => lin.forward(xs),
-        }
-    }
-}
-
-struct Attention {
-    q: QProj,
-    kv_a_proj_with_mqa: ReplicatedLinear,
-    kv_a_layernorm: RmsNorm,
-    kv_b_proj: TensorParallelColumnLinear,
-    o_proj: TensorParallelRowLinear,
-    rotary_emb: Arc<DeepSeekV2RotaryEmbedding>,
-    q_head_dim: usize,
-    num_attention_heads: usize,
-    attn: PagedAttention,
-    moe_cfg: DeepSeekMoEConfig,
-}
-
-impl Attention {
-    fn new(
-        rotary_emb: Arc<DeepSeekV2RotaryEmbedding>,
-        cfg: &Config,
-        vb: VarBuilder,
-        comm: Rc<Comm>,
-    ) -> Result<Self> {
-        let q_head_dim = cfg.q_head_dim();
-        let moe_cfg = if let Some(MoEConfig::DeepSeekMoE(moe_cfg)) = &cfg.moe_config {
-            moe_cfg.clone()
-        } else {
-            candle::bail!("Expected DeepSeekMoEConfig")
-        };
-        let attention_bias = cfg.attention_bias.unwrap();
-        let q = match moe_cfg.q_lora_rank {
-            Some(lora_rank) => {
-                let a = ReplicatedLinear::load_b(
-                    cfg.hidden_size,
-                    lora_rank,
-                    attention_bias,
-                    vb.pp("q_a_proj"),
-                    &cfg.isq_quant,
-                    &cfg.quantization_config,
-                )?;
-                let norm = rms_norm(lora_rank, cfg.rms_norm_eps, vb.pp("q_a_layernorm"))?;
-                let b = TensorParallelColumnLinear::load_with_hints(
-                    lora_rank,
-                    cfg.num_attention_heads * q_head_dim,
-                    false,
-                    vb.pp("q_b_proj"),
-                    comm.clone(),
-                    &cfg.isq_quant,
-                    &cfg.quantization_config,
-                )?;
-                QProj::Lora { a, norm, b }
-            }
-            None => QProj::Plain(TensorParallelColumnLinear::load_with_hints(
-                cfg.hidden_size,
-                cfg.num_attention_heads * q_head_dim,
-                false,
-                vb.pp("q_proj"),
-                comm.clone(),
-                &cfg.isq_quant,
-                &cfg.quantization_config,
-            )?),
-        };
-
-        let kv_a_proj_with_mqa = ReplicatedLinear::load_b(
-            cfg.hidden_size,
-            moe_cfg.kv_lora_rank + moe_cfg.qk_rope_head_dim,
-            attention_bias,
-            vb.pp("kv_a_proj_with_mqa"),
-            &cfg.isq_quant,
-            &cfg.quantization_config,
-        )?;
-        let kv_a_layernorm = rms_norm(
-            moe_cfg.kv_lora_rank,
-            cfg.rms_norm_eps,
-            vb.pp("kv_a_layernorm"),
-        )?;
-        let kv_b_proj = TensorParallelColumnLinear::load_with_hints(
-            moe_cfg.kv_lora_rank,
-            cfg.num_attention_heads * (q_head_dim - moe_cfg.qk_rope_head_dim + moe_cfg.v_head_dim),
-            false,
-            vb.pp("kv_b_proj"),
-            comm.clone(),
-            &cfg.isq_quant,
-            &cfg.quantization_config,
-        )?;
-
-        let o_proj = TensorParallelRowLinear::load_with_hints(
-            cfg.num_attention_heads * moe_cfg.v_head_dim,
-            cfg.hidden_size,
-            attention_bias,
-            vb.pp("o_proj"),
-            comm.clone(),
-            &cfg.isq_quant,
-            &cfg.quantization_config,
-        )?;
-
-        let num_attention_heads = cfg.num_attention_heads / comm.world_size();
-        let num_kv_heads = cfg.num_key_value_heads.unwrap() / comm.world_size();
-
-        Ok(Self {
-            q,
-            kv_a_proj_with_mqa,
-            kv_a_layernorm,
-            kv_b_proj,
-            o_proj,
-            rotary_emb,
-            q_head_dim,
-            num_attention_heads,
-            attn: PagedAttention::new(
-                num_attention_heads,
-                moe_cfg.v_head_dim,
-                moe_cfg.softmax_scale(),
-                Some(num_kv_heads),
-                cfg.sliding_window,
-                vb.device().clone(),
-                None,
-                cfg.kvcache_dtype.is_fp8_keys(),
-            )?,
-            moe_cfg,
-        })
-    }
-
-    fn forward(
-        &self,
-        xs: &Tensor,
-        attention_mask: Option<&Vec<Tensor>>,
-        input_positions: &Tensor,
-        cache: Option<(&Tensor, &Tensor)>,
-        input_metadata: &InputMetadata,
-    ) -> Result<Tensor> {
-        let (seq_len, _) = xs.dims2()?;
-        let (q_nope, mut q_pe) = {
-            let q = self.q.forward(xs)?;
-            let q = q.reshape((1, seq_len, self.num_attention_heads, self.q_head_dim))?;
-            let (q_nope, q_pe) = q.split2(
-                &[self.moe_cfg.qk_nope_head_dim, self.moe_cfg.qk_rope_head_dim],
-                D::Minus1,
-            )?;
-            let q_nope = q_nope.transpose(1, 2)?;
-            let q_pe = q_pe.contiguous()?.transpose(1, 2)?;
-            (q_nope, q_pe)
-        };
-
-        let compressed_kv = self.kv_a_proj_with_mqa.forward(xs)?;
-        let (compressed_kv, k_pe) = compressed_kv.split2(
-            &[self.moe_cfg.kv_lora_rank, self.moe_cfg.qk_rope_head_dim],
-            D::Minus1,
-        )?;
-        let mut k_pe = k_pe
-            .reshape((1, seq_len, 1, self.moe_cfg.qk_rope_head_dim))?
-            .transpose(1, 2)?;
-        let kv = {
-            let kv = self
-                .kv_b_proj
-                .forward(&self.kv_a_layernorm.forward(&compressed_kv)?)?;
-            kv.reshape((
-                1,
-                seq_len,
-                self.num_attention_heads,
-                self.moe_cfg.qk_nope_head_dim + self.moe_cfg.v_head_dim,
-            ))?
-            .transpose(1, 2)?
-        };
-
-        let (k_nope, v) = kv.split2(
-            &[self.moe_cfg.qk_nope_head_dim, self.moe_cfg.v_head_dim],
-            D::Minus1,
-        )?;
-        let mut v = v.contiguous()?;
-
-        (q_pe, k_pe) = self.rotary_emb.forward(&q_pe, &k_pe, input_positions)?;
-
-        let q = Tensor::cat(&[q_nope, q_pe], D::Minus1)?;
-        let k_pe = k_pe.repeat((1, q.dim(1)?, 1, 1))?;
-        let k = Tensor::cat(&[k_nope, k_pe], D::Minus1)?;
-
-        if self.q_head_dim != self.moe_cfg.v_head_dim {
-            v = v
-                .pad_with_zeros(D::Minus1, 0, self.q_head_dim - self.moe_cfg.v_head_dim)?
-                .contiguous()?;
-        }
-
-        let mut y = self.attn.forward(
-            &q,
-            &k,
-            &v,
-            attention_mask,
-            cache.map(|(k_, _)| k_.clone()),
-            cache.map(|(_, v_)| v_.clone()),
-            input_metadata,
-            None,
-        )?;
-
-        if self.q_head_dim != self.moe_cfg.v_head_dim {
-            y = y.narrow(D::Minus1, 0, self.moe_cfg.v_head_dim)?;
-        }
-
-        y = y.reshape((seq_len, ()))?;
-
-        self.o_proj.forward(&y)
-    }
-}
-
-struct Mlp {
-    gate: RwLock<ReplicatedLinear>,
-    up: RwLock<ReplicatedLinear>,
-    down: RwLock<ReplicatedLinear>,
-    act: Activation,
-    preloaded: AtomicBool,
-    can_be_offloaded: bool,
-}
-
-impl Mlp {
-    fn new(
-        cfg: &Config,
-        vb: VarBuilder,
-        hidden_size: Option<usize>,
-        intermediate_size: Option<usize>,
-        offload: bool,
-    ) -> Result<Self> {
-        let hidden_size = hidden_size.unwrap_or(cfg.hidden_size);
-        let intermediate_size = intermediate_size.unwrap_or(cfg.intermediate_size);
-        let mut gate = ReplicatedLinear::load_no_bias(
-            hidden_size,
-            intermediate_size,
-            vb.pp("gate_proj"),
-            &cfg.isq_quant,
-            &cfg.quantization_config,
-        )?;
-
-        let mut up = ReplicatedLinear::load_no_bias(
-            hidden_size,
-            intermediate_size,
-            vb.pp("up_proj"),
-            &cfg.isq_quant,
-            &cfg.quantization_config,
-        )?;
-
-        let mut down = ReplicatedLinear::load_no_bias(
-            intermediate_size,
-            hidden_size,
-            vb.pp("down_proj"),
-            &cfg.isq_quant,
-            &cfg.quantization_config,
-        )?;
-
-        if offload {
-            gate.offload()?;
-            up.offload()?;
-            down.offload()?;
-        }
-        Ok(Self {
-            gate: RwLock::new(gate),
-            up: RwLock::new(up),
-            down: RwLock::new(down),
-            preloaded: AtomicBool::new(!offload),
-            can_be_offloaded: offload,
-            act: cfg.hidden_act.unwrap(),
-        })
-    }
-
-    pub fn reload(&self) {
-        if !self.preloaded.load(Ordering::SeqCst) {
-            let _ = self.gate.write().reload();
-            let _ = self.up.write().reload();
-            let _ = self.down.write().reload();
-            self.preloaded.store(true, Ordering::SeqCst);
-        }
-    }
-
-    pub fn offload(&self) {
-        if self.can_be_offloaded && self.preloaded.load(Ordering::SeqCst) {
-            let _ = self.gate.write().offload();
-            let _ = self.up.write().offload();
-            let _ = self.down.write().offload();
-            self.preloaded.store(false, Ordering::SeqCst);
-        }
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let lhs = self.gate.read().forward(xs)?.apply(&self.act)?;
-        let rhs = self.up.read().forward(xs)?;
-        self.down.read().forward(&(&lhs * &rhs)?)
-    }
-}
-
-#[allow(dead_code)]
-struct MoeGate {
-    weight: Tensor,
-    top_k: usize,
-    n_routed_experts: usize,
-    e_score_correction_bias: Option<Tensor>,
-    moe_cfg: DeepSeekMoEConfig,
-}
-
-impl MoeGate {
-    fn new(cfg: &Config, vb: VarBuilder, n_routed_experts: usize) -> Result<Self> {
-        let moe_cfg = if let Some(MoEConfig::DeepSeekMoE(moe_cfg)) = &cfg.moe_config {
-            moe_cfg.clone()
-        } else {
-            candle::bail!("Expected DeepSeekMoEConfig")
-        };
-        let weight = vb.get((n_routed_experts, cfg.hidden_size), "weight")?;
-        let e_score_correction_bias = if matches!(moe_cfg.topk_method, TopkMethod::NoAuxTc) {
-            Some(vb.get_with_hints_dtype(
-                n_routed_experts,
-                "e_score_correction_bias",
-                Default::default(),
-                DType::F32,
-            )?)
-        } else {
-            None
-        };
-        Ok(Self {
-            weight: weight.to_dtype(DType::F32)?,
-            top_k: moe_cfg.num_experts_per_tok.unwrap(),
-            n_routed_experts,
-            e_score_correction_bias,
-            moe_cfg,
-        })
-    }
-
-    /// (topk_idx, topk_weight)
-    fn forward(&self, xs: &Tensor) -> Result<(Tensor, Tensor)> {
-        #[cfg(not(feature = "gcu"))]
-        let (seq_len, _) = xs.dims2()?;
-        let moe_cfg = &self.moe_cfg;
-        // Compute gating score
-        let logits = xs
-            .to_dtype(DType::F32)?
-            .broadcast_matmul(&self.weight.t()?)?;
-        let scores = match moe_cfg.scoring_func {
-            ScoringFunc::Softmax => candle_nn::ops::softmax_last_dim(&logits)?,
-            ScoringFunc::Sigmoid => candle_nn::ops::sigmoid(&logits)?,
-        };
-
-        // Select top-k experts
-        #[cfg(feature = "gcu")]
-        let TopKOutput {
-            values: mut topk_weight,
-            indices: topk_idx,
-        } = scores.topk(self.top_k)?;
-        #[cfg(not(feature = "gcu"))]
-        let (mut topk_weight, topk_idx) = match moe_cfg.topk_method {
-            TopkMethod::Greedy => {
-                let TopKOutput { values, indices } = scores.topk_unsorted(self.top_k)?;
-                (values, indices)
-            }
-            TopkMethod::NoAuxTc => {
-                let Some(e_score_correction_bias) = &self.e_score_correction_bias else {
-                    candle_core::bail!("Expected e_score_correction_bias")
-                };
-                let scores_for_choice = scores
-                    .reshape((seq_len, ()))?
-                    .broadcast_add(&e_score_correction_bias.unsqueeze(0)?)?;
-                // (n, n_group)
-                let group_scores = scores_for_choice
-                    .reshape((seq_len, moe_cfg.n_group, ()))?
-                    .topk(2)?
-                    .values
-                    .sum(D::Minus1)?;
-                // (n, topk_group)
-                let group_idx = group_scores.topk(moe_cfg.topk_group)?.indices;
-                // (n, n_group)
-                let mut group_mask = group_scores.zeros_like()?;
-                // (n, n_group)
-                group_mask = group_mask.scatter_add(
-                    &group_idx,
-                    &group_idx.ones_like()?.to_dtype(group_mask.dtype())?,
-                    1,
-                )?;
-                // (n, e)
-                let score_mask = group_mask
-                    .unsqueeze(D::Minus1)?
-                    .expand((
-                        seq_len,
-                        moe_cfg.n_group,
-                        self.n_routed_experts / moe_cfg.n_group,
-                    ))?
-                    .reshape((seq_len, ()))?;
-                // (n, e)
-                // Invert the mask
-                let tmp_scores = scores_for_choice.broadcast_mul(&score_mask)?;
-                let topk_idx = tmp_scores.topk(self.top_k)?.indices;
-                (scores.gather(&topk_idx, 1)?, topk_idx)
-            }
-            TopkMethod::GroupLimitedGreedy => {
-                // (n, n_group)
-                let group_scores = scores
-                    .reshape((seq_len, moe_cfg.n_group, ()))?
-                    .max(D::Minus1)?;
-                // (n, topk_group)
-                let group_idx = group_scores.topk_unsorted(moe_cfg.topk_group)?.indices;
-                // (n, n_group)
-                let mut group_mask = group_scores.zeros_like()?;
-                // (n, n_group)
-                group_mask = group_mask.scatter_add(
-                    &group_idx,
-                    &group_idx.ones_like()?.to_dtype(group_mask.dtype())?,
-                    1,
-                )?;
-                // (n, e)
-                let score_mask = group_mask
-                    .unsqueeze(D::Minus1)?
-                    .expand((
-                        seq_len,
-                        moe_cfg.n_group,
-                        self.n_routed_experts / moe_cfg.n_group,
-                    ))?
-                    .reshape((seq_len, ()))?;
-                // (n, e)
-                // Invert the mask
-                let tmp_scores = masked_fill(&score_mask, &(1. - &score_mask.ne(0.)?)?, 0.)?;
-                let TopKOutput { values, indices } = tmp_scores.topk_unsorted(self.top_k)?;
-                (values, indices)
-            }
-        };
-
-        if matches!(moe_cfg.scoring_func, ScoringFunc::Sigmoid) {
-            let denominator = (topk_weight.sum_keepdim(D::Minus1)? + 1e-20)?;
-            topk_weight = topk_weight.broadcast_div(&denominator)?;
-        }
-
-        topk_weight = (topk_weight * moe_cfg.routed_scaling_factor)?;
-        Ok((topk_idx, topk_weight))
-    }
-}
-
-struct Moe {
-    experts: Vec<Option<Mlp>>,
-    shared_experts: Option<Mlp>,
-    gate: MoeGate,
-    all_reduce: AllReduce,
-    experts_start_idx: usize,
-    experts_end_idx: usize,
-    world_size: usize,
-}
-
-impl Moe {
-    fn new(
-        cfg: &Config,
-        vb: VarBuilder,
-        n_shared_experts: Option<usize>,
-        n_routed_experts: usize,
-        comm: Rc<Comm>,
-    ) -> Result<Self> {
-        let moe_cfg = if let Some(MoEConfig::DeepSeekMoE(moe_cfg)) = &cfg.moe_config {
-            moe_cfg.clone()
-        } else {
-            candle::bail!("Expected DeepSeekMoEConfig")
-        };
-        let mut experts = Vec::with_capacity(n_routed_experts);
-        let n_local_experts = n_routed_experts / comm.world_size();
-        let experts_start_idx = comm.rank() * n_local_experts;
-        let experts_end_idx = experts_start_idx + n_local_experts;
-        let n_local_experts_need_offload = moe_cfg.num_experts_offload_per_rank.unwrap_or(0);
-        let mut offloaded_count = 0;
-        for i in 0..n_routed_experts {
-            if i >= experts_start_idx && i < experts_end_idx {
-                let vb_e = vb.pp("experts").pp(i);
-                let offload = offloaded_count < n_local_experts_need_offload;
-                experts.push(Some(Mlp::new(
-                    cfg,
-                    vb_e,
-                    None,
-                    Some(moe_cfg.moe_intermediate_size),
-                    offload,
-                )?));
-                offloaded_count += 1;
-            } else {
-                experts.push(None);
-            }
-        }
-
-        let shared_experts = if let Some(n_shared_experts) = n_shared_experts {
-            let intermediate_size = moe_cfg.moe_intermediate_size * n_shared_experts;
-            Some(Mlp::new(
-                cfg,
-                vb.pp("shared_experts"),
-                None,
-                Some(intermediate_size),
-                false,
-            )?)
-        } else {
-            None
-        };
-        let gate = MoeGate::new(cfg, vb.pp("gate"), n_routed_experts)?;
-        let word_size = comm.world_size();
-        Ok(Self {
-            experts,
-            shared_experts,
-            gate,
-            all_reduce: AllReduce::new(comm),
-            experts_end_idx,
-            experts_start_idx,
-            world_size: word_size,
-        })
-    }
-
-    fn moe_infer(&self, xs: &Tensor, topk_ids: &Tensor, topk_weight: &Tensor) -> Result<Tensor> {
-        let mut y = xs.zeros_like()?;
-        let topk_weight = if !xs.device().is_gcu() && topk_weight.dtype() != xs.dtype() {
-            topk_weight.to_dtype(xs.dtype())?
-        } else {
-            topk_weight.to_owned()
-        };
-        let (topk_ids, unique_ids): (Tensor, HashSet<u32>) = if !xs.device().is_gcu() {
-            let topk_ids = topk_ids.to_device(&Device::Cpu)?;
-            (
-                topk_ids.to_owned(),
-                HashSet::from_iter(topk_ids.flatten_all()?.to_vec1()?),
-            )
-        } else {
-            (
-                topk_ids.to_owned(),
-                HashSet::from_iter(topk_ids.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?),
-            )
-        };
-
-        let mut cur_used_experts = Vec::<u32>::new();
-        for i in self.experts_start_idx..self.experts_end_idx {
-            if unique_ids.contains(&(i as u32)) {
-                cur_used_experts.push(i as u32);
-                let expert = self.experts[i]
-                    .as_ref()
-                    .expect("Expert is not present for this rank.");
-                expert.reload(); //make sure the current used expert is loaded on device
-            }
-        }
-
-        for i in &cur_used_experts {
-            if xs.device().is_gcu() {
-                let idx_top = candle_nn::ops::expert_mask(&topk_ids, *i as u32)?;
-                let idx = &idx_top.i(0)?;
-                let top = &idx_top.i(1)?;
-                let expert = self.experts[*i as usize]
-                    .as_ref()
-                    .expect("Expert is not present for this rank.");
-                candle_nn::ops::moe(
-                    &y,
-                    &expert.forward(&xs.index_select(&idx, 0)?)?,
-                    &topk_weight,
-                    &idx,
-                    &top,
-                )?;
-            } else {
-                let idx_top = topk_ids.nonzero(*i as u32)?.t()?.contiguous()?;
-                let idx = &idx_top.i(0)?.contiguous()?.to_device(&xs.device())?;
-                let top = &idx_top.i(1)?.contiguous()?.to_device(&xs.device())?;
-                let expert = self.experts[*i as usize]
-                    .as_ref()
-                    .expect("Expert is not present for this rank.");
-                y = y.index_add(
-                    idx,
-                    &expert.forward(&xs.index_select(idx, 0)?)?.broadcast_mul(
-                        &topk_weight
-                            .index_select(idx, 0)?
-                            .gather(&top.unsqueeze(1)?, 1)?
-                            .squeeze(1)?
-                            .unsqueeze(D::Minus1)?,
-                    )?,
-                    0,
-                )?;
-            }
-        }
-
-        if self.world_size > 1 {
-            y = self.all_reduce.apply(&y)?;
-        }
-
-        for i in &cur_used_experts {
-            let expert = self.experts[*i as usize]
-                .as_ref()
-                .expect("Expert is not present for this rank.");
-            expert.offload();
-        }
-        Ok(y)
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let identity = xs.clone();
-        let (topk_idx, topk_weight) = self.gate.forward(xs)?;
-        let mut y = self.moe_infer(&xs, &topk_idx, &topk_weight)?;
-        if let Some(ref shared_experts) = self.shared_experts {
-            y = (y + shared_experts.forward(&identity)?)?;
-        }
-        Ok(y)
-    }
-}
-
-enum MoeOrMlp {
-    Moe(Moe),
-    Mlp(Mlp),
-}
-
-impl MoeOrMlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Mlp(mlp) => mlp.forward(xs),
-            Self::Moe(moe) => moe.forward(xs),
-        }
-    }
-}
-
-struct DecoderLayer {
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
-    attn: Attention,
-    moe_or_mlp: MoeOrMlp,
-}
-
-impl DecoderLayer {
-    fn new(
-        rotary_emb: Arc<DeepSeekV2RotaryEmbedding>,
-        cfg: &Config,
-        vb: VarBuilder,
-        layer_idx: usize,
-        comm: Rc<Comm>,
-    ) -> Result<Self> {
-        let moe_cfg = if let Some(MoEConfig::DeepSeekMoE(moe_cfg)) = &cfg.moe_config {
-            moe_cfg.clone()
-        } else {
-            candle::bail!("Expected DeepSeekMoEConfig")
-        };
-        let attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"), comm.clone())?;
-        let input_layernorm =
-            rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let post_attention_layernorm = rms_norm(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
-        )?;
-        let moe_or_mlp = if moe_cfg.n_routed_experts > 0
-            && layer_idx >= moe_cfg.first_k_dense_replace
-            && layer_idx % moe_cfg.moe_layer_freq == 0
-        {
-            MoeOrMlp::Moe(Moe::new(
-                cfg,
-                vb.pp("mlp"),
-                moe_cfg.n_shared_experts,
-                moe_cfg.n_routed_experts,
-                comm.clone(),
-            )?)
-        } else {
-            MoeOrMlp::Mlp(Mlp::new(cfg, vb.pp("mlp"), None, None, false)?)
-        };
-
-        Ok(Self {
-            input_layernorm,
-            post_attention_layernorm,
-            attn,
-            moe_or_mlp,
-        })
-    }
-
-    fn forward(
-        &self,
-        xs: &Tensor,
-        attention_mask: Option<&Vec<Tensor>>,
-        input_positions: &Tensor,
-        cache: Option<(&Tensor, &Tensor)>,
-        input_metadata: &InputMetadata,
-    ) -> Result<Tensor> {
-        let residual = xs;
-        let xs = self.input_layernorm.forward(xs)?;
-        let xs = self
-            .attn
-            .forward(&xs, attention_mask, input_positions, cache, input_metadata)?;
-        let xs = (xs + residual)?;
-        let residual = &xs;
-        let xs = self
-            .moe_or_mlp
-            .forward(&xs.apply(&self.post_attention_layernorm)?)?;
-        residual + xs
-    }
-}
-
-pub struct DeepSeek {
-    lm_head: ReplicatedLinear,
-    embed_tokens: Embedding,
-    norm: RmsNorm,
-    layers: Vec<DecoderLayer>,
-    dtype: DType,
-    device: Device,
-    cfg: Config,
-}
-
-impl DeepSeek {
     pub fn load(
         vb: VarBuilder,
         cfg: &Config,
@@ -1102,118 +459,183 @@ impl DeepSeek {
         comm: Rc<Comm>,
         progress_reporter: Arc<RwLock<ProgressReporter>>,
     ) -> Result<Self> {
+        let mla_cfg = MlaConfig::from_config(cfg);
         let vb_m = vb.pp("model");
-        let moe_cfg = if let Some(MoEConfig::DeepSeekMoE(moe_cfg)) = &cfg.moe_config {
-            moe_cfg.clone()
-        } else {
-            candle::bail!("Expected DeepSeekMoEConfig")
-        };
+
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+
+        let mut mla_rope_cfg = cfg.clone();
+        mla_rope_cfg.head_dim = Some(mla_cfg.qk_rope_head_dim);
+        mla_rope_cfg.partial_rotary_factor = None;
+        let rotary_dtype = if cfg.isq_quant.is_some() || cfg.higher_precision_required() {
+            DType::F32
+        } else {
+            dtype
+        };
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(
+            rotary_dtype,
+            &mla_rope_cfg,
+            device,
+            false,
+        )?);
+
         let reporter = progress_reporter.clone();
-        let lm_head = if !cfg.tie_word_embeddings {
-            ReplicatedLinear::load_no_bias(
+        let mut layers = Vec::new();
+        for i in 0..cfg.num_hidden_layers {
+            let layer = DeepSeekDecoderLayer::new(
+                vb_m.pp("layers").pp(i),
+                comm.clone(),
+                rotary_emb.clone(),
+                cfg,
+                &mla_cfg,
+                dtype,
+                i,
+            )?;
+            layers.push(layer);
+            reporter.write().set_progress(i + 1);
+        }
+
+        let norm = rms_norm(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb_m.pp("norm"),
+            DType::F32,
+            false,
+        )?;
+
+        let lm_head = if cfg.tie_word_embeddings {
+            VocabParallelLinear::from_weight_bias(
+                embed_tokens.embeddings().clone(),
+                None,
+                comm.clone(),
+                cfg.vocab_size,
+                dtype,
+            )?
+        } else {
+            VocabParallelLinear::load_no_bias(
                 cfg.hidden_size,
                 cfg.vocab_size,
                 vb.pp("lm_head"),
-                &None,
-                &None,
-            )?
-        } else {
-            ReplicatedLinear::from_weight_bias(embed_tokens.embeddings().clone(), None)?
-        };
-        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
-
-        let rope_cfg = DeepSeekV2RopeConfig {
-            rope_scaling: moe_cfg.rope_scaling.clone(),
-            max_position_embeddings: cfg.max_seq_len,
-            rope_theta: cfg.rope_theta as f32,
-            qk_rope_head_dim: moe_cfg.qk_rope_head_dim,
-        };
-        let rotary_emb = Arc::new(DeepSeekV2RotaryEmbedding::new(&rope_cfg, dtype, device)?);
-
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        let vb_l = vb_m.pp("layers");
-        for layer_idx in 0..cfg.num_hidden_layers {
-            let layer = DecoderLayer::new(
-                rotary_emb.clone(),
-                cfg,
-                vb_l.pp(layer_idx),
-                layer_idx,
                 comm.clone(),
-            )?;
-            layers.push(layer);
-            reporter.write().set_progress(layer_idx + 1);
-        }
+                &None,
+                &None,
+                dtype,
+            )?
+        };
 
         Ok(Self {
-            lm_head,
             embed_tokens,
-            norm,
             layers,
-            dtype,
+            norm,
+            lm_head,
             device: device.clone(),
-            cfg: cfg.clone(),
+            config: cfg.clone(),
+            dtype,
+            vocab_size: cfg.vocab_size,
         })
+    }
+
+    pub fn embed_forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = self.embed_tokens.forward(xs)?;
+        let needs_f32 = if self.config.isq_quant.is_some() {
+            true
+        } else if let Some(qcfg) = &self.config.quantization_config {
+            !matches!(qcfg.quant_method.as_str(), "nvfp4" | "mxfp4" | "fp8")
+        } else {
+            false
+        };
+        if needs_f32 && xs.dtype() != DType::F32 {
+            xs.to_dtype(DType::F32)
+        } else {
+            Ok(xs)
+        }
     }
 
     pub fn forward(
         &self,
-        x: &Tensor,
-        input_positions: &Tensor,
+        input_ids: &Tensor,
+        positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        let seqlens = if input_metadata.cu_seqlens_q.is_some() {
+        self.forward_inner(input_ids, positions, kv_caches, input_metadata, false)
+    }
+
+    fn forward_inner(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        embeded_inputs: bool,
+    ) -> Result<Tensor> {
+        let seqlens = if let Some(seqlens) = input_metadata.seqlens.as_ref() {
+            seqlens.clone()
+        } else if input_metadata.cu_seqlens_q.is_some() {
             input_metadata
                 .cu_seqlens_q
                 .as_ref()
                 .unwrap()
                 .to_vec1::<u32>()?[1..]
-                .into()
+                .to_vec()
         } else {
             Vec::new()
         };
         let attention_mask = get_attention_causal_mask(
             &self.device,
             self.dtype,
-            input_positions,
+            positions,
             &seqlens,
-            self.cfg.sliding_window,
+            self.config.sliding_window,
             input_metadata.is_prefill,
         );
-        let mut xs = self.embed_tokens.forward(x)?;
+
+        let mut xs = if embeded_inputs {
+            input_ids.to_owned()
+        } else {
+            self.embed_forward(input_ids)?
+        };
 
         if let Some(kv_caches) = kv_caches {
-            for ((k_cache, v_cache), block) in zip(kv_caches.iter(), &self.layers) {
-                xs = block.forward(
+            for ((k_cache, v_cache), layer) in zip(kv_caches.iter(), self.layers.iter()) {
+                xs = layer.forward(
                     &xs,
                     attention_mask.as_ref(),
-                    input_positions,
+                    positions,
                     Some((k_cache, v_cache)),
                     input_metadata,
                 )?;
             }
-        } else {
-            for block in &self.layers {
-                xs = block.forward(
-                    &xs,
-                    attention_mask.as_ref(),
-                    input_positions,
-                    None,
-                    input_metadata,
-                )?;
-            }
         }
+
         if !seqlens.is_empty() {
-            let indices: Vec<_> = seqlens.iter().map(|x| x - 1 as u32).collect();
+            let indices: Vec<_> = seqlens.iter().map(|x| x - 1).collect();
             let batch = indices.len();
             xs = xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?;
         }
         let xs = self.norm.forward(&xs)?;
-        self.lm_head.forward(&xs)?.to_dtype(DType::F32)
+        let logits = self
+            .lm_head
+            .forward(&xs.to_dtype(self.dtype)?)?
+            .to_dtype(DType::F32)?;
+        Ok(logits)
     }
 
-    pub fn get_config(&self) -> &Config {
-        &self.cfg
+    pub fn forward_embedding(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        self.forward(input_ids, positions, kv_caches, input_metadata)
+    }
+
+    pub fn get_vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 }

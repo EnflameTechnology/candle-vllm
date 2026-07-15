@@ -3,7 +3,7 @@ use super::rotary_emb::ScalingRotaryEmbedding;
 #[cfg(feature = "eccl")]
 use crate::openai::distributed::AllReduce;
 use crate::openai::distributed::{
-    rms_norm_sharded, rms_norm_x, shard, tp_kv_head_sharding, Comm, MergedParallelColumnLinear, Rc,
+    kv_head_shard, rms_norm_sharded, rms_norm_x, shard, Comm, MergedParallelColumnLinear, Rc,
     TensorParallelColumnLinear, TensorParallelRowLinear, VarBuilder,
 };
 use crate::openai::models::layers::qrmsnorm::QRmsNorm;
@@ -155,7 +155,10 @@ impl Attention {
         let scale_dim0 = out_dim.div_ceil(by);
         let scale_dim1 = in_dim.div_ceil(bx);
 
-        let weight = match vb.get_with_hints_dtype((out_dim, in_dim), "weight", shard, DType::U8) {
+        let weight = match vb
+            .get_with_hints_dtype((out_dim, in_dim), "weight", shard, DType::F8E4M3)
+            .or_else(|_| vb.get_with_hints_dtype((out_dim, in_dim), "weight", shard, DType::U8))
+        {
             Ok(weight) => weight,
             Err(_) => return Ok(None),
         };
@@ -196,6 +199,7 @@ impl Attention {
         kv_out_dim: usize,
         attention_bias: bool,
         comm: Rc<Comm>,
+        kv_shard: Shard,
         dtype: DType,
         quant_cfg: &Option<crate::openai::models::QuantConfig>,
         quant: &Option<String>,
@@ -406,8 +410,13 @@ impl Attention {
                 | "Qwen3NextForCausalLM"
                 | "Qwen3NextForConditionalGeneration"
         );
-        // Qwen3.5/Qwen3-Next and Gemma q/k norms use Gemma-style +1 weight semantics.
-        let qk_norm_add_one = is_gemma || is_qwen35_or_next;
+        // MLX NVFP4 checkpoints contain the already-materialized norm weights;
+        // applying the Gemma/Qwen +1 convention a second time is incorrect.
+        let is_mlx_nvfp4 = cfg
+            .quantization_config
+            .as_ref()
+            .is_some_and(|q| q.is_mlx_nvfp4);
+        let qk_norm_add_one = is_gemma || (is_qwen35_or_next && !is_mlx_nvfp4);
         let attention_bias = if is_qwen35_or_next {
             cfg.use_qkv_bias.or(cfg.attention_bias).unwrap_or(false)
         } else {
@@ -415,8 +424,8 @@ impl Attention {
         };
         let attn_output_gate = is_qwen35_or_next;
         let q_out_dim = num_heads * head_dim * if attn_output_gate { 2 } else { 1 };
-        let (local_kv_heads, kv_shard) =
-            tp_kv_head_sharding(num_kv_heads, comm.rank(), comm.world_size())?;
+        let world_size = comm.world_size();
+        let (kv_heads, kv_shard) = kv_head_shard(num_kv_heads, comm.rank(), world_size)?;
         let qkv_proj = if let Some(packed) = Self::try_load_packed_qkv(
             &vb,
             hidden_sz,
@@ -424,6 +433,7 @@ impl Attention {
             num_kv_heads * head_dim,
             attention_bias,
             comm.clone(),
+            kv_shard,
             vb.dtype(),
             &cfg.quantization_config,
             &cfg.isq_quant,
@@ -567,7 +577,6 @@ impl Attention {
         assert!(cfg.num_attention_heads % comm.world_size() == 0);
 
         let attention_heads = cfg.num_attention_heads / comm.world_size();
-        let kv_heads = local_kv_heads;
         Ok(Self {
             qkv_proj,
             o_proj,
@@ -836,9 +845,23 @@ impl QuantizedAttention {
         #[allow(unused_variables)] comm: Rc<Comm>,
     ) -> Result<Self> {
         let prefix_vb = vb.pp(prefix);
+        let n_kv_head_global = config
+            .num_key_value_heads
+            .unwrap_or(config.num_attention_heads);
+        let (_, kv_shard) = kv_head_shard(n_kv_head_global, rank, world_size)?;
         let attention_wq = prefix_vb.get_sharded_no_shape("attn_q.weight", 0, rank, world_size)?;
-        let attention_wk = prefix_vb.get_sharded_no_shape("attn_k.weight", 0, rank, world_size)?;
-        let attention_wv = prefix_vb.get_sharded_no_shape("attn_v.weight", 0, rank, world_size)?;
+        let attention_wk = prefix_vb.get_sharded_no_shape(
+            "attn_k.weight",
+            0,
+            kv_shard.rank,
+            kv_shard.world_size,
+        )?;
+        let attention_wv = prefix_vb.get_sharded_no_shape(
+            "attn_v.weight",
+            0,
+            kv_shard.rank,
+            kv_shard.world_size,
+        )?;
 
         let attention_bq = prefix_vb.get_no_shape("attn_q.bias");
         let attention_bk = prefix_vb.get_no_shape("attn_k.bias");
@@ -858,9 +881,9 @@ impl QuantizedAttention {
 
         let attention_bk = if let Ok(bk) = attention_bk {
             let b = bk.dequantize(device)?.to_dtype(DType::F32)?;
-            if world_size > 1 {
-                let chunk = b.dim(0)? / world_size;
-                Some(b.narrow(0, rank * chunk, chunk)?.contiguous()?)
+            if kv_shard.world_size > 1 {
+                let chunk = b.dim(0)? / kv_shard.world_size;
+                Some(b.narrow(0, kv_shard.rank * chunk, chunk)?.contiguous()?)
             } else {
                 Some(b)
             }
@@ -870,9 +893,9 @@ impl QuantizedAttention {
 
         let attention_bv = if let Ok(bv) = attention_bv {
             let b = bv.dequantize(device)?.to_dtype(DType::F32)?;
-            if world_size > 1 {
-                let chunk = b.dim(0)? / world_size;
-                Some(b.narrow(0, rank * chunk, chunk)?.contiguous()?)
+            if kv_shard.world_size > 1 {
+                let chunk = b.dim(0)? / kv_shard.world_size;
+                Some(b.narrow(0, kv_shard.rank * chunk, chunk)?.contiguous()?)
             } else {
                 Some(b)
             }
@@ -900,14 +923,7 @@ impl QuantizedAttention {
             .head_dim
             .unwrap_or(config.hidden_size / config.num_attention_heads);
         let n_head = config.num_attention_heads / world_size;
-        let n_kv_head_global = config
-            .num_key_value_heads
-            .unwrap_or(config.num_attention_heads);
-        let n_kv_head = if n_kv_head_global >= world_size {
-            n_kv_head_global / world_size
-        } else {
-            n_kv_head_global
-        };
+        let (n_kv_head, _) = kv_head_shard(n_kv_head_global, rank, world_size)?;
         let expected_q_dim = n_head * head_dim;
         let q_out_dim = attention_wq.shape().dims()[0];
         let attn_output_gate = q_out_dim == expected_q_dim * 2;

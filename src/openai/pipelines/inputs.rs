@@ -136,11 +136,7 @@ impl LLMEngine {
                     max_context_len = seq_len + self.cache_config.block_size;
                 }
                 let num_cached_tokens = seq.deref().get_num_cached_tokens();
-                let num_tokens = if chunk_size > 0 {
-                    std::cmp::min(chunk_size, seq_len - num_cached_tokens)
-                } else {
-                    seq_len - num_cached_tokens
-                };
+                let num_tokens = seq.deref().prefill_chunk_tokens(chunk_size);
                 #[cfg(feature = "flashinfer")]
                 prefill_tokens.push(num_tokens);
 
@@ -150,6 +146,7 @@ impl LLMEngine {
                 let use_cached_kv = num_cached_tokens > 0
                     && ((cfg!(feature = "flash")
                         || cfg!(feature = "flashattn")
+                        || cfg!(feature = "metal")
                         || cfg!(feature = "flashinfer")
                         || cfg!(all(feature = "aten", feature = "gcu")))
                         || self.scheduler.prefix_cache_enabled());

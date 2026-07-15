@@ -49,6 +49,8 @@ pub struct SequenceData {
     pub stream_role_sent: bool,
     pub images: Option<ImageData>,
     pub mamba_prefix_hash: Option<u64>,
+    pub mamba_prefix_warmup_tokens: Option<usize>,
+    swapped_time: Option<SystemTime>,
 }
 
 impl SequenceData {
@@ -72,6 +74,8 @@ impl SequenceData {
             stream_role_sent: false,
             images,
             mamba_prefix_hash: None,
+            mamba_prefix_warmup_tokens: None,
+            swapped_time: None,
         }
     }
 
@@ -245,6 +249,14 @@ impl _Sequence {
         self.deref_mut().num_cached_tokens = num_cached_tokens;
     }
 
+    pub fn swapped_time(&self) -> Option<SystemTime> {
+        self.deref().swapped_time
+    }
+
+    pub fn set_swapped_time(&mut self, swapped_time: Option<SystemTime>) {
+        self.deref_mut().swapped_time = swapped_time;
+    }
+
     pub fn get_images(&self) -> Option<ImageData> {
         self.deref().images.clone()
     }
@@ -259,6 +271,46 @@ impl _Sequence {
 
     pub fn set_mamba_prefix_hash(&mut self, hash: Option<u64>) {
         self.deref_mut().mamba_prefix_hash = hash;
+    }
+
+    pub fn set_mamba_prefix_warmup_tokens(&mut self, tokens: Option<usize>) {
+        self.deref_mut().mamba_prefix_warmup_tokens = tokens;
+    }
+
+    pub fn clear_mamba_prefix_warmup(&mut self) {
+        self.deref_mut().mamba_prefix_warmup_tokens = None;
+    }
+
+    pub fn active_mamba_prefix_warmup_target(&self) -> Option<usize> {
+        let data = self.deref();
+        let target_tokens = data.mamba_prefix_warmup_tokens?;
+        if target_tokens > data.num_cached_tokens && target_tokens < data.prompt_token_ids.len() {
+            Some(target_tokens)
+        } else {
+            None
+        }
+    }
+
+    pub fn prefill_chunk_tokens(&self, default_chunk_size: usize) -> usize {
+        let data = self.deref();
+        let remaining = data
+            .prompt_token_ids
+            .len()
+            .saturating_sub(data.num_cached_tokens);
+        if remaining == 0 {
+            return 0;
+        }
+        if default_chunk_size == 0 {
+            return remaining;
+        }
+        if let Some(target_tokens) = data.mamba_prefix_warmup_tokens {
+            if target_tokens > data.num_cached_tokens && target_tokens < data.prompt_token_ids.len()
+            {
+                let to_target = target_tokens - data.num_cached_tokens;
+                return to_target.min(default_chunk_size);
+            }
+        }
+        remaining.min(default_chunk_size)
     }
 }
 
@@ -459,5 +511,65 @@ impl SequenceGroup {
 
     pub fn get_created_time(&self) -> SystemTime {
         self.created_time
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::_Sequence;
+
+    fn test_sequence(len: usize) -> _Sequence {
+        let tokens = (0..len as u32).collect::<Vec<_>>();
+        _Sequence::new(&tokens, 0, 64, None)
+    }
+
+    #[test]
+    fn prefill_chunk_tokens_uses_mamba_warmup_boundary() {
+        let mut seq = test_sequence(20_000);
+        seq.set_num_cached_tokens(0);
+        seq.set_mamba_prefix_warmup_tokens(Some(5_824));
+
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 5_824);
+
+        seq.set_num_cached_tokens(5_824);
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 8_192);
+    }
+
+    #[test]
+    fn prefill_chunk_tokens_tracks_multi_chunk_mamba_warmup_boundary() {
+        let mut seq = test_sequence(50_000);
+        seq.set_mamba_prefix_warmup_tokens(Some(20_000));
+
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 8_192);
+
+        seq.set_num_cached_tokens(8_192);
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 8_192);
+
+        seq.set_num_cached_tokens(16_384);
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 3_616);
+
+        seq.set_num_cached_tokens(20_000);
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 8_192);
+    }
+
+    #[test]
+    fn prefill_chunk_tokens_ignores_invalid_mamba_warmup_boundary() {
+        let mut seq = test_sequence(10_000);
+        seq.set_num_cached_tokens(4_096);
+        seq.set_mamba_prefix_warmup_tokens(Some(4_096));
+
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 5_904);
+
+        seq.set_mamba_prefix_warmup_tokens(Some(12_000));
+        assert_eq!(seq.prefill_chunk_tokens(8_192), 5_904);
+    }
+
+    #[test]
+    fn prefill_chunk_tokens_zero_chunk_size_ignores_warmup_boundary() {
+        let mut seq = test_sequence(10_000);
+        seq.set_num_cached_tokens(1_000);
+        seq.set_mamba_prefix_warmup_tokens(Some(5_000));
+
+        assert_eq!(seq.prefill_chunk_tokens(0), 9_000);
     }
 }

@@ -298,6 +298,7 @@ impl LLMEngine {
         if aborted_seq_ids.is_empty() {
             return (0..scheduled.len()).map(|idx| idx as u32).collect();
         }
+        self.release_sequence_states(&aborted_seq_ids);
 
         let aborted_set = aborted_seq_ids.iter().copied().collect::<HashSet<_>>();
         let mut kept_indices = Vec::with_capacity(scheduled.len());
@@ -513,6 +514,28 @@ impl LLMEngine {
         }
     }
 
+    fn release_sequence_states(&self, seq_ids: &[usize]) {
+        if seq_ids.is_empty() {
+            return;
+        }
+
+        for (pipeline, _) in self.pipelines.values() {
+            for &seq_id in seq_ids {
+                pipeline.release_sequence_state(seq_id);
+            }
+        }
+
+        #[cfg(feature = "nccl")]
+        {
+            if self.multi_process {
+                let mut dm = self.daemon_manager.write();
+                if let Some(dm) = dm.as_mut() {
+                    let _ = dm.send_message(&MessageType::FinishSequences(seq_ids.to_vec()));
+                }
+            }
+        }
+    }
+
     fn validate_scheduled_prompt_mamba_prefix_states(
         &mut self,
         scheduled: &VecDeque<Arc<SequenceGroup>>,
@@ -692,7 +715,12 @@ impl LLMEngine {
         );
 
         if let Some(estimate) = hybrid_mamba_estimate {
-            let stride_blocks = crate::mamba_snapshot_block_stride_blocks();
+            let effective_prefill_chunk_size = prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE);
+            let stride_blocks = crate::mamba_snapshot_block_stride_blocks(
+                effective_prefill_chunk_size
+                    .div_ceil(cache_config.block_size)
+                    .max(1),
+            );
             info!(
                 "Hybrid mamba snapshot capture stride: {} block(s) ({} tokens), configured by {}",
                 stride_blocks,
@@ -1339,17 +1367,46 @@ impl LLMEngine {
         scheduler_output: &SchedulerOutput,
         rank: usize,
     ) -> Result<()> {
-        let cache_engine = Box::new(&mut self.get_mut_pipeline(rank).unwrap().1);
-        if !scheduler_output.blocks_to_swap_in.is_empty() {
-            cache_engine.swap_in(scheduler_output.blocks_to_swap_in.clone())?;
+        let result = {
+            let cache_engine = Box::new(&mut self.get_mut_pipeline(rank).unwrap().1);
+            (|| -> Result<()> {
+                if !scheduler_output.blocks_to_swap_in.is_empty() {
+                    cache_engine.swap_in(scheduler_output.blocks_to_swap_in.clone())?;
+                }
+                if !scheduler_output.blocks_to_swap_out.is_empty() {
+                    cache_engine.swap_out(scheduler_output.blocks_to_swap_out.clone())?;
+                }
+                if !scheduler_output.blocks_to_copy.is_empty() {
+                    cache_engine.copy(scheduler_output.blocks_to_copy.clone())?;
+                }
+                Ok(())
+            })()
+        };
+
+        match result {
+            Ok(()) => {
+                for group_id in &scheduler_output.swap_in_groups {
+                    self.scheduler.block_engine.finalize_swap_in(*group_id);
+                }
+                for group_id in &scheduler_output.swap_out_groups {
+                    self.scheduler.block_engine.finalize_swap_out(*group_id);
+                }
+                Ok(())
+            }
+            Err(err) => {
+                for group_id in &scheduler_output.swap_in_groups {
+                    self.scheduler.block_engine.rollback_swap_in(*group_id);
+                }
+                for group_id in &scheduler_output.swap_out_groups {
+                    self.scheduler.block_engine.rollback_swap_out(*group_id);
+                }
+                self.scheduler
+                    .rollback_swap_in_groups(&scheduler_output.swap_in_groups);
+                self.scheduler
+                    .rollback_swap_out_groups(&scheduler_output.swap_out_groups);
+                Err(err)
+            }
         }
-        if !scheduler_output.blocks_to_swap_out.is_empty() {
-            cache_engine.swap_out(scheduler_output.blocks_to_swap_out.clone())?;
-        }
-        if !scheduler_output.blocks_to_copy.is_empty() {
-            cache_engine.copy(scheduler_output.blocks_to_copy.clone())?;
-        }
-        Ok(())
     }
 
     #[cfg(feature = "gcu")]
@@ -1576,6 +1633,8 @@ impl LLMEngine {
     fn schedule_current_batch(&mut self, rank: usize) -> Result<()> {
         self.validate_mamba_prefix_hashes_before_schedule(rank);
         let scheduler_outputs = self.scheduler.schedule();
+        let pending_runner_releases = self.scheduler.take_pending_runner_releases();
+        self.release_sequence_states(&pending_runner_releases);
         if !scheduler_outputs.ignored_seq_groups.is_empty() {
             for group in scheduler_outputs.ignored_seq_groups.iter() {
                 if let Some(sender) = &group.sender {
@@ -1636,6 +1695,7 @@ impl LLMEngine {
         }
 
         let aborted = self.scheduler.abort_sequences(&seq_ids);
+        self.release_sequence_states(&aborted);
         warn!(
             "Aborted {} scheduled sequence(s) after generation failure: {:?}",
             aborted.len(),

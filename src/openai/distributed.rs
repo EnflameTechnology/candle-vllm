@@ -281,8 +281,11 @@ impl MergedParallelColumnLinear {
         }
 
         // Load full weight and scale (no sharding initially)
-        let weight =
-            vb.get_with_hints_dtype((out_dim, in_dim), "weight", Shard::default(), DType::U8)?;
+        let weight = vb
+            .get_with_hints_dtype((out_dim, in_dim), "weight", Shard::default(), DType::F8E4M3)
+            .or_else(|_| {
+                vb.get_with_hints_dtype((out_dim, in_dim), "weight", Shard::default(), DType::U8)
+            })?;
         let scale_dim0 = (out_dim + by - 1) / by;
         let scale_dim1 = (in_dim + bx - 1) / bx;
         let weight_scale = match vb.get_with_hints_dtype(
@@ -715,16 +718,14 @@ impl TensorParallelRowLinear {
         let mut xs = self.linear.forward(x)?;
         #[cfg(feature = "eccl")]
         if let Some(all_reduce) = &self.all_reduce {
-            if xs.dtype() != self.dtype {
-                //only bf16/fp16 supported in all reduce
-                let xs_reduce = xs.to_dtype(self.dtype)?.apply_op1_no_bwd(all_reduce)?;
-                xs = xs_reduce.to_dtype(xs.dtype())?
-            } else {
-                xs = xs.apply_op1_no_bwd(all_reduce)?;
-            }
+            xs = xs.apply_op1_no_bwd(all_reduce)?;
         }
         if let Some(bias) = &self.bias {
-            xs = xs.broadcast_add(bias)?;
+            if bias.dtype() == xs.dtype() {
+                xs = xs.broadcast_add(bias)?;
+            } else {
+                xs = xs.broadcast_add(&bias.to_dtype(xs.dtype())?)?;
+            }
         }
         Ok(xs)
     }
@@ -746,42 +747,60 @@ pub fn local_num_kv_heads(num_kv_heads: usize, num_shards: usize) -> usize {
     std::cmp::max(1, num_kv_heads / num_shards.max(1))
 }
 
-/// Resolve per-rank KV head count and the weight shard for K/V projections.
-///
-/// Supports:
-/// - Partitioning: `num_kv_heads % world_size == 0`
-/// - Replication: `world_size % num_kv_heads == 0` when TP exceeds KV heads
+/// Determine the local KV-head count and weight shard for tensor-parallel
+/// attention. When there are fewer KV heads than ranks, each KV head is
+/// replicated across a contiguous group of ranks so every rank receives a
+/// complete KV head.
+pub fn kv_head_shard(
+    total_num_kv_heads: usize,
+    rank: usize,
+    world_size: usize,
+) -> Result<(usize, Shard)> {
+    if total_num_kv_heads == 0 {
+        candle_core::bail!("num_key_value_heads must be > 0");
+    }
+    let world_size = world_size.max(1);
+    if world_size == 1 {
+        return Ok((total_num_kv_heads, Shard::default()));
+    }
+    if rank >= world_size {
+        candle_core::bail!(
+            "rank out of bounds for tensor parallel group (rank={}, world_size={})",
+            rank,
+            world_size
+        );
+    }
+
+    if total_num_kv_heads >= world_size {
+        if total_num_kv_heads % world_size != 0 {
+            candle_core::bail!(
+                "KV heads must be divisible by tensor parallel world_size when partitioned (num_kv_heads={}, world_size={})",
+                total_num_kv_heads,
+                world_size
+            );
+        }
+        Ok((total_num_kv_heads / world_size, shard(0, rank, world_size)))
+    } else {
+        if world_size % total_num_kv_heads != 0 {
+            candle_core::bail!(
+                "tensor parallel world_size must be divisible by KV heads when KV heads are replicated (num_kv_heads={}, world_size={})",
+                total_num_kv_heads,
+                world_size
+            );
+        }
+        let ranks_per_kv_head = world_size / total_num_kv_heads;
+        let kv_head_rank = rank / ranks_per_kv_head;
+        Ok((1, shard(0, kv_head_rank, total_num_kv_heads)))
+    }
+}
+
+/// Alias used by GCU/enflame call sites (same as [`kv_head_shard`]).
 pub fn tp_kv_head_sharding(
     num_kv_heads: usize,
     rank: usize,
     world_size: usize,
 ) -> Result<(usize, Shard)> {
-    let world_size = world_size.max(1);
-    if world_size == 1 {
-        return Ok((num_kv_heads, Shard::default()));
-    }
-    if num_kv_heads >= world_size {
-        if num_kv_heads % world_size != 0 {
-            candle_core::bail!(
-                "num_key_value_heads ({}) must be divisible by world_size ({})",
-                num_kv_heads,
-                world_size
-            );
-        }
-        Ok((num_kv_heads / world_size, shard(0, rank, world_size)))
-    } else {
-        if world_size % num_kv_heads != 0 {
-            candle_core::bail!(
-                "world_size ({}) must be divisible by num_key_value_heads ({}) \
-                 when tensor parallel size exceeds KV heads (GQA replication)",
-                world_size,
-                num_kv_heads
-            );
-        }
-        let num_replicas = world_size / num_kv_heads;
-        let kv_rank = rank / num_replicas;
-        Ok((1, shard(0, kv_rank, num_kv_heads)))
-    }
+    kv_head_shard(num_kv_heads, rank, world_size)
 }
 use crate::openai::models::QuantConfig;
 impl TensorParallelColumnLinear {
@@ -977,8 +996,16 @@ impl MergedParallelColumnLinear {
                 candle_core::bail!("LnFp8: invalid zero in weight_block_size");
             }
 
-            let weight =
-                vb.get_with_hints_dtype((out_dim, in_dim), "weight", Shard::default(), DType::U8)?;
+            let weight = vb
+                .get_with_hints_dtype((out_dim, in_dim), "weight", Shard::default(), DType::F8E4M3)
+                .or_else(|_| {
+                    vb.get_with_hints_dtype(
+                        (out_dim, in_dim),
+                        "weight",
+                        Shard::default(),
+                        DType::U8,
+                    )
+                })?;
             let scale_dim0 = (out_dim + by - 1) / by;
             let scale_dim1 = (in_dim + bx - 1) / bx;
             let weight_scale = match vb.get_with_hints_dtype(
@@ -1251,6 +1278,35 @@ pub fn layer_norm(size: usize, eps: f64, affine: bool, vb: VarBuilder) -> Result
 }
 
 pub fn embedding(vocab_size: usize, hidden_size: usize, vb: VarBuilder) -> Result<Embedding> {
+    if vb.contains_tensor("scales") {
+        // MLX NVFP4 embeddings use the same U32 packing as linear weights,
+        // but embedding lookup needs a dequantized table rather than a GEMM.
+        let no_shard = Shard::default();
+        let weight = vb.get_with_hints_dtype(
+            (vocab_size, hidden_size / 8),
+            "weight",
+            no_shard,
+            DType::U32,
+        )?;
+        let scales = vb.get_with_hints_dtype(
+            (vocab_size, hidden_size / 16),
+            "scales",
+            no_shard,
+            DType::U8,
+        )?;
+        let dtype = match vb.dtype() {
+            DType::F16 | DType::BF16 => vb.dtype(),
+            _ => DType::BF16,
+        };
+        let embeddings = attention_rs::nvfp4_linear::mlx_dequant_embedding(
+            &weight,
+            &scales,
+            vocab_size,
+            hidden_size,
+            dtype,
+        )?;
+        return Ok(Embedding::new(embeddings, hidden_size));
+    }
     let embeddings = vb.get((vocab_size, hidden_size), "weight")?;
     Ok(Embedding::new(embeddings, hidden_size))
 }
@@ -1680,12 +1736,7 @@ impl VocabParallelLinear {
 
         #[cfg(feature = "eccl")]
         if let Some(all_gather) = &self.all_gather {
-            let gathered = if logits.dtype() != self.dtype {
-                let g = all_gather.apply(&logits.to_dtype(self.dtype)?)?;
-                g.to_dtype(logits.dtype())?
-            } else {
-                all_gather.apply(&logits)?
-            };
+            let gathered = all_gather.apply(&logits)?;
 
             let ws = all_gather.world_size;
             let local_vocab = logits.dim(logits.dims().len() - 1)?;
