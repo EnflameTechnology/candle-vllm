@@ -1946,10 +1946,7 @@ impl DefaultPipeline {
                     kv_dtype: _kv_cache_dtype,
                     out_dtype: dtype,
                     page_size: block_size,
-                    num_kv_heads: crate::openai::distributed::local_num_kv_heads(
-                        kv_heads,
-                        _num_shards,
-                    ),
+                    num_kv_heads: (kv_heads / _num_shards.max(1)).max(1),
                     head_dim: hd,
                     num_qo_heads: config.num_attention_heads / _num_shards,
                 })
@@ -1962,12 +1959,11 @@ impl DefaultPipeline {
                 kv_dtype: _kv_cache_dtype,
                 out_dtype: dtype,
                 page_size: block_size,
-                num_kv_heads: crate::openai::distributed::local_num_kv_heads(
-                    config
-                        .num_key_value_heads
-                        .unwrap_or(config.num_attention_heads),
-                    _num_shards,
-                ),
+                num_kv_heads: (config
+                    .num_key_value_heads
+                    .unwrap_or(config.num_attention_heads)
+                    / _num_shards.max(1))
+                .max(1),
                 head_dim: config.k_head_dim(),
                 num_qo_heads: config.num_attention_heads / _num_shards,
             })

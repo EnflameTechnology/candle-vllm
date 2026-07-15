@@ -699,7 +699,7 @@ impl BlockEngine {
     }
 
     pub fn cpu_swap_enabled(&self) -> bool {
-        cfg!(feature = "cuda")
+        cfg!(any(feature = "cuda", feature = "gcu"))
     }
 
     pub fn prefix_cache_blocks(&self) -> usize {

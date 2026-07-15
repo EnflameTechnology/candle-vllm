@@ -178,18 +178,14 @@ pub fn get_cache_config(
     } else if let Some(ref per_layer_cfg) = config.gemma4_per_layer_cache_config() {
         let mut total = 0usize;
         for &(kv_heads, head_dim) in per_layer_cfg {
-            let kv_heads_sharded =
-                crate::openai::distributed::local_num_kv_heads(kv_heads, num_shards);
+            let kv_heads_sharded = kv_heads_per_shard(kv_heads);
             total += block_size * kv_heads_sharded * head_dim * dsize * 2;
         }
         total
     } else {
         dsize
             * block_size
-            * crate::openai::distributed::local_num_kv_heads(
-                config.num_key_value_heads.unwrap(),
-                num_shards,
-            )
+            * kv_heads_per_shard(config.num_key_value_heads.unwrap())
             * config.k_head_dim()
             * kv_layers
             * 2
@@ -201,16 +197,12 @@ pub fn get_cache_config(
                 per_layer_cfg
                     .iter()
                     .map(|&(kv_heads, hd)| {
-                        let heads =
-                            crate::openai::distributed::local_num_kv_heads(kv_heads, num_shards);
+                        let heads = kv_heads_per_shard(kv_heads);
                         block_size * heads * 4 + block_size * heads * (hd / 2)
                     })
                     .sum()
             } else {
-                let heads = crate::openai::distributed::local_num_kv_heads(
-                    config.num_key_value_heads.unwrap(),
-                    num_shards,
-                );
+                let heads = kv_heads_per_shard(config.num_key_value_heads.unwrap());
                 let hd = config.k_head_dim();
                 (block_size * heads * 4 + block_size * heads * (hd / 2)) * kv_layers
             }
@@ -220,16 +212,12 @@ pub fn get_cache_config(
                 per_layer_cfg
                     .iter()
                     .map(|&(kv_heads, hd)| {
-                        let heads =
-                            crate::openai::distributed::local_num_kv_heads(kv_heads, num_shards);
+                        let heads = kv_heads_per_shard(kv_heads);
                         block_size * heads * 4 * 2 + block_size * heads * (hd / 2) * 2
                     })
                     .sum()
             } else {
-                let heads = crate::openai::distributed::local_num_kv_heads(
-                    config.num_key_value_heads.unwrap(),
-                    num_shards,
-                );
+                let heads = kv_heads_per_shard(config.num_key_value_heads.unwrap());
                 let hd = config.k_head_dim();
                 (block_size * heads * 4 * 2 + block_size * heads * (hd / 2) * 2) * kv_layers
             }
@@ -239,18 +227,14 @@ pub fn get_cache_config(
                 per_layer_cfg
                     .iter()
                     .map(|&(kv_heads, hd)| {
-                        let heads =
-                            crate::openai::distributed::local_num_kv_heads(kv_heads, num_shards);
+                        let heads = kv_heads_per_shard(kv_heads);
                         block_size * heads * 4 * 2
                             + block_size * heads * ((hd * 3 + 7) / 8)
                             + block_size * heads * (hd / 2)
                     })
                     .sum()
             } else {
-                let heads = crate::openai::distributed::local_num_kv_heads(
-                    config.num_key_value_heads.unwrap(),
-                    num_shards,
-                );
+                let heads = kv_heads_per_shard(config.num_key_value_heads.unwrap());
                 let hd = config.k_head_dim();
                 (block_size * heads * 4 * 2
                     + block_size * heads * ((hd * 3 + 7) / 8)
@@ -266,7 +250,8 @@ pub fn get_cache_config(
     // Match xInfer's default CPU swap policy: reserve half as many CPU KV
     // blocks as GPU KV blocks. A non-zero `kvcache_mem_cpu` remains an
     // explicit megabyte override for callers that need a fixed budget.
-    let num_cpu_blocks = if cfg!(feature = "cuda") {
+    // Enabled for CUDA and GCU (both use discrete device memory + CPU swap tier).
+    let num_cpu_blocks = if cfg!(any(feature = "cuda", feature = "gcu")) {
         if kvcache_mem_cpu == 0 {
             num_gpu_blocks / 2
         } else {
@@ -279,8 +264,8 @@ pub fn get_cache_config(
         "KV cache block allocation: GPU {} block(s), CPU {} block(s) ({})",
         num_gpu_blocks,
         num_cpu_blocks,
-        if !cfg!(feature = "cuda") {
-            "CPU swap disabled for non-CUDA device"
+        if !cfg!(any(feature = "cuda", feature = "gcu")) {
+            "CPU swap disabled for this device"
         } else if kvcache_mem_cpu == 0 {
             "CPU default 0.5x GPU blocks"
         } else {

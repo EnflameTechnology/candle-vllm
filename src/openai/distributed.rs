@@ -739,14 +739,6 @@ pub fn shard(dim: usize, rank: usize, world_size: usize) -> candle_nn::var_build
     }
 }
 
-/// Local KV-head count per tensor-parallel rank.
-///
-/// When `num_shards > num_kv_heads` and shards evenly cover KV heads (GQA
-/// replication), each rank still owns at least one KV head.
-pub fn local_num_kv_heads(num_kv_heads: usize, num_shards: usize) -> usize {
-    std::cmp::max(1, num_kv_heads / num_shards.max(1))
-}
-
 /// Determine the local KV-head count and weight shard for tensor-parallel
 /// attention. When there are fewer KV heads than ranks, each KV head is
 /// replicated across a contiguous group of ranks so every rank receives a
@@ -759,9 +751,8 @@ pub fn kv_head_shard(
     if total_num_kv_heads == 0 {
         candle_core::bail!("num_key_value_heads must be > 0");
     }
-    let world_size = world_size.max(1);
-    if world_size == 1 {
-        return Ok((total_num_kv_heads, Shard::default()));
+    if world_size == 0 {
+        candle_core::bail!("tensor parallel world_size must be > 0");
     }
     if rank >= world_size {
         candle_core::bail!(
@@ -792,15 +783,6 @@ pub fn kv_head_shard(
         let kv_head_rank = rank / ranks_per_kv_head;
         Ok((1, shard(0, kv_head_rank, total_num_kv_heads)))
     }
-}
-
-/// Alias used by GCU/enflame call sites (same as [`kv_head_shard`]).
-pub fn tp_kv_head_sharding(
-    num_kv_heads: usize,
-    rank: usize,
-    world_size: usize,
-) -> Result<(usize, Shard)> {
-    kv_head_shard(num_kv_heads, rank, world_size)
 }
 use crate::openai::models::QuantConfig;
 impl TensorParallelColumnLinear {

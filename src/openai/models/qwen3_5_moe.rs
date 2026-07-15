@@ -171,6 +171,10 @@ enum MoeOrMlp {
     FusedMoeISQ(FusedMoeISQ),
     #[cfg(not(feature = "gcu"))]
     FusedMoeFp8(FusedMoeFp8),
+    #[cfg(not(feature = "gcu"))]
+    FusedMoeMxfp4(FusedMoeMxfp4),
+    #[cfg(not(feature = "gcu"))]
+    FusedMoeNvfp4(FusedMoeNvfp4),
 }
 
 impl MoeOrMlp {
@@ -181,6 +185,10 @@ impl MoeOrMlp {
             Self::FusedMoeISQ(m) => m.forward(xs, is_prefill),
             #[cfg(not(feature = "gcu"))]
             Self::FusedMoeFp8(m) => m.forward(xs, is_prefill),
+            #[cfg(not(feature = "gcu"))]
+            Self::FusedMoeMxfp4(m) => m.forward(xs, is_prefill),
+            #[cfg(not(feature = "gcu"))]
+            Self::FusedMoeNvfp4(m) => m.forward(xs, is_prefill),
         }
     }
 }
@@ -237,18 +245,62 @@ impl DecoderLayer {
             candle::bail!("Expected QwenMoEConfig")
         };
 
-        let is_fp8_model = if let Some(ref quant_cfg) = cfg.quantization_config {
-            quant_cfg.quant_method == "fp8"
-        } else {
-            false
-        };
         // Qwen3.5 MoE / Qwen3-Next are routed-MoE layers; keep model path aligned
         // with upstream and avoid dense-MLP fallback in these architectures.
-        let mlp = if is_fp8_model {
-            if let Some(ref _quant_cfg) = cfg.quantization_config {
-                candle::bail!("FP8 MoE is not supported on GCU; use a non-fp8 checkpoint or build without the gcu feature")
+        let mlp = if let Some(ref quant_cfg) = cfg.quantization_config {
+            if quant_cfg.quant_method == "fp8" {
+                #[cfg(feature = "gcu")]
+                {
+                    let _ = quant_cfg;
+                    candle::bail!("FP8 MoE is not supported on GCU; use a non-fp8 checkpoint or build without the gcu feature")
+                }
+                #[cfg(not(feature = "gcu"))]
+                {
+                    MoeOrMlp::FusedMoeFp8(FusedMoeFp8::new(
+                        cfg,
+                        vb.pp("mlp").clone(),
+                        comm.clone(),
+                        dtype,
+                        quant_cfg,
+                    )?)
+                }
+            } else if quant_cfg.quant_method == "mxfp4" {
+                #[cfg(feature = "gcu")]
+                {
+                    let _ = quant_cfg;
+                    candle::bail!("MXFP4 MoE is not supported on GCU")
+                }
+                #[cfg(not(feature = "gcu"))]
+                {
+                    MoeOrMlp::FusedMoeMxfp4(FusedMoeMxfp4::new(
+                        cfg,
+                        vb.pp("mlp").clone(),
+                        comm.clone(),
+                        dtype,
+                    )?)
+                }
+            } else if quant_cfg.quant_method == "nvfp4" {
+                #[cfg(feature = "gcu")]
+                {
+                    let _ = quant_cfg;
+                    candle::bail!("NVFP4 MoE is not supported on GCU")
+                }
+                #[cfg(not(feature = "gcu"))]
+                {
+                    MoeOrMlp::FusedMoeNvfp4(FusedMoeNvfp4::new(
+                        cfg,
+                        vb.pp("mlp").clone(),
+                        comm.clone(),
+                        dtype,
+                    )?)
+                }
             } else {
-                candle_core::bail!("Missing quantization_config for fp8 model!")
+                MoeOrMlp::FusedMoe(FusedMoe::new(
+                    cfg,
+                    vb.pp("mlp").clone(),
+                    comm.clone(),
+                    dtype,
+                )?)
             }
         } else if cfg.isq_quant.is_some() {
             #[cfg(feature = "gcu")]

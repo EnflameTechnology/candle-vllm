@@ -1335,10 +1335,7 @@ impl AttentionSelect {
         } else {
             let head_dim = cfg.head_dim.unwrap();
             let attention_heads = cfg.num_attention_heads / comm.world_size();
-            let kv_heads = crate::openai::distributed::local_num_kv_heads(
-                cfg.num_key_value_heads.unwrap(),
-                comm.world_size(),
-            );
+            let kv_heads = (cfg.num_key_value_heads.unwrap() / comm.world_size()).max(1);
             AttentionSelect::Paged(
                 PagedAttention::new(
                     attention_heads,

@@ -1009,30 +1009,33 @@ impl QuantizedAttention {
 
         #[cfg(feature = "gcu")]
         let (q, k, v) = {
-            let q = q_linear
-                .reshape((1, seq_len, self.n_head, self.head_dim))?
-                .transpose(1, 2)?;
-            let k = k
-                .reshape((1, seq_len, self.n_kv_head, self.head_dim))?
-                .transpose(1, 2)?;
-            let v = v
-                .reshape((1, seq_len, self.n_kv_head, self.head_dim))?
-                .transpose(1, 2)?
-                .contiguous()?;
-            (q, k, v)
+            if self.q_norm.is_some() {
+                // Head-major layout for GCU QK-norm kernels: [1, heads, seq, dim].
+                // Converted back to [seq, heads, dim] after the norm block below.
+                let q = q_linear
+                    .reshape((1, seq_len, self.n_head, self.head_dim))?
+                    .transpose(1, 2)?;
+                let k = k
+                    .reshape((1, seq_len, self.n_kv_head, self.head_dim))?
+                    .transpose(1, 2)?;
+                let v = v
+                    .reshape((1, seq_len, self.n_kv_head, self.head_dim))?
+                    .transpose(1, 2)?
+                    .contiguous()?;
+                (q, k, v)
+            } else {
+                // Match CUDA [seq, heads, dim] for RoPE / paged KV cache.
+                let q = q_linear.reshape((seq_len, self.n_head, self.head_dim))?;
+                let kn = k.reshape((seq_len, self.n_kv_head, self.head_dim))?;
+                let vn = v.reshape((seq_len, self.n_kv_head, self.head_dim))?;
+                (q, kn, vn)
+            }
         };
         #[cfg(not(feature = "gcu"))]
         let (q, k, v) = {
             let q = q_linear.reshape((seq_len, self.n_head, self.head_dim))?;
             let k = k.reshape((seq_len, self.n_kv_head, self.head_dim))?;
             let v = v.reshape((seq_len, self.n_kv_head, self.head_dim))?;
-            (q, k, v)
-        };
-
-        #[cfg(feature = "gcu")]
-        let (q, k, v) = if self.q_norm.is_none() {
-            (q.squeeze(0)?, k.squeeze(0)?, v.squeeze(0)?)
-        } else {
             (q, k, v)
         };
 
@@ -1072,9 +1075,11 @@ impl QuantizedAttention {
             (q, k)
         };
 
+        // After GCU QK-norm path, V is still [1, heads, seq, dim] — restore
+        // [seq, heads, dim] before RoPE / attention.
         #[cfg(feature = "gcu")]
         let v = if v.dims().len() == 4 {
-            v.squeeze(0)?
+            v.squeeze(0)?.transpose(0, 1)?.contiguous()?
         } else {
             v
         };

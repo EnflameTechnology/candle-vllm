@@ -1361,7 +1361,6 @@ impl LLMEngine {
 }
 
 impl LLMEngine {
-    #[cfg(not(feature = "gcu"))]
     fn execute_scheduler_ops(
         &mut self,
         scheduler_output: &SchedulerOutput,
@@ -1370,11 +1369,15 @@ impl LLMEngine {
         let result = {
             let cache_engine = Box::new(&mut self.get_mut_pipeline(rank).unwrap().1);
             (|| -> Result<()> {
-                if !scheduler_output.blocks_to_swap_in.is_empty() {
-                    cache_engine.swap_in(scheduler_output.blocks_to_swap_in.clone())?;
-                }
+                // Offload before promote/copy so recycled GPU block IDs retain
+                // their source payload until it has been copied to CPU. Matches
+                // vLLM's worker order and is required when the same schedule
+                // step reuses freed GPU physical blocks for COW or swap-in.
                 if !scheduler_output.blocks_to_swap_out.is_empty() {
                     cache_engine.swap_out(scheduler_output.blocks_to_swap_out.clone())?;
+                }
+                if !scheduler_output.blocks_to_swap_in.is_empty() {
+                    cache_engine.swap_in(scheduler_output.blocks_to_swap_in.clone())?;
                 }
                 if !scheduler_output.blocks_to_copy.is_empty() {
                     cache_engine.copy(scheduler_output.blocks_to_copy.clone())?;
@@ -1407,15 +1410,6 @@ impl LLMEngine {
                 Err(err)
             }
         }
-    }
-
-    #[cfg(feature = "gcu")]
-    fn execute_scheduler_ops(
-        &mut self,
-        _scheduler_output: &SchedulerOutput,
-        _rank: usize,
-    ) -> Result<()> {
-        Ok(())
     }
 
     #[allow(unused)]

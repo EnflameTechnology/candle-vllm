@@ -1,5 +1,6 @@
 #[cfg(not(feature = "gcu"))]
 use crate::backend::custom_ops::moe::TopKLastDimOp;
+#[cfg(not(feature = "gcu"))]
 use crate::candle::quantized::QTensor;
 use crate::openai::distributed::{shard, AllReduce, Comm, VarBuilder};
 use crate::openai::models::linear::{linear_no_bias, Linear};
@@ -62,6 +63,7 @@ fn presorted_expert_assignments(
     Ok(Some((sorted_token_ids, expert_ids)))
 }
 
+#[cfg(not(feature = "gcu"))]
 fn select_topk_indices(scores: &Tensor, topk: usize, is_prefill: bool) -> Result<Tensor> {
     let sorted_idx = if is_prefill {
         scores.contiguous()?.arg_sort(false)?

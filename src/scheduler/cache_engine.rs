@@ -1,14 +1,11 @@
-use crate::openai::distributed::local_num_kv_heads;
 use crate::openai::models::{Config, KvCacheDtype};
 use candle_core::{DType, Device, Result, Tensor};
-#[cfg(not(feature = "gcu"))]
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
-#[cfg(not(feature = "gcu"))]
 use std::time::Instant;
 
 #[cfg(not(feature = "gcu"))]
-use crate::backend::{copy_blocks, swap_blocks};
+use crate::backend::copy_blocks;
 
 #[derive(Clone, Debug)]
 pub struct CacheConfig {
@@ -56,11 +53,11 @@ impl CacheEngine {
         device: &Device,
         num_shards: usize,
     ) -> Result<Self> {
-        // CPU KV offload is a CUDA-only path. Metal uses unified memory and
-        // must not allocate or schedule a separate CPU swap tier.
-        let cpu_swap_enabled = cfg!(feature = "cuda") && !device.is_cpu();
+        // CPU KV offload is supported on CUDA and GCU. Metal uses unified memory
+        // and must not allocate or schedule a separate CPU swap tier.
+        let cpu_swap_enabled = cfg!(any(feature = "cuda", feature = "gcu")) && !device.is_cpu();
         if !cpu_swap_enabled {
-            tracing::info!("CPU KV cache swapping disabled for non-CUDA device");
+            tracing::info!("CPU KV cache swapping disabled for this device");
         }
 
         let cpu_turboquant_cache = if cpu_swap_enabled && cache_config.kvcache_dtype.is_turboquant()
@@ -209,7 +206,7 @@ impl CacheEngine {
             }
             let mut cache = Vec::new();
             for (layer_kv_heads, layer_head_dim) in configs.iter().copied() {
-                let kv_heads = local_num_kv_heads(layer_kv_heads, num_shards);
+                let kv_heads = (layer_kv_heads / num_shards.max(1)).max(1);
                 if use_flash_layout && layer_head_dim <= 256 {
                     let key_blocks = Tensor::zeros(
                         (num_blocks, block_size, kv_heads, layer_head_dim),
@@ -308,10 +305,7 @@ impl CacheEngine {
         let element_size = dtype.size_in_bytes();
         let x = 16 / element_size;
         (
-            local_num_kv_heads(
-                cfg.num_key_value_heads.unwrap_or(cfg.num_attention_heads),
-                num_shards,
-            ),
+            (cfg.num_key_value_heads.unwrap_or(cfg.num_attention_heads) / num_shards.max(1)).max(1),
             cfg.k_head_dim() / x,
             block_size,
             x,
@@ -324,10 +318,7 @@ impl CacheEngine {
         num_shards: usize,
     ) -> (usize, usize, usize) {
         (
-            local_num_kv_heads(
-                cfg.num_key_value_heads.unwrap_or(cfg.num_attention_heads),
-                num_shards,
-            ),
+            (cfg.num_key_value_heads.unwrap_or(cfg.num_attention_heads) / num_shards.max(1)).max(1),
             cfg.v_head_dim(),
             block_size,
         )
@@ -345,17 +336,13 @@ impl CacheEngine {
 
         (
             block_size,
-            local_num_kv_heads(
-                cfg.num_key_value_heads.unwrap_or(cfg.num_attention_heads),
-                num_shards,
-            ),
+            (cfg.num_key_value_heads.unwrap_or(cfg.num_attention_heads) / num_shards.max(1)).max(1),
             head_dim,
         )
     }
 }
 
 impl CacheEngine {
-    #[cfg(not(feature = "gcu"))]
     pub fn swap_in(&self, src_to_dst: HashMap<usize, usize>) -> Result<()> {
         if !self.cpu_swap_enabled {
             candle_core::bail!("CPU KV cache swap-in is disabled for this device");
@@ -376,7 +363,6 @@ impl CacheEngine {
         Ok(())
     }
 
-    #[cfg(not(feature = "gcu"))]
     pub fn swap_out(&mut self, src_to_dst: HashMap<usize, usize>) -> Result<()> {
         if !self.cpu_swap_enabled {
             candle_core::bail!("CPU KV cache swap-out is disabled for this device");
@@ -399,7 +385,6 @@ impl CacheEngine {
         Ok(())
     }
 
-    #[cfg(not(feature = "gcu"))]
     #[allow(unused_unsafe)]
     pub fn copy(&mut self, src_to_dst: HashMap<usize, Vec<usize>>) -> Result<()> {
         let mut gpu_cache = self.get_kv_cache();
@@ -409,6 +394,11 @@ impl CacheEngine {
         let (key_caches, value_caches) = caches;
 
         // NOTE(EricLBuehler): This may synchronize the CPU and GPU
+        #[cfg(feature = "gcu")]
+        {
+            attention_rs::cache::copy_blocks(key_caches, value_caches, src_to_dst)?;
+        }
+        #[cfg(not(feature = "gcu"))]
         unsafe {
             copy_blocks(key_caches, value_caches, src_to_dst)?;
         }
@@ -437,15 +427,14 @@ impl CacheEngine {
         for layer_idx in 0..num_kv_layers {
             let (kv_heads, hd) = if let Some(ref configs) = per_layer_config {
                 let (h, d) = configs[layer_idx];
-                (local_num_kv_heads(h, num_shards), d)
+                ((h / num_shards.max(1)).max(1), d)
             } else {
                 (
-                    local_num_kv_heads(
-                        model_config
-                            .num_key_value_heads
-                            .unwrap_or(model_config.num_attention_heads),
-                        num_shards,
-                    ),
+                    (model_config
+                        .num_key_value_heads
+                        .unwrap_or(model_config.num_attention_heads)
+                        / num_shards.max(1))
+                    .max(1),
                     model_config
                         .head_dim
                         .unwrap_or(model_config.hidden_size / model_config.num_attention_heads),
@@ -542,7 +531,6 @@ impl CacheEngine {
         )
     }
 
-    #[cfg(not(feature = "gcu"))]
     fn swap_tensor(src: &Tensor, dst: &Tensor, mapping: &HashMap<usize, usize>) -> Result<usize> {
         let bytes_per_block = src
             .elem_count()
@@ -553,7 +541,6 @@ impl CacheEngine {
         Ok(bytes_per_block.saturating_mul(mapping.len()))
     }
 
-    #[cfg(not(feature = "gcu"))]
     fn swap_turboquant(&self, mapping: &HashMap<usize, usize>, swap_in: bool) -> Result<usize> {
         let Some(cpu_layers) = &self.cpu_turboquant_cache else {
             return Ok(0);
@@ -591,7 +578,6 @@ impl CacheEngine {
         Ok(bytes)
     }
 
-    #[cfg(not(feature = "gcu"))]
     fn log_swap(direction: &str, blocks: usize, bytes: usize, started: Instant) {
         let elapsed = started.elapsed();
         let elapsed_seconds = elapsed.as_secs_f64();
