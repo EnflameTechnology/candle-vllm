@@ -23,8 +23,8 @@ anyhow = "1.0.75"
 rand = "0.9.0"
 rayon="1.10.0"
 hyper = { version = "0.14", features = ["full"] }
-candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="d91110ba" }
-candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev ="d91110ba" }
+candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev = "d91110b" }
+candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.3", rev = "d91110b" }
 dyn-fmt = "0.4.0"
 safetensors = "0.8"
 serde = { version = "1.0.190", features = ["serde_derive"] }
@@ -111,13 +111,6 @@ assets = [
 ]
 
 # Local development patches: customized candle / attention.rs / Ubridge
-[patch."https://github.com/EnflameTechnology/candle.git"]
-candle-core = { path = "../candle/candle-core" }
-candle-nn = { path = "../candle/candle-nn" }
-
-[patch."https://github.com/guoqingbao/candle.git"]
-candle-core = { path = "../candle/candle-core" }
-candle-nn = { path = "../candle/candle-nn" }
 
 [patch."https://github.com/guoqingbao/attention.rs"]
 attention-rs = { path = "../attention.rs" }
