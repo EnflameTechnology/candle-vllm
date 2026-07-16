@@ -919,8 +919,8 @@ impl Gemma4 {
         .to_dtype(DType::F32)?
         .reshape((cfg.max_position_embeddings.unwrap(), 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        let cos = freqs.cos()?.to_dtype(DType::F32)?;
-        let sin = freqs.sin()?.to_dtype(DType::F32)?;
+        let cos = freqs.cos()?.to_dtype(dtype)?;
+        let sin = freqs.sin()?.to_dtype(dtype)?;
         #[cfg(feature = "gcu")]
         let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?;
         let rotary_emb = Arc::new(ScalingRotaryEmbedding {
@@ -951,7 +951,7 @@ impl Gemma4 {
         local_config.rope_theta = rope_local_base_freq;
 
         let rotary_emb_local = Arc::new(ScalingRotaryEmbedding {
-            0: DefaultRotaryEmbedding::new(DType::F32, &local_config, &vb.device(), true)?,
+            0: DefaultRotaryEmbedding::new(dtype, &local_config, &vb.device(), true)?,
         });
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);

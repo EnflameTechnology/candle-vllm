@@ -221,7 +221,7 @@ impl GGUFQWen {
             kv_cache_dtype,
         );
         cfg.apply_runtime_rope_overrides(yarn_scaling_factor);
-        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, &cfg, device, true)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(dtype, &cfg, device, true)?);
 
         let mut layers = Vec::with_capacity(block_count);
 

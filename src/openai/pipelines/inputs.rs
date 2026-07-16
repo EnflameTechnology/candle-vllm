@@ -117,6 +117,7 @@ impl LLMEngine {
         let mut slot_mapping = Vec::new();
         let chunk_size = self.prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE);
         let mut max_context_len = 0;
+        let mut all_have_block_tables = true;
         #[cfg(feature = "flashinfer")]
         let mut ordered_sequences = Vec::<Arc<Sequence>>::new();
         #[cfg(feature = "flashinfer")]
@@ -139,8 +140,6 @@ impl LLMEngine {
                 let num_tokens = seq.deref().prefill_chunk_tokens(chunk_size);
                 #[cfg(feature = "flashinfer")]
                 prefill_tokens.push(num_tokens);
-
-                context_lens.push((num_cached_tokens + num_tokens) as u32);
 
                 let seqlen_q = num_tokens;
                 let use_cached_kv = num_cached_tokens > 0
@@ -184,6 +183,7 @@ impl LLMEngine {
                     .block_tables
                     .get(&seq.deref().get_id());
                 if table.is_none() {
+                    all_have_block_tables = false;
                     slot_mapping.extend([_PAD_SLOT_ID].repeat(num_tokens));
                     continue;
                 }
@@ -250,7 +250,7 @@ impl LLMEngine {
 
         let slot_mapping = Tensor::from_vec(slot_mapping, (s_len,), device)?;
 
-        let (context_lens, block_tables) = if cu_seqlens_k.last() > cu_seqlens_q.last() {
+        let (context_lens, block_tables) = if all_have_block_tables {
             let len = context_lens.len();
             let context_lens_t = Tensor::from_vec(context_lens, len, device)?;
             let block_tables_t = self.prepare_block_tables(groups, device)?;

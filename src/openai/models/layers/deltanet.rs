@@ -437,21 +437,6 @@ impl GatedDeltaNet {
         }
     }
 
-    fn repeat_kv_heads(&self, x: Tensor) -> Result<Tensor> {
-        if self.num_k_heads == self.num_v_heads {
-            return Ok(x);
-        }
-        let (seq_len, _h, _d) = x.dims3()?;
-        x.unsqueeze(2)?
-            .broadcast_as((
-                seq_len,
-                self.num_k_heads,
-                self.kv_group_size,
-                self.head_k_dim,
-            ))?
-            .reshape((seq_len, self.num_v_heads, self.head_k_dim))
-    }
-
     pub fn new(
         vb: VarBuilder,
         comm: Rc<Comm>,
@@ -779,22 +764,31 @@ impl GatedDeltaNet {
                 }
                 #[cfg(feature = "gcu")]
                 {
-                    let (q, k) = if self.num_k_heads != self.num_v_heads {
-                        (self.repeat_kv_heads(q)?, self.repeat_kv_heads(k)?)
+                    if self.num_k_heads != self.num_v_heads {
+                        gdn::gated_delta_rule_recurrence_varlen_gqa(
+                            &q,
+                            &k,
+                            &v,
+                            &g,
+                            &beta,
+                            global_state,
+                            seq_slots,
+                            &cu_seqlens,
+                            self.scale as f32,
+                        )?
                     } else {
-                        (q, k)
-                    };
-                    let q_scaled = (&q * self.scale)?;
-                    gdn::gated_delta_rule_recurrence_varlen(
-                        &q_scaled,
-                        &k,
-                        &v,
-                        &g,
-                        &beta,
-                        global_state,
-                        seq_slots,
-                        &cu_seqlens,
-                    )?
+                        let q_scaled = (&q * self.scale)?;
+                        gdn::gated_delta_rule_recurrence_varlen(
+                            &q_scaled,
+                            &k,
+                            &v,
+                            &g,
+                            &beta,
+                            global_state,
+                            seq_slots,
+                            &cu_seqlens,
+                        )?
+                    }
                 }
             };
             let output = output.reshape((token_count, self.value_dim))?;

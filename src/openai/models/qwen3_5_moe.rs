@@ -471,7 +471,7 @@ impl Qwen3_5MoE {
         };
         let tie_word_embeddings = text_backbone.tie_word_embeddings;
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, cfg, device, true)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(dtype, cfg, device, true)?);
 
         let hybrid = resolve_qwen3_hybrid_config(cfg);
         let layer_types = &hybrid.layer_types;

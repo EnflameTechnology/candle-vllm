@@ -219,12 +219,7 @@ impl GGUFGLM4 {
             kv_cache_dtype,
         );
         cfg.apply_runtime_rope_overrides(yarn_scaling_factor);
-        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(
-            DType::F32,
-            &cfg,
-            device,
-            false,
-        )?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(dtype, &cfg, device, false)?);
 
         let mut layers = Vec::with_capacity(block_count);
         for layer_idx in 0..block_count {

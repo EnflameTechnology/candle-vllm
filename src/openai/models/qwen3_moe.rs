@@ -3,8 +3,8 @@ use super::{
 };
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::openai::distributed::{
-    embedding, Comm, TensorParallelColumnLinear, TensorParallelRowLinear, VarBuilder,
-    VocabParallelLinear,
+    embedding, shard, Comm, MergedParallelColumnLinear, TensorParallelColumnLinear,
+    TensorParallelRowLinear, VarBuilder, VocabParallelLinear,
 };
 use crate::openai::models::layers::deepstack::ApplyDeepStack;
 #[allow(unused)]
@@ -82,35 +82,72 @@ impl Qwen3MoE {
 }
 
 struct Mlp {
-    gate_proj: TensorParallelColumnLinear,
-    up_proj: TensorParallelColumnLinear,
+    gate_up_proj: GateUpProjection,
     down_proj: TensorParallelRowLinear,
     act_fn: candle_nn::Activation,
+}
+
+enum GateUpProjection {
+    Separate {
+        gate_proj: TensorParallelColumnLinear,
+        up_proj: TensorParallelColumnLinear,
+    },
+    Packed(MergedParallelColumnLinear),
 }
 
 impl Mlp {
     fn new(cfg: &Config, intermediate_size: usize, vb: VarBuilder, comm: Rc<Comm>) -> Result<Self> {
         let hidden_sz = cfg.hidden_size;
-        // let intermediate_sz = cfg.intermediate_size;
-
-        let gate_proj = TensorParallelColumnLinear::load_with_hints(
-            hidden_sz,
-            intermediate_size,
-            false,
-            vb.pp("gate_proj"),
-            comm.clone(),
-            &cfg.isq_quant,
-            &cfg.quantization_config,
-        )?;
-        let up_proj = TensorParallelColumnLinear::load_with_hints(
-            hidden_sz,
-            intermediate_size,
-            false,
-            vb.pp("up_proj"),
-            comm.clone(),
-            &cfg.isq_quant,
-            &cfg.quantization_config,
-        )?;
+        let gate_up_proj = if cfg.isq_quant.is_none() && cfg.quantization_config.is_none() {
+            let world_size = comm.world_size();
+            if intermediate_size % world_size != 0 {
+                candle::bail!(
+                    "shared MLP intermediate size {} is not divisible by tensor parallel size {}",
+                    intermediate_size,
+                    world_size
+                );
+            }
+            let local_intermediate = intermediate_size / world_size;
+            let weight_shard = shard(0, comm.rank(), world_size);
+            let gate_weight = vb.pp("gate_proj").get_with_hints_dtype(
+                (intermediate_size, hidden_sz),
+                "weight",
+                weight_shard,
+                vb.dtype(),
+            )?;
+            let up_weight = vb.pp("up_proj").get_with_hints_dtype(
+                (intermediate_size, hidden_sz),
+                "weight",
+                weight_shard,
+                vb.dtype(),
+            )?;
+            let gate_up_weight = Tensor::cat(&[&gate_weight, &up_weight], 0)?.contiguous()?;
+            GateUpProjection::Packed(MergedParallelColumnLinear::from_packed_local(
+                gate_up_weight,
+                None,
+                vec![local_intermediate, local_intermediate],
+            ))
+        } else {
+            let gate_proj = TensorParallelColumnLinear::load_with_hints(
+                hidden_sz,
+                intermediate_size,
+                false,
+                vb.pp("gate_proj"),
+                comm.clone(),
+                &cfg.isq_quant,
+                &cfg.quantization_config,
+            )?;
+            let up_proj = TensorParallelColumnLinear::load_with_hints(
+                hidden_sz,
+                intermediate_size,
+                false,
+                vb.pp("up_proj"),
+                comm.clone(),
+                &cfg.isq_quant,
+                &cfg.quantization_config,
+            )?;
+            GateUpProjection::Separate { gate_proj, up_proj }
+        };
         let down_proj = TensorParallelRowLinear::load_with_hints(
             intermediate_size,
             hidden_sz,
@@ -121,8 +158,7 @@ impl Mlp {
             &cfg.quantization_config,
         )?;
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up_proj,
             down_proj,
             act_fn: cfg.hidden_act.unwrap(),
         })
@@ -131,8 +167,21 @@ impl Mlp {
 
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(xs)?;
-        let up = self.up_proj.forward(xs)?;
+        let (gate, up) = match &self.gate_up_proj {
+            GateUpProjection::Separate { gate_proj, up_proj } => {
+                (gate_proj.forward(xs)?, up_proj.forward(xs)?)
+            }
+            GateUpProjection::Packed(gate_up_proj) => {
+                let gate_up = gate_up_proj.forward(xs)?;
+                if gate_up.len() != 2 {
+                    candle::bail!(
+                        "expected 2 outputs from packed shared gate/up projection, got {}",
+                        gate_up.len()
+                    );
+                }
+                (gate_up[0].clone(), gate_up[1].clone())
+            }
+        };
         let activated = match self.act_fn {
             candle_nn::Activation::Silu | candle_nn::Activation::Swish => {
                 let combined = Tensor::cat(&[&gate, &up], candle_core::D::Minus1)?;
@@ -448,7 +497,7 @@ impl Qwen3MoE {
             (vb.pp("model"), cfg.tie_word_embeddings)
         };
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, cfg, device, true)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(dtype, cfg, device, true)?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         let reporter = progress_reporter.clone();

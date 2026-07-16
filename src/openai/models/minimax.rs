@@ -220,7 +220,7 @@ impl MiniMaxForCausalLM {
         let vb_m = vb.pp("model");
 
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, cfg, device, true)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(dtype, cfg, device, true)?);
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");

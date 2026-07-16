@@ -770,7 +770,7 @@ impl GGUFQWen3_5 {
             Some(extra_config_json),
         );
         cfg.apply_runtime_rope_overrides(yarn_scaling_factor);
-        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, &cfg, device, true)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(dtype, &cfg, device, true)?);
 
         let tok_embeddings = vb.get_no_shape("token_embd.weight")?;
         let vocab_size = tok_embeddings.shape().dims()[0];

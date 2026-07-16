@@ -219,7 +219,7 @@ impl Llama {
             dtype,
         )?;
 
-        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, cfg, device, true)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(dtype, cfg, device, true)?);
         let norm_dtype = if cfg.higher_precision_required() {
             DType::F32
         } else {

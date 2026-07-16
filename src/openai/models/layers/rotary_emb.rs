@@ -40,7 +40,7 @@ fn calculate_default_inv_freq(base: f64, dim: usize) -> Vec<f32> {
 }
 
 impl DefaultRotaryEmbedding {
-    pub fn new(_dtype: DType, cfg: &Config, device: &Device, is_gpt_neox: bool) -> Result<Self> {
+    pub fn new(dtype: DType, cfg: &Config, device: &Device, is_gpt_neox: bool) -> Result<Self> {
         let dim = cfg
             .head_dim
             .unwrap_or(cfg.hidden_size / cfg.num_attention_heads);
@@ -54,12 +54,8 @@ impl DefaultRotaryEmbedding {
             .to_dtype(DType::F32)?
             .reshape((cfg.max_seq_len, 1))?
             .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-        #[cfg(feature = "gcu")]
-        let rope_elem_dtype = DType::F32;
-        #[cfg(not(feature = "gcu"))]
-        let rope_elem_dtype = dtype;
-        let cos = idx_theta.cos()?.to_dtype(rope_elem_dtype)?;
-        let sin = idx_theta.sin()?.to_dtype(rope_elem_dtype)?;
+        let cos = idx_theta.cos()?.to_dtype(dtype)?;
+        let sin = idx_theta.sin()?.to_dtype(dtype)?;
         default_rotary_embedding_from_cos_sin(
             cos,
             sin,
@@ -86,16 +82,18 @@ impl DefaultRotaryEmbedding {
             let (seq_len, num_heads, head_dim) = q.dims3()?;
             let (_, num_kv_heads, _) = k.dims3()?;
             (
-                q.reshape((1, seq_len, num_heads, head_dim))?
-                    .transpose(1, 2)?,
-                // .contiguous()?,
-                k.reshape((1, seq_len, num_kv_heads, head_dim))?
-                    .transpose(1, 2)?,
-                // .contiguous()?,
+                // Keep the physical token-major layout. The GCU RoPE
+                // kernels consume [batch, tokens, heads, dim] storage; the
+                // previous transpose created a non-contiguous [batch, heads,
+                // tokens, dim] view and then paid for a transpose back after
+                // the raw-pointer kernel ran.
+                q.reshape((1, seq_len, num_heads, head_dim))?,
+                k.reshape((1, seq_len, num_kv_heads, head_dim))?,
             )
         } else {
             (q.clone(), k.clone())
         };
+        let token_major = rank == 3;
         let (q_out, k_out) = candle_nn::apply_rotary_emb_qkv(
             &q4,
             &k4,
@@ -103,19 +101,15 @@ impl DefaultRotaryEmbedding {
             &self.sin,
             positions,
             self.rotary_dim.unwrap_or(0),
-            true,
+            !token_major,
             self.is_gpt_neox,
         )?;
         if rank == 3 {
             let (seq_len, num_heads, head_dim) = q.dims3()?;
             let (_, num_kv_heads, _) = k.dims3()?;
             Ok((
-                q_out
-                    .transpose(1, 2)?
-                    .reshape((seq_len, num_heads, head_dim))?,
-                k_out
-                    .transpose(1, 2)?
-                    .reshape((seq_len, num_kv_heads, head_dim))?,
+                q_out.reshape((seq_len, num_heads, head_dim))?,
+                k_out.reshape((seq_len, num_kv_heads, head_dim))?,
             ))
         } else {
             Ok((q_out, k_out))
@@ -179,7 +173,7 @@ impl DefaultRotaryEmbedding {
 pub struct ScalingRotaryEmbedding(pub DefaultRotaryEmbedding);
 
 impl ScalingRotaryEmbedding {
-    pub fn new(_dtype: DType, cfg: &Config, dev: &Device, is_gpt_neox: bool) -> Result<Self> {
+    pub fn new(dtype: DType, cfg: &Config, dev: &Device, is_gpt_neox: bool) -> Result<Self> {
         let dim = cfg
             .head_dim
             .unwrap_or(cfg.hidden_size / cfg.num_attention_heads);
@@ -187,10 +181,6 @@ impl ScalingRotaryEmbedding {
             .partial_rotary_factor
             .map(|factor| (factor * dim as f32) as usize)
             .unwrap_or(dim);
-        #[cfg(feature = "gcu")]
-        let rope_elem_dtype = DType::F32;
-        #[cfg(not(feature = "gcu"))]
-        let rope_elem_dtype = dtype;
         if let Some(rope_scaling) = &cfg.rope_scaling {
             let mut rope_scaling = rope_scaling.clone();
             if !rope_scaling.contains_key("rope_type") && rope_scaling.contains_key("type") {
@@ -229,8 +219,8 @@ impl ScalingRotaryEmbedding {
                             1,
                         ))? / (*factor as f64))?
                             .matmul(&inv_freq.reshape((1, inv_freq.elem_count()))?)?;
-                        let cos = idx_theta.cos()?.to_dtype(rope_elem_dtype)?;
-                        let sin = idx_theta.sin()?.to_dtype(rope_elem_dtype)?;
+                        let cos = idx_theta.cos()?.to_dtype(dtype)?;
+                        let sin = idx_theta.sin()?.to_dtype(dtype)?;
                         Self(default_rotary_embedding_from_cos_sin(
                             cos,
                             sin,
@@ -283,8 +273,8 @@ impl ScalingRotaryEmbedding {
                                 .to_dtype(DType::F32)?
                                 .reshape((cfg.max_seq_len, 1))?;
                             let freqs = t.matmul(&inv_freq)?;
-                            let sin = freqs.sin()?.to_dtype(rope_elem_dtype)?;
-                            let cos = freqs.cos()?.to_dtype(rope_elem_dtype)?;
+                            let sin = freqs.sin()?.to_dtype(dtype)?;
+                            let cos = freqs.cos()?.to_dtype(dtype)?;
                             Self(default_rotary_embedding_from_cos_sin(
                                 cos,
                                 sin,
@@ -301,12 +291,7 @@ impl ScalingRotaryEmbedding {
                         }
                     }
                 } else if rope_type == "default" {
-                    Self(DefaultRotaryEmbedding::new(
-                        rope_elem_dtype,
-                        cfg,
-                        dev,
-                        is_gpt_neox,
-                    )?)
+                    Self(DefaultRotaryEmbedding::new(dtype, cfg, dev, is_gpt_neox)?)
                 } else if rope_type == "dynamic" {
                     let scaling_factor = if let Some(ScalingValue::Single(factor)) =
                         rope_scaling.get("alpha")
@@ -347,8 +332,8 @@ impl ScalingRotaryEmbedding {
                         .to_dtype(DType::F32)?
                         .reshape((max_seq_len as usize, 1))?;
                     let freqs = t.matmul(&inv_freq)?;
-                    let sin = freqs.sin()?.to_dtype(rope_elem_dtype)?;
-                    let cos = freqs.cos()?.to_dtype(rope_elem_dtype)?;
+                    let sin = freqs.sin()?.to_dtype(dtype)?;
+                    let cos = freqs.cos()?.to_dtype(dtype)?;
                     Self(default_rotary_embedding_from_cos_sin(
                         cos,
                         sin,
@@ -379,7 +364,7 @@ impl ScalingRotaryEmbedding {
                             Some(ScalingValue::Single(factor)),
                         ) => {
                             let embed = YarnRotaryEmbedding::new_yarn(
-                                rope_elem_dtype,
+                                dtype,
                                 dev,
                                 cfg.rope_theta as f32,
                                 rotary_dim,
@@ -415,7 +400,7 @@ impl ScalingRotaryEmbedding {
             }
         } else {
             Ok(Self(DefaultRotaryEmbedding::new(
-                rope_elem_dtype,
+                dtype,
                 cfg,
                 dev,
                 is_gpt_neox,

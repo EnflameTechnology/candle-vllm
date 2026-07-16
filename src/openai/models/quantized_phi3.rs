@@ -318,7 +318,7 @@ impl GGUFPhi3 {
             kv_cache_dtype,
         );
         cfg.apply_runtime_rope_overrides(yarn_scaling_factor);
-        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, &cfg, device, true)?);
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(dtype, &cfg, device, true)?);
 
         let n_head = head_count / world_size;
         let n_kv_head = if head_count_kv >= world_size {

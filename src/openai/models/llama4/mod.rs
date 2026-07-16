@@ -392,7 +392,7 @@ impl LLama4ForConditionalGeneration {
         )?;
 
         let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(
-            DType::F32,
+            dtype,
             config,
             &vb.device(),
             false,

@@ -349,13 +349,10 @@ impl Gemma3 {
         let vb_m = vb.pp("language_model.model");
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let rotary_emb = Arc::new(ScalingRotaryEmbedding::new_sliding(
-            DType::F32,
-            None,
-            cfg,
-            device,
+            dtype, None, cfg, device,
         )?);
         let sliding_emb = Arc::new(ScalingRotaryEmbedding::new_sliding(
-            DType::F32,
+            dtype,
             cfg.sliding_window,
             cfg,
             device,

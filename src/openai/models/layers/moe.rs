@@ -18,7 +18,10 @@ use candle_core as candle;
 #[cfg(not(feature = "gcu"))]
 use candle_core::quantized::GgmlDType;
 use candle_nn::var_builder::Shard;
+#[cfg(not(feature = "gcu"))]
 use candle_nn::Activation;
+#[cfg(feature = "gcu")]
+use parking_lot::Mutex;
 use std::rc::Rc;
 
 /// Apply gated activation on fused gate_up tensor.
@@ -343,15 +346,11 @@ fn get_hidden_act(cfg: &Config) -> Activation {
 #[allow(dead_code)]
 pub struct FusedMoe {
     gate: Linear,
-    #[cfg(feature = "gcu")]
-    gate_w: Tensor,
-    #[cfg(feature = "gcu")]
-    up_w: Tensor,
-    #[cfg(not(feature = "gcu"))]
     gate_up_w: Tensor,
     #[cfg(not(feature = "gcu"))]
     w_size_n: usize,
     down_w: Tensor,
+    #[cfg(not(feature = "gcu"))]
     act: Activation,
     norm_topk_prob: bool,
     routed_scaling_factor: Option<f64>,
@@ -359,9 +358,117 @@ pub struct FusedMoe {
     all_reduce: AllReduce,
     world_size: usize,
     dtype: DType,
+    #[cfg(feature = "gcu")]
+    workspace: Mutex<GcuMoeWorkspace>,
+}
+
+#[cfg(feature = "gcu")]
+#[derive(Default)]
+struct GcuMoeWorkspace {
+    sorted_token_ids: Option<Tensor>,
+    expert_ids: Option<Tensor>,
+    num_tokens_post_pad: Option<Tensor>,
+}
+
+#[cfg(feature = "gcu")]
+impl GcuMoeWorkspace {
+    fn buffer(slot: &mut Option<Tensor>, len: usize, device: &candle::Device) -> Result<Tensor> {
+        let needs_resize = match slot.as_ref() {
+            Some(tensor) => tensor.dim(0)? < len,
+            None => true,
+        };
+        if needs_resize {
+            *slot = Some(unsafe { Tensor::empty_((len,), DType::I32, device)? });
+        }
+        slot.as_ref()
+            .expect("MoE workspace buffer must be initialized")
+            .narrow(0, 0, len)
+    }
+
+    fn align(
+        &mut self,
+        topk_ids: &Tensor,
+        num_experts: usize,
+        block_size: usize,
+        token_num: usize,
+        topk: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let max_padded_num = token_num * topk + num_experts * (block_size - 1);
+        let max_block_num = max_padded_num / block_size;
+        let sorted_token_ids = Self::buffer(
+            &mut self.sorted_token_ids,
+            max_padded_num,
+            topk_ids.device(),
+        )?;
+        let expert_ids = Self::buffer(&mut self.expert_ids, max_block_num, topk_ids.device())?;
+        let num_tokens_post_pad =
+            Self::buffer(&mut self.num_tokens_post_pad, 1, topk_ids.device())?;
+        moe::gcu_moe_align_block_size_into(
+            topk_ids,
+            num_experts,
+            block_size,
+            token_num,
+            topk,
+            &sorted_token_ids,
+            &expert_ids,
+            &num_tokens_post_pad,
+        )
+    }
 }
 
 impl FusedMoe {
+    #[cfg(feature = "gcu")]
+    fn forward_gcu_chunk(
+        &self,
+        xs: &Tensor,
+        topk_weights: &Tensor,
+        topk_ids: &Tensor,
+    ) -> Result<Tensor> {
+        let (num_tokens, hidden_dim) = xs.dims2()?;
+        const MOE_BLOCK_SIZE: usize = 64;
+
+        let mut workspace = self.workspace.lock();
+        let (sorted_token_ids, expert_ids, num_tokens_post_pad) = workspace.align(
+            topk_ids,
+            self.gate_up_w.dim(0)?,
+            MOE_BLOCK_SIZE,
+            num_tokens,
+            self.num_experts_per_tok,
+        )?;
+
+        let gate_up = moe::moe_gemm(
+            xs,
+            &self.gate_up_w,
+            &None,
+            topk_ids,
+            &sorted_token_ids,
+            &expert_ids,
+            &num_tokens_post_pad,
+            self.num_experts_per_tok,
+            MOE_BLOCK_SIZE,
+            num_tokens,
+        )?;
+
+        let down_inputs = candle_nn::ops::silu_and_mul(&gate_up)?;
+        let down_topk_weights = Some(topk_weights.flatten_all()?);
+        let ys = moe::moe_gemm(
+            &down_inputs,
+            &self.down_w,
+            &down_topk_weights,
+            topk_ids,
+            &sorted_token_ids,
+            &expert_ids,
+            &num_tokens_post_pad,
+            self.num_experts_per_tok,
+            MOE_BLOCK_SIZE,
+            num_tokens,
+        )?
+        .reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
+        .sum(1)?;
+
+        Ok(ys)
+    }
+
     pub fn new(cfg: &Config, vb: VarBuilder, comm: Rc<Comm>, dtype: DType) -> Result<Self> {
         let moe_cfg = qwen_moe_cfg(cfg)?;
         let num_experts = moe_cfg.num_experts.unwrap_or(0);
@@ -381,27 +488,17 @@ impl FusedMoe {
         )?;
 
         let (gate_w, up_w, down_w) = load_packed_experts(cfg, vb.pp("experts"), comm.clone())?;
+        let gate_up_w = Tensor::cat(&[&gate_w, &up_w], 1)?.contiguous()?;
         #[cfg(not(feature = "gcu"))]
-        let (gate_up_w, w_size_n) = {
-            let gate_up_w = Tensor::cat(&[&gate_w, &up_w], 1)?;
-            let w_size_n = gate_up_w.dim(1)? / 2;
-            (gate_up_w, w_size_n)
-        };
+        let w_size_n = gate_up_w.dim(1)? / 2;
         let world_size = comm.world_size();
 
         Ok(Self {
             gate,
-            #[cfg(feature = "gcu")]
-            gate_w,
-            #[cfg(feature = "gcu")]
-            up_w,
-            #[cfg(not(feature = "gcu"))]
             gate_up_w,
             #[cfg(not(feature = "gcu"))]
             w_size_n,
             down_w,
-            #[cfg(feature = "gcu")]
-            act: candle_nn::Activation::Silu,
             #[cfg(not(feature = "gcu"))]
             act: get_hidden_act(cfg),
             norm_topk_prob: moe_cfg.norm_topk_prob,
@@ -410,6 +507,8 @@ impl FusedMoe {
             all_reduce: AllReduce::new(comm),
             world_size,
             dtype,
+            #[cfg(feature = "gcu")]
+            workspace: Mutex::new(GcuMoeWorkspace::default()),
         })
     }
 
@@ -429,27 +528,17 @@ impl FusedMoe {
         let gate = linear_no_bias(cfg.hidden_size, num_experts, gate_vb, Shard::default())?;
 
         let (gate_w, up_w, down_w) = load_packed_experts(cfg, experts_vb, comm.clone())?;
+        let gate_up_w = Tensor::cat(&[&gate_w, &up_w], 1)?.contiguous()?;
         #[cfg(not(feature = "gcu"))]
-        let (gate_up_w, w_size_n) = {
-            let gate_up_w = Tensor::cat(&[&gate_w, &up_w], 1)?;
-            let w_size_n = gate_up_w.dim(1)? / 2;
-            (gate_up_w, w_size_n)
-        };
+        let w_size_n = gate_up_w.dim(1)? / 2;
         let world_size = comm.world_size();
 
         Ok(Self {
             gate,
-            #[cfg(feature = "gcu")]
-            gate_w,
-            #[cfg(feature = "gcu")]
-            up_w,
-            #[cfg(not(feature = "gcu"))]
             gate_up_w,
             #[cfg(not(feature = "gcu"))]
             w_size_n,
             down_w,
-            #[cfg(feature = "gcu")]
-            act: candle_nn::Activation::Silu,
             #[cfg(not(feature = "gcu"))]
             act: get_hidden_act(cfg),
             norm_topk_prob: moe_cfg.norm_topk_prob,
@@ -458,6 +547,8 @@ impl FusedMoe {
             all_reduce: AllReduce::new(comm),
             world_size,
             dtype,
+            #[cfg(feature = "gcu")]
+            workspace: Mutex::new(GcuMoeWorkspace::default()),
         })
     }
 
@@ -469,67 +560,17 @@ impl FusedMoe {
         topk_ids: Tensor,
         _is_prefill: bool,
     ) -> Result<Tensor> {
-        let (num_tokens, hidden_dim) = xs.dims2()?;
-
-        const MOE_BLOCK_SIZE: usize = 32;
-
-        let (sorted_token_ids, expert_ids, num_tokens_post_pad) = moe::gcu_moe_align_block_size(
-            &topk_ids,
-            self.gate_w.dim(0)?,
-            MOE_BLOCK_SIZE,
-            num_tokens,
-            self.num_experts_per_tok,
-        )?;
-
-        let gate = moe::moe_gemm(
-            &xs,
-            &self.gate_w,
-            &None,
-            &topk_ids,
-            &sorted_token_ids,
-            &expert_ids,
-            &num_tokens_post_pad,
-            self.num_experts_per_tok,
-            MOE_BLOCK_SIZE,
-            num_tokens,
-        )?;
-
-        let up = moe::moe_gemm(
-            &xs,
-            &self.up_w,
-            &None,
-            &topk_ids,
-            &sorted_token_ids,
-            &expert_ids,
-            &num_tokens_post_pad,
-            self.num_experts_per_tok,
-            MOE_BLOCK_SIZE,
-            num_tokens,
-        )?;
-
-        let down_inputs = (up * gate.apply(&self.act)?)?;
-
-        let mut ys = {
-            let down_topk_weights = Some(topk_weights.flatten_all()?);
-            moe::moe_gemm(
-                &down_inputs,
-                &self.down_w,
-                &down_topk_weights,
-                &topk_ids,
-                &sorted_token_ids,
-                &expert_ids,
-                &num_tokens_post_pad,
-                self.num_experts_per_tok,
-                MOE_BLOCK_SIZE,
-                num_tokens,
-            )?
-        };
-
-        ys = ys
-            .to_dtype(DType::F32)?
-            .reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
-            .sum(1)?
-            .to_dtype(xs.dtype())?;
+        let num_tokens = xs.dim(0)?;
+        const MOE_KERNEL_CHUNK_SIZE: usize = 32_768;
+        let mut chunks = Vec::new();
+        for start in (0..num_tokens).step_by(MOE_KERNEL_CHUNK_SIZE) {
+            let len = (num_tokens - start).min(MOE_KERNEL_CHUNK_SIZE);
+            let xs_chunk = xs.narrow(0, start, len)?;
+            let weights_chunk = topk_weights.narrow(0, start, len)?;
+            let ids_chunk = topk_ids.narrow(0, start, len)?;
+            chunks.push(self.forward_gcu_chunk(&xs_chunk, &weights_chunk, &ids_chunk)?);
+        }
+        let mut ys = Tensor::cat(&chunks, 0)?;
 
         if self.world_size > 1 {
             ys = self.all_reduce.apply(&ys)?;
@@ -539,7 +580,6 @@ impl FusedMoe {
 
     #[cfg(feature = "gcu")]
     pub fn forward(&self, xs: &Tensor, _is_prefill: bool) -> Result<Tensor> {
-        let (num_tokens, hidden_dim) = xs.dims2()?;
         let router_logits = self.gate.forward(&xs)?;
 
         let (mut topk_weights, topk_ids) = if self.norm_topk_prob {
@@ -558,70 +598,7 @@ impl FusedMoe {
             topk_weights = (topk_weights * routed_scaling_factor)?;
         }
 
-        const MOE_BLOCK_SIZE: usize = 32;
-
-        let (sorted_token_ids, expert_ids, num_tokens_post_pad) = moe::gcu_moe_align_block_size(
-            &topk_ids,
-            self.gate_w.dim(0)?,
-            MOE_BLOCK_SIZE,
-            num_tokens,
-            self.num_experts_per_tok,
-        )?;
-
-        let gate = moe::moe_gemm(
-            &xs,
-            &self.gate_w,
-            &None,
-            &topk_ids,
-            &sorted_token_ids,
-            &expert_ids,
-            &num_tokens_post_pad,
-            self.num_experts_per_tok,
-            MOE_BLOCK_SIZE,
-            num_tokens,
-        )?;
-
-        let up = moe::moe_gemm(
-            &xs,
-            &self.up_w,
-            &None,
-            &topk_ids,
-            &sorted_token_ids,
-            &expert_ids,
-            &num_tokens_post_pad,
-            self.num_experts_per_tok,
-            MOE_BLOCK_SIZE,
-            num_tokens,
-        )?;
-
-        let down_inputs = (up * gate.apply(&self.act)?)?;
-
-        let mut ys = {
-            let down_topk_weights = Some(topk_weights.flatten_all()?);
-            moe::moe_gemm(
-                &down_inputs,
-                &self.down_w,
-                &down_topk_weights,
-                &topk_ids,
-                &sorted_token_ids,
-                &expert_ids,
-                &num_tokens_post_pad,
-                self.num_experts_per_tok,
-                MOE_BLOCK_SIZE,
-                num_tokens,
-            )?
-        };
-
-        ys = ys
-            .to_dtype(DType::F32)?
-            .reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
-            .sum(1)?
-            .to_dtype(xs.dtype())?;
-
-        if self.world_size > 1 {
-            ys = self.all_reduce.apply(&ys)?;
-        }
-        Ok(ys)
+        self.forward_with_routing(xs, topk_weights, topk_ids, true)
     }
 
     #[cfg(not(feature = "gcu"))]

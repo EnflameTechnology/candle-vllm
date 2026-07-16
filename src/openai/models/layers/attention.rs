@@ -39,7 +39,6 @@ pub struct Attention {
     softcapping: Option<f64>,
     dtype: DType,
     attn_output_gate: bool,
-    no_per_head_norm: bool,
     full_dim_qk_norm: bool,
     qk_l2_norm: bool,
     v_norm_eps: Option<f64>,
@@ -552,25 +551,6 @@ impl Attention {
         } else {
             None
         };
-        let no_per_head_norm_models: Vec<String> = vec![
-            "Gemma3ForConditionalGeneration",
-            "Gemma3ForCausalLM",
-            "Gemma4ForConditionalGeneration",
-            "Gemma4ForCausalLM",
-            "Qwen3VLForConditionalGeneration",
-            "Qwen3VLMoeForConditionalGeneration",
-            "Qwen3_5ForCausalLM",
-            "Qwen3_5ForConditionalGeneration",
-            "Qwen3_5MoeForCausalLM",
-            "Qwen3_5MoeForConditionalGeneration",
-            "Qwen3NextForCausalLM",
-            "Qwen3NextForConditionalGeneration",
-            "MiniMaxM2ForCausalLM",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
         assert!(cfg.num_attention_heads >= comm.world_size());
         assert!(cfg.num_attention_heads % comm.world_size() == 0);
 
@@ -597,7 +577,6 @@ impl Attention {
             softcapping: cfg.attn_logit_softcapping,
             dtype: vb.dtype(),
             attn_output_gate,
-            no_per_head_norm: no_per_head_norm_models.contains(&arch),
             full_dim_qk_norm,
             qk_l2_norm,
             v_norm_eps,
@@ -663,65 +642,27 @@ impl Attention {
         let k = key_states.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
         let v = value_states.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
 
-        let (q, k) = if q.dtype() != DType::F32 {
-            (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?)
-        } else {
-            (q, k)
-        };
-
         let (q, k) = if let (Some(q_norm), Some(k_norm)) = (&self.q_norm, &self.k_norm) {
             if self.full_dim_qk_norm {
                 let q_2d = q.reshape((seq_len, self.num_heads * self.head_dim))?;
                 let k_2d = k.reshape((seq_len, self.num_kv_heads * self.head_dim))?;
-                let q_2d = q_norm.forward(&q_2d)?;
-                let k_2d = k_norm.forward(&k_2d)?;
+                let q_2d = q_norm
+                    .forward(&q_2d.to_dtype(DType::F32)?)?
+                    .to_dtype(self.dtype)?;
+                let k_2d = k_norm
+                    .forward(&k_2d.to_dtype(DType::F32)?)?
+                    .to_dtype(self.dtype)?;
                 let q = q_2d.reshape((seq_len, self.num_heads, self.head_dim))?;
                 let k = k_2d.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
                 (q, k)
-            } else if self.no_per_head_norm {
-                let q = q_norm.forward(&q)?;
-                let k = k_norm.forward(&k)?;
-                (q, k)
             } else {
-                #[cfg(feature = "gcu")]
-                {
-                    let q = q
-                        .reshape((1, seq_len, self.num_heads, self.head_dim))?
-                        .transpose(1, 2)?
-                        .contiguous()?;
-                    let k = k
-                        .reshape((1, seq_len, self.num_kv_heads, self.head_dim))?
-                        .transpose(1, 2)?
-                        .contiguous()?;
-                    let q_flat = q.flatten(0, 2)?;
-                    let k_flat = k.flatten(0, 2)?;
-                    let q_flat = q_norm.forward(&q_flat)?;
-                    let k_flat = k_norm.forward(&k_flat)?;
-                    let q = q_flat
-                        .reshape((1, self.num_heads, seq_len, self.head_dim))?
-                        .transpose(1, 2)?
-                        .contiguous()?;
-                    let k = k_flat
-                        .reshape((1, self.num_kv_heads, seq_len, self.head_dim))?
-                        .transpose(1, 2)?
-                        .contiguous()?;
-                    let q = q.squeeze(0)?;
-                    let k = k.squeeze(0)?;
-                    (q, k)
-                }
-                #[cfg(not(feature = "gcu"))]
-                {
-                    let q_flat = q.flatten(0, 1)?;
-                    let k_flat = k.flatten(0, 1)?;
-
-                    let q_flat = q_norm.forward(&q_flat)?;
-                    let k_flat = k_norm.forward(&k_flat)?;
-
-                    let q = q_flat.reshape((seq_len, self.num_heads, self.head_dim))?;
-                    let k = k_flat.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
-
-                    (q, k)
-                }
+                let q = q_norm
+                    .forward(&q.to_dtype(DType::F32)?)?
+                    .to_dtype(self.dtype)?;
+                let k = k_norm
+                    .forward(&k.to_dtype(DType::F32)?)?
+                    .to_dtype(self.dtype)?;
+                (q, k)
             }
         } else {
             (q, k)
