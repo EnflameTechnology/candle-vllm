@@ -688,7 +688,7 @@ def render_samples(console: Console, cases: Sequence[BenchmarkCase], sample_coun
 async def main(args: argparse.Namespace) -> None:
     console = Console()
     random.seed(args.seed)
-    base_url = args.base_url or f"http://localhost:{args.port}/v1/"
+    base_url = args.base_url or f"http://127.0.0.1:{args.port}/v1/"
     client = AsyncOpenAI(api_key=args.api_key, base_url=base_url, max_retries=args.max_retries)
     input_lens = parse_lengths(args.input_lens, args.input_len)
     output_lens = parse_lengths(args.output_lens, args.output_len)

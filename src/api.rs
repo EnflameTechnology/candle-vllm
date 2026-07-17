@@ -209,6 +209,8 @@ impl EngineBuilder {
         let kvcache_dtype_enum = self.kvcache_dtype.unwrap_or(KvCacheDtype::Auto);
         let kv_cache_dtype = if kvcache_dtype_enum.is_fp8_keys() {
             DType::U8
+        } else if kvcache_dtype_enum.is_int8() {
+            DType::I8
         } else {
             dtype
         };

@@ -47,6 +47,7 @@ use std::rc::Rc;
 pub enum KvCacheDtype {
     Auto,
     Fp8,
+    Int8,
     Turbo8,
     Turbo4,
     Turbo3,
@@ -63,10 +64,19 @@ impl KvCacheDtype {
         matches!(self, Self::Fp8 | Self::Turbo8)
     }
 
+    pub fn is_int8(&self) -> bool {
+        matches!(self, Self::Int8)
+    }
+
+    pub fn uses_standard_quantized_cache(&self) -> bool {
+        self.is_fp8_keys() || self.is_int8()
+    }
+
     pub fn from_str_opt(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "auto" | "bf16" | "bfloat16" => Some(Self::Auto),
             "fp8" | "e4m3" => Some(Self::Fp8),
+            "int8" => Some(Self::Int8),
             "turbo8" | "k8v4" => Some(Self::Turbo8),
             "turbo4" | "4bit" => Some(Self::Turbo4),
             "turbo3" | "k3v4" => Some(Self::Turbo3),
@@ -81,6 +91,7 @@ impl KvCacheDtype {
             Self::Turbo8 => 2,
             Self::Turbo4 => 3,
             Self::Turbo3 => 4,
+            Self::Int8 => 5,
         }
     }
 
@@ -90,6 +101,7 @@ impl KvCacheDtype {
             2 => Self::Turbo8,
             3 => Self::Turbo4,
             4 => Self::Turbo3,
+            5 => Self::Int8,
             _ => Self::Auto,
         }
     }
@@ -114,6 +126,7 @@ impl std::fmt::Display for KvCacheDtype {
         match self {
             Self::Auto => write!(f, "auto"),
             Self::Fp8 => write!(f, "fp8"),
+            Self::Int8 => write!(f, "int8"),
             Self::Turbo8 => write!(f, "turbo8"),
             Self::Turbo4 => write!(f, "turbo4"),
             Self::Turbo3 => write!(f, "turbo3"),
@@ -845,7 +858,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ScalingValue};
+    use super::{Config, KvCacheDtype, ScalingValue};
     use std::collections::HashMap;
 
     fn test_config(max_position_embeddings: usize) -> Config {
@@ -1345,7 +1358,7 @@ impl AttentionSelect {
                     sliding_window,
                     device.clone(),
                     None,
-                    cfg.kvcache_dtype.is_fp8_keys(),
+                    cfg.kvcache_dtype.uses_standard_quantized_cache(),
                 )
                 .unwrap(),
             )

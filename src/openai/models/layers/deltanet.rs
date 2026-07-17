@@ -675,8 +675,14 @@ impl GatedDeltaNet {
         let v = v_conv.reshape((token_count, self.num_v_heads, self.head_v_dim))?;
 
         let gated_output = if is_prefill {
-            let q = gdn::l2_norm_last_dim(&q, 1e-6)?;
-            let k = gdn::l2_norm_last_dim(&k, 1e-6)?;
+            let (q, k) = if self.num_k_heads != self.num_v_heads {
+                (q, k)
+            } else {
+                (
+                    gdn::l2_norm_last_dim(&q, 1e-6)?,
+                    gdn::l2_norm_last_dim(&k, 1e-6)?,
+                )
+            };
 
             let (g, beta) = {
                 #[cfg(feature = "gcu")]

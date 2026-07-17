@@ -1151,6 +1151,8 @@ impl DefaultLoader {
             let weight_filenames: Vec<PathBuf> = paths.get_weight_filenames();
             if kv_cache_dtype == DType::U8 {
                 config.kvcache_dtype = crate::openai::models::KvCacheDtype::Fp8;
+            } else if kv_cache_dtype == DType::I8 {
+                config.kvcache_dtype = crate::openai::models::KvCacheDtype::Int8;
             }
 
             if let Some(qcfg) = &mut config.quantization_config {

@@ -16,6 +16,11 @@ mod graph_gcu {
     use parking_lot::RwLock;
     use tqdm::tqdm;
 
+    /// Maximum context length for which the regular decode graph path is
+    /// eligible.  The captured FA metadata uses the model's actual limit,
+    /// while this public bound is used by the pipeline before replay.
+    pub const GRAPH_FA_MAX_CONTEXT_LEN: usize = 262_144;
+
     #[allow(dead_code)]
     pub struct CudaGraph {
         cu_graph: driv::topsGraph_t,
@@ -427,6 +432,7 @@ mod graph_gcu {
             self.device = Some(device.clone());
             let max_bs = self.graph_bs[self.graph_bs.len() - 1];
             let max_num_blocks = (self.max_model_len + self.block_size - 1) / self.block_size;
+            let graph_context_len = self.max_model_len;
 
             let input_ids = Tensor::zeros((max_bs,), DType::U32, device)?;
             let positions = Tensor::zeros((max_bs,), DType::I64, device)?;

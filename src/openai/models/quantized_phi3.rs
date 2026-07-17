@@ -376,7 +376,7 @@ impl GGUFPhi3 {
                     None,
                     device.clone(),
                     None,
-                    cfg.kvcache_dtype.is_fp8_keys(),
+                    cfg.kvcache_dtype.uses_standard_quantized_cache(),
                 )?,
                 rotary_emb: rotary_emb.clone(),
                 dtype,

@@ -140,7 +140,7 @@ struct Args {
     #[arg(long)]
     prefill_chunk_size: Option<usize>,
 
-    /// KV cache dtype: auto (default), fp8, turbo8, turbo4, turbo3
+    /// KV cache dtype: auto (default), fp8, int8, turbo8, turbo4, turbo3
     #[arg(long)]
     kvcache_dtype: Option<String>,
 
@@ -259,7 +259,7 @@ async fn main() -> Result<()> {
     let kvcache_dtype_enum = if let Some(ref s) = args.kvcache_dtype {
         candle_vllm::openai::models::KvCacheDtype::from_str_opt(s).unwrap_or_else(|| {
             panic!(
-                "Invalid --kvcache-dtype value: {}. Use auto/fp8/turbo8/turbo4/turbo3.",
+                "Invalid --kvcache-dtype value: {}. Use auto/fp8/int8/turbo8/turbo4/turbo3.",
                 s
             )
         })
@@ -268,6 +268,8 @@ async fn main() -> Result<()> {
     };
     let kv_cache_dtype = if kvcache_dtype_enum.is_fp8_keys() {
         DType::U8
+    } else if kvcache_dtype_enum.is_int8() {
+        DType::I8
     } else {
         dtype
     };
