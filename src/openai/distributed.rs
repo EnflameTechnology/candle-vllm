@@ -1,4 +1,6 @@
 use super::models::linear::qlinear;
+#[cfg(all(feature = "gcu", feature = "eccl"))]
+use super::zipccl_gcu;
 use crate::openai::models::linear::{linear_no_bias_x as linear, Linear, LinearX, LnFp8};
 #[cfg(feature = "eccl")]
 pub use candle_core::gcu_backend::ubridge::eccl::{Comm, Id};
@@ -609,6 +611,28 @@ impl CustomOp1 for AllReduce {
         }
         let elem_count = l.shape().elem_count();
         let dev = s.device().clone();
+        #[cfg(all(feature = "gcu", feature = "eccl"))]
+        if zipccl_gcu::eligible(elem_count, self.comm.world_size(), s.dtype())
+            && super::models::linear::linear_is_prefill()
+        {
+            let raw = dev.gcu_device();
+            let result = match s.dtype() {
+                DType::BF16 => {
+                    let full = s.as_gcu_slice::<bf16>()?;
+                    let src = full.slice(l.start_offset()..l.start_offset() + elem_count);
+                    zipccl_gcu::all_reduce_bf16(&raw, &self.comm, &src, elem_count)
+                        .map(|out| candle::GcuStorage::wrap_gcu_slice(out, dev.clone()))
+                }
+                DType::F16 => {
+                    let full = s.as_gcu_slice::<f16>()?;
+                    let src = full.slice(l.start_offset()..l.start_offset() + elem_count);
+                    zipccl_gcu::all_reduce_f16(&raw, &self.comm, &src, elem_count)
+                        .map(|out| candle::GcuStorage::wrap_gcu_slice(out, dev.clone()))
+                }
+                _ => unreachable!(),
+            }?;
+            return Ok((result, l.shape().clone()));
+        }
         let start_offset = l.start_offset();
         let dst = match s.dtype() {
             DType::BF16 => {
@@ -1460,6 +1484,32 @@ impl CustomOp1 for AllGather {
         let dev = s.device().clone();
         let start_offset = l.start_offset();
         let total_elems = elem_count * self.world_size;
+
+        #[cfg(all(feature = "gcu", feature = "eccl"))]
+        if zipccl_gcu::eligible(elem_count, self.comm.world_size(), s.dtype())
+            && super::models::linear::linear_is_prefill()
+        {
+            let raw = dev.gcu_device();
+            let result = match s.dtype() {
+                DType::BF16 => {
+                    let full = s.as_gcu_slice::<bf16>()?;
+                    let src = full.slice(start_offset..start_offset + elem_count);
+                    zipccl_gcu::all_gather_bf16(&raw, &self.comm, &src, elem_count)
+                        .map(|out| candle_core::GcuStorage::wrap_gcu_slice(out, dev.clone()))
+                }
+                DType::F16 => {
+                    let full = s.as_gcu_slice::<f16>()?;
+                    let src = full.slice(start_offset..start_offset + elem_count);
+                    zipccl_gcu::all_gather_f16(&raw, &self.comm, &src, elem_count)
+                        .map(|out| candle_core::GcuStorage::wrap_gcu_slice(out, dev.clone()))
+                }
+                _ => unreachable!(),
+            }?;
+            let dims = l.shape().dims();
+            let mut out_dims = dims.to_vec();
+            out_dims[0] *= self.world_size;
+            return Ok((result, Shape::from_dims(&out_dims)));
+        }
 
         let dst = match s.dtype() {
             DType::BF16 => {

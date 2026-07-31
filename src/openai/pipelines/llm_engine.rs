@@ -704,7 +704,13 @@ impl LLMEngine {
             .unwrap_or(cache_config.dtype);
         let hybrid_mamba_estimate =
             crate::estimate_hybrid_mamba_cache(config, model_dtype, num_shards);
-        let require_mamba_prefix_snapshots = hybrid_mamba_estimate.is_some();
+        // Mamba snapshots are only needed when a prompt can resume from a
+        // shared prefix-cache block.  With --disable-prefix-cache there is no
+        // snapshot hash to restore; enabling this path anyway makes every
+        // chunked prefill look like a failed restore and resets the sequence
+        // to the beginning on each scheduler pass.
+        let require_mamba_prefix_snapshots =
+            hybrid_mamba_estimate.is_some() && scheduler_config.prefix_cache.enabled;
         let active_slot_target = scheduler_config
             .max_num_seqs
             .max(HYBRID_MAMBA_MIN_ACTIVE_SLOTS);

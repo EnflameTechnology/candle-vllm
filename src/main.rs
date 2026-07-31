@@ -156,6 +156,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     disable_cuda_graph: bool,
 
+    /// Enable lossless ZipCCL compression for large prefill ECCL collectives.
+    #[arg(long, default_value_t = false)]
+    zipccl: bool,
+
     #[arg(long, default_value_t = false)]
     ui_server: bool, //start candle-vllm with built-in web server
 
@@ -237,6 +241,10 @@ fn config_log(logger: ftail::Ftail, log_enable: bool, log_file: String) -> Resul
 #[allow(unused_mut)]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if args.zipccl {
+        std::env::set_var("CANDLE_VLLM_ZIPCCL", "1");
+        tracing::info!("ZipCCL enabled for eligible prefill collectives");
+    }
     if !args.log {
         tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)

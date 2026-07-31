@@ -17,6 +17,8 @@ pub mod requests;
 pub mod responses;
 pub mod sampling_params;
 pub mod streaming;
+#[cfg(all(feature = "gcu", feature = "eccl"))]
+pub(crate) mod zipccl_gcu;
 use either::Either;
 use serde::{Deserialize, Serialize};
 pub trait TokenizerWrapper<'s, E>
