@@ -13,10 +13,64 @@ use candle_core::gcu_backend::ubridge::{self, device_ptr::DevicePtr, device_ptr:
 use candle_core::gcu_backend::WrapErr;
 use candle_core::{DType, Result};
 use half::{bf16, f16};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const BLOCK: usize = 256;
 const HEADER: usize = 16;
+const TOP7_REFRESH_CALLS: u32 = 24;
+
+struct CachedTop7 {
+    words: Vec<u32>,
+    uses: u32,
+}
+
+static TOP7_CACHE: OnceLock<Mutex<[Option<CachedTop7>; 2]>> = OnceLock::new();
+
+/// Device-side result of a batched compression launch.
+///
+/// Compression and compaction leave `sizes` on the same GCU stream as the
+/// payload.  Keeping that buffer device-resident is important: callers can
+/// enqueue more device work after compression without an accidental host
+/// synchronization hidden inside the codec.  The host sizes are materialized
+/// only immediately before ECCL variable-count transfers are posted.
+struct CompressedChunks {
+    payload: GcuSlice<u8>,
+    sizes: GcuSlice<u32>,
+    capacity: usize,
+    num_chunks: usize,
+}
+
+impl CompressedChunks {
+    /// Read the exact packet sizes for the next host-count ECCL operation.
+    ///
+    /// This synchronization cannot currently be removed completely: ECCL's
+    /// send/recv ABI takes a host `usize` count, while the compaction kernel
+    /// produces a data-dependent count on the device.  The readback is kept
+    /// here, after all compression kernels have been enqueued, so there is one
+    /// ordered metadata fence per collective rather than one in each codec
+    /// helper or packet operation.
+    fn exact_sizes(
+        &self,
+        raw: &Arc<ubridge::gcu_device::GcuDevice>,
+    ) -> Result<Vec<usize>> {
+        let words = raw.dtoh_sync_copy(&self.sizes).w()?;
+        if words.len() != self.num_chunks * 4 {
+            candle_core::bail!(
+                "invalid ZipCCL size metadata length: got {}, expected {}",
+                words.len(),
+                self.num_chunks * 4
+            )
+        }
+        let exact: Vec<usize> = words
+            .chunks_exact(4)
+            .map(|chunk| chunk[0] as usize)
+            .collect();
+        if exact.iter().any(|&size| size == 0 || size > self.capacity) {
+            candle_core::bail!("invalid ZipCCL compressed packet size metadata")
+        }
+        Ok(exact)
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum CodecDType {
@@ -65,7 +119,8 @@ fn base_bytes(n: usize) -> usize {
 fn transfer_capacity(n: usize, dtype: CodecDType) -> usize {
     let fixed_base = static_bytes(n, dtype) + base_bytes(n);
     let scratch_base = (fixed_base + n + 15) & !15;
-    (scratch_base + n + 15) & !15
+    let tile_count = (blocks(n) + 15) / 16;
+    (scratch_base + tile_count * 4096 + 15) & !15
 }
 
 fn check_count(n: usize, world: usize, dtype: DType) -> Result<CodecDType> {
@@ -139,31 +194,67 @@ fn select_top7(
     .w()
 }
 
+fn top7_for(
+    raw: &Arc<ubridge::gcu_device::GcuDevice>,
+    input: RawDevicePtr,
+    n: usize,
+    dtype: CodecDType,
+) -> Result<GcuSlice<u32>> {
+    let slot = dtype.id() as usize;
+    let cache = TOP7_CACHE.get_or_init(|| Mutex::new([None, None]));
+    let cached = {
+        let mut guard = cache
+            .lock()
+            .map_err(|_| candle_core::Error::Msg("ZipCCL top7 cache lock poisoned".into()))?;
+        if let Some(entry) = guard[slot].as_mut() {
+            if entry.uses < TOP7_REFRESH_CALLS {
+                entry.uses += 1;
+                Some(entry.words.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(words) = cached {
+        return raw.htod_copy(words).w();
+    }
+
+    // Keep the device buffer large enough for the GCU DTE granule. Only the
+    // first seven words are meaningful, but the kernel reads the full table.
+    let top7 = raw.alloc::<u32>(256).w()?;
+    let histograms = raw.alloc::<u32>(24 * 256).w()?;
+    select_top7(raw, input, &histograms, &top7, n, dtype)?;
+    let words = raw.dtoh_sync_copy(&top7).w()?;
+    let mut guard = cache
+        .lock()
+        .map_err(|_| candle_core::Error::Msg("ZipCCL top7 cache lock poisoned".into()))?;
+    guard[slot] = Some(CachedTop7 { words, uses: 0 });
+    Ok(top7)
+}
+
 /// Select the top7 window and compress `num_chunks` contiguous chunks of
-/// `n_chunk` values each into worst-case-capacity packets.  A DTE compaction
-/// pass then returns the exact dynamic packet size for every chunk.
+/// `n_chunk` values each into worst-case-capacity packets. A tiled DTE
+/// compaction pass then returns the exact dynamic packet size for every chunk.
 fn compress_chunks(
     raw: &Arc<ubridge::gcu_device::GcuDevice>,
     input: RawDevicePtr,
     n_chunk: usize,
     num_chunks: usize,
     dtype: CodecDType,
-) -> Result<(GcuSlice<u8>, Vec<usize>)> {
+) -> Result<CompressedChunks> {
     let capacity = transfer_capacity(n_chunk, dtype);
     let mut output = raw.alloc::<u8>(capacity * num_chunks).w()?;
     let mut sizes = raw.alloc::<u32>(num_chunks * 4).w()?;
-    // Store the selected exponents as 32 naturally aligned words.  This is a
-    // 128-byte DTE transfer, but avoids the unsupported byte-vector ABI on
-    // gcu300.
-    // 1 KB: the DTE engine reads in large granules, and a 128-byte buffer
-    // at a small allocation can over-read into unmapped memory.
-    let top7 = raw.alloc::<u32>(256).w()?;
-    let histograms = raw.alloc::<u32>(24 * 256).w()?;
-    select_top7(raw, input, &histograms, &top7, n_chunk, dtype)?;
+    let top7 = top7_for(raw, input, n_chunk, dtype)?;
+    let pack_cfg = launch_config(raw);
+    // The compressor writes vectorized sign/plane data and fixed exponent
+    // slots. The compactor scans those tiles and emits the dynamic outlier
+    // stream; its single-packet mapping uses all twelve SIPs in block zero.
     let pack = raw
         .get_or_load_func("zipccl_compress_all", ubridge::ZIPCCL)
         .w()?;
-    let pack_cfg = launch_config(raw);
     unsafe {
         pack.launch(
             &pack_cfg,
@@ -196,15 +287,12 @@ fn compress_chunks(
     }
     .w()?;
 
-    // One readback covers all outbound packets.  It is required only because
-    // ECCL's send/recv interface takes a host-side element count.
-    let exact = raw
-        .dtoh_sync_copy(&sizes)
-        .w()?
-        .chunks(4)
-        .map(|chunk| chunk[0] as usize)
-        .collect();
-    Ok((output, exact))
+    Ok(CompressedChunks {
+        payload: output,
+        sizes,
+        capacity,
+        num_chunks,
+    })
 }
 
 fn compress(
@@ -212,12 +300,8 @@ fn compress(
     input: RawDevicePtr,
     n: usize,
     dtype: CodecDType,
-) -> Result<(GcuSlice<u8>, usize)> {
-    let capacity = transfer_capacity(n, dtype);
-    let (output, sizes) = compress_chunks(raw, input, n, 1, dtype)?;
-    debug_assert_eq!(sizes.len(), 1);
-    debug_assert!(sizes[0] <= capacity);
-    Ok((output, sizes[0]))
+) -> Result<CompressedChunks> {
+    compress_chunks(raw, input, n, 1, dtype)
 }
 
 fn exchange_sizes(
@@ -444,9 +528,12 @@ fn all_gather_impl<O: DeviceCopy>(
     n: usize,
     dtype: CodecDType,
 ) -> Result<GcuSlice<O>> {
-    let (payload, exact) = compress(raw, input, n, dtype)?;
+    let compressed = compress(raw, input, n, dtype)?;
+    // ECCL requires a host-side count.  Delay the only metadata fence until
+    // after compression has returned the device buffers to this collective.
+    let exact = compressed.exact_sizes(raw)?[0];
     let sizes = exchange_sizes(raw, comm, &[exact])?;
-    let received = exchange_variable_payload(raw, comm, &payload, exact, &sizes)?;
+    let received = exchange_variable_payload(raw, comm, &compressed.payload, exact, &sizes)?;
     let mut output = raw.alloc::<O>(n * comm.world_size()).w()?;
     let mut offset = 0;
     for rank in 0..comm.world_size() {
@@ -473,13 +560,17 @@ fn all_reduce_impl<O: DeviceCopy + EcclType>(
     let chunk = n / world;
     // Compress all world chunks in a single launch: the chunks are contiguous
     // in `input`, and each chunk becomes one fixed-capacity packet.
-    let (send_pack, local_sizes) = compress_chunks(raw, input, chunk, world, dtype)?;
+    let compressed = compress_chunks(raw, input, chunk, world, dtype)?;
+    // Materialize all packet lengths with one stream-ordered readback.  The
+    // compact kernel already produced every length on-device; this is deferred
+    // to the point where the host must post variable-count ECCL receives.
+    let local_sizes = compressed.exact_sizes(raw)?;
     let all_sizes = exchange_sizes(raw, comm, &local_sizes)?;
-    let packet_capacity = transfer_capacity(chunk, dtype);
+    let packet_capacity = compressed.capacity;
     let (received, recv_offsets, recv_sizes) = exchange_variable_chunks(
         raw,
         comm,
-        &send_pack,
+        &compressed.payload,
         packet_capacity,
         &local_sizes,
         &all_sizes,
@@ -496,7 +587,6 @@ fn all_reduce_impl<O: DeviceCopy + EcclType>(
         // Fused decompress + FP32 accumulation in one kernel launch.
         decompress_add_f32(raw, &view, &mut accumulator, chunk, dtype)?;
     }
-
     let mut reduced = raw.alloc::<O>(chunk).w()?;
     from_f32(raw, &accumulator, &mut reduced, chunk, dtype)?;
     // The reduce-scatter phase is where compression saves the expensive
