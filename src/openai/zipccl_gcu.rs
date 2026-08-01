@@ -6,7 +6,7 @@
 //! only for prefill BF16/F16 tensors above the configured threshold; decode
 //! and unsupported shapes continue to use native ECCL.
 
-use candle_core::gcu_backend::ubridge::eccl::Comm;
+use candle_core::gcu_backend::ubridge::eccl::{Comm, EcclType};
 use candle_core::gcu_backend::ubridge::gcu_launch::{DeviceCopy, GcuLaunchAsync};
 use candle_core::gcu_backend::ubridge::gcu_slice::GcuSlice;
 use candle_core::gcu_backend::ubridge::{self, device_ptr::DevicePtr, device_ptr::DevicePtrMut};
@@ -58,8 +58,14 @@ fn static_bytes(n: usize, dtype: CodecDType) -> usize {
     (HEADER + n + planes * bitplane_bytes(n) + 15) & !15
 }
 
+fn base_bytes(n: usize) -> usize {
+    (blocks(n) * std::mem::size_of::<u32>() + 15) & !15
+}
+
 fn transfer_capacity(n: usize, dtype: CodecDType) -> usize {
-    (static_bytes(n, dtype) + blocks(n) * 4 + n + 15) & !15
+    let fixed_base = static_bytes(n, dtype) + base_bytes(n);
+    let scratch_base = (fixed_base + n + 15) & !15;
+    (scratch_base + n + 15) & !15
 }
 
 fn check_count(n: usize, world: usize, dtype: DType) -> Result<CodecDType> {
@@ -133,42 +139,29 @@ fn select_top7(
     .w()
 }
 
-fn compress(
+/// Select the top7 window and compress `num_chunks` contiguous chunks of
+/// `n_chunk` values each into worst-case-capacity packets.  A DTE compaction
+/// pass then returns the exact dynamic packet size for every chunk.
+fn compress_chunks(
     raw: &Arc<ubridge::gcu_device::GcuDevice>,
     input: RawDevicePtr,
-    n: usize,
+    n_chunk: usize,
+    num_chunks: usize,
     dtype: CodecDType,
-) -> Result<(GcuSlice<u8>, usize)> {
-    let capacity = transfer_capacity(n, dtype);
-    let output = raw.alloc::<u8>(capacity).w()?;
+) -> Result<(GcuSlice<u8>, Vec<usize>)> {
+    let capacity = transfer_capacity(n_chunk, dtype);
+    let mut output = raw.alloc::<u8>(capacity * num_chunks).w()?;
+    let mut sizes = raw.alloc::<u32>(num_chunks * 4).w()?;
     // Store the selected exponents as 32 naturally aligned words.  This is a
     // 128-byte DTE transfer, but avoids the unsupported byte-vector ABI on
     // gcu300.
-    let top7 = raw.alloc::<u32>(32).w()?;
+    // 1 KB: the DTE engine reads in large granules, and a 128-byte buffer
+    // at a small allocation can over-read into unmapped memory.
+    let top7 = raw.alloc::<u32>(256).w()?;
     let histograms = raw.alloc::<u32>(24 * 256).w()?;
-    select_top7(raw, input, &histograms, &top7, n, dtype)?;
-    // The fixed packet still needs its header initialized, but does not need
-    // dynamic per-block counts or prefix offsets.  The metadata kernel keeps
-    // this single-SIP DTE operation out of the multi-SIP compressor.
-    let metadata = raw.alloc::<u32>(1).w()?;
-    let prefix = raw.get_or_load_func("zipccl_prefix", ubridge::ZIPCCL).w()?;
-    let prefix_cfg = launch_config(raw);
-    unsafe {
-        prefix.launch(
-            &prefix_cfg,
-            (
-                output.device_ptr(),
-                metadata.device_ptr(),
-                top7.device_ptr(),
-                n as i32,
-                dtype.id(),
-                blocks(n) as i32,
-            ),
-        )
-    }
-    .w()?;
+    select_top7(raw, input, &histograms, &top7, n_chunk, dtype)?;
     let pack = raw
-        .get_or_load_func("zipccl_compress", ubridge::ZIPCCL)
+        .get_or_load_func("zipccl_compress_all", ubridge::ZIPCCL)
         .w()?;
     let pack_cfg = launch_config(raw);
     unsafe {
@@ -178,18 +171,53 @@ fn compress(
                 input,
                 output.device_ptr(),
                 top7.device_ptr(),
-                n as i32,
+                n_chunk as i32,
+                num_chunks as i32,
                 dtype.id(),
             ),
         )
     }
     .w()?;
 
-    // The receiver can determine every fixed outlier slot from n and the
-    // 256-value tile size.  ECCL receives the same Ubridge stream as the
-    // codec launches, so stream ordering makes a host synchronization both
-    // unnecessary and very expensive in the repeated prefill schedule.
-    Ok((output, capacity))
+    let compact = raw
+        .get_or_load_func("zipccl_compact_all", ubridge::ZIPCCL)
+        .w()?;
+    unsafe {
+        compact.launch(
+            &pack_cfg,
+            (
+                output.device_ptr_mut(),
+                sizes.device_ptr_mut(),
+                n_chunk as i32,
+                num_chunks as i32,
+                dtype.id(),
+            ),
+        )
+    }
+    .w()?;
+
+    // One readback covers all outbound packets.  It is required only because
+    // ECCL's send/recv interface takes a host-side element count.
+    let exact = raw
+        .dtoh_sync_copy(&sizes)
+        .w()?
+        .chunks(4)
+        .map(|chunk| chunk[0] as usize)
+        .collect();
+    Ok((output, exact))
+}
+
+fn compress(
+    raw: &Arc<ubridge::gcu_device::GcuDevice>,
+    input: RawDevicePtr,
+    n: usize,
+    dtype: CodecDType,
+) -> Result<(GcuSlice<u8>, usize)> {
+    let capacity = transfer_capacity(n, dtype);
+    let (output, sizes) = compress_chunks(raw, input, n, 1, dtype)?;
+    debug_assert_eq!(sizes.len(), 1);
+    debug_assert!(sizes[0] <= capacity);
+    Ok((output, sizes[0]))
 }
 
 fn exchange_sizes(
@@ -211,17 +239,26 @@ fn exchange_sizes(
         .map(|sizes| sizes.into_iter().map(|v| v as usize).collect())
 }
 
-fn exchange_fixed_payload(
+fn exchange_variable_payload(
     raw: &Arc<ubridge::gcu_device::GcuDevice>,
     comm: &Comm,
     payload: &GcuSlice<u8>,
-    payload_size: usize,
+    local_size: usize,
+    all_sizes: &[usize],
 ) -> Result<GcuSlice<u8>> {
     let world = comm.world_size();
-    let mut received = raw.alloc::<u8>(payload_size * world).w()?;
+    if all_sizes.len() != world {
+        candle_core::bail!("invalid ZipCCL AllGather size table")
+    }
+    let mut offsets = vec![0usize; world];
+    for rank in 1..world {
+        offsets[rank] = offsets[rank - 1] + all_sizes[rank - 1];
+    }
+    let total = offsets[world - 1] + all_sizes[world - 1];
+    let mut received = raw.alloc::<u8>(total).w()?;
     raw.dtod_copy(
-        &payload.slice(..payload_size),
-        &mut received.slice_mut(comm.rank() * payload_size..(comm.rank() + 1) * payload_size),
+        &payload.slice(..local_size),
+        &mut received.slice_mut(offsets[comm.rank()]..offsets[comm.rank()] + local_size),
     )
     .w()?;
 
@@ -230,8 +267,8 @@ fn exchange_fixed_payload(
         if peer == comm.rank() {
             continue;
         }
-        let send = payload.slice(..payload_size);
-        let mut recv = received.slice_mut(peer * payload_size..(peer + 1) * payload_size);
+        let send = payload.slice(..local_size);
+        let mut recv = received.slice_mut(offsets[peer]..offsets[peer] + all_sizes[peer]);
         comm.send(&send, peer as i32)
             .map_err(candle_core::Error::debug)?;
         comm.recv(&mut recv, peer as i32)
@@ -241,30 +278,57 @@ fn exchange_fixed_payload(
     Ok(received)
 }
 
-fn exchange_fixed_chunks(
+fn exchange_variable_chunks(
     raw: &Arc<ubridge::gcu_device::GcuDevice>,
     comm: &Comm,
     send_pack: &GcuSlice<u8>,
-    chunk_size: usize,
-) -> Result<GcuSlice<u8>> {
+    packet_capacity: usize,
+    local_sizes: &[usize],
+    all_sizes: &[usize],
+) -> Result<(GcuSlice<u8>, Vec<usize>, Vec<usize>)> {
     let world = comm.world_size();
-    let mut received = raw.alloc::<u8>(chunk_size * (world - 1)).w()?;
+    if local_sizes.len() != world || all_sizes.len() != world * world {
+        candle_core::bail!("invalid ZipCCL AllReduce size table")
+    }
+    let mut recv_sizes = vec![0usize; world];
+    for src in 0..world {
+        recv_sizes[src] = if src == comm.rank() {
+            local_sizes[comm.rank()]
+        } else {
+            all_sizes[src * world + comm.rank()]
+        };
+    }
+    let mut offsets = vec![0usize; world];
+    for src in 1..world {
+        offsets[src] = offsets[src - 1] + recv_sizes[src - 1];
+    }
+    let total = offsets[world - 1] + recv_sizes[world - 1];
+    let mut received = raw.alloc::<u8>(total).w()?;
+    let local_packet = send_pack.slice(
+        comm.rank() * packet_capacity..comm.rank() * packet_capacity + local_sizes[comm.rank()],
+    );
+    raw.dtod_copy(
+        &local_packet,
+        &mut received
+            .slice_mut(offsets[comm.rank()]..offsets[comm.rank()] + recv_sizes[comm.rank()]),
+    )
+    .w()?;
+
     ubridge::eccllib::group_start().map_err(candle_core::Error::debug)?;
-    let mut recv_index = 0;
     for peer in 0..world {
         if peer == comm.rank() {
             continue;
         }
-        let send = send_pack.slice(peer * chunk_size..(peer + 1) * chunk_size);
-        let mut recv = received.slice_mut(recv_index * chunk_size..(recv_index + 1) * chunk_size);
+        let send =
+            send_pack.slice(peer * packet_capacity..peer * packet_capacity + local_sizes[peer]);
+        let mut recv = received.slice_mut(offsets[peer]..offsets[peer] + recv_sizes[peer]);
         comm.send(&send, peer as i32)
             .map_err(candle_core::Error::debug)?;
         comm.recv(&mut recv, peer as i32)
             .map_err(candle_core::Error::debug)?;
-        recv_index += 1;
     }
     ubridge::eccllib::group_end().map_err(candle_core::Error::debug)?;
-    Ok(received)
+    Ok((received, offsets, recv_sizes))
 }
 
 fn decompress<O: DeviceCopy, P: DevicePtr<u8>, R: DevicePtrMut<O>>(
@@ -381,17 +445,21 @@ fn all_gather_impl<O: DeviceCopy>(
     dtype: CodecDType,
 ) -> Result<GcuSlice<O>> {
     let (payload, exact) = compress(raw, input, n, dtype)?;
-    let received = exchange_fixed_payload(raw, comm, &payload, exact)?;
+    let sizes = exchange_sizes(raw, comm, &[exact])?;
+    let received = exchange_variable_payload(raw, comm, &payload, exact, &sizes)?;
     let mut output = raw.alloc::<O>(n * comm.world_size()).w()?;
+    let mut offset = 0;
     for rank in 0..comm.world_size() {
-        let view = received.slice(rank * exact..(rank + 1) * exact);
+        let size = sizes[rank];
+        let view = received.slice(offset..offset + size);
         let mut out = output.slice_mut(rank * n..(rank + 1) * n);
         decompress::<O, _, _>(raw, &view, &mut out, n, dtype)?;
+        offset += size;
     }
     Ok(output)
 }
 
-fn all_reduce_impl<O: DeviceCopy>(
+fn all_reduce_impl<O: DeviceCopy + EcclType>(
     raw: &Arc<ubridge::gcu_device::GcuDevice>,
     comm: &Comm,
     input: RawDevicePtr,
@@ -403,47 +471,42 @@ fn all_reduce_impl<O: DeviceCopy>(
         candle_core::bail!("GCU ZipCCL AllReduce requires n divisible by world size")
     }
     let chunk = n / world;
-    let payload_size = transfer_capacity(chunk, dtype);
-    let mut send_pack = raw.alloc::<u8>(world * payload_size).w()?;
-    for peer in 0..world {
-        let src = offset_ptr::<u16>(input, peer * chunk);
-        let (payload, exact) = compress(raw, src, chunk, dtype)?;
-        debug_assert_eq!(exact, payload_size);
-        raw.dtod_copy(
-            &payload.slice(..payload_size),
-            &mut send_pack.slice_mut(peer * payload_size..(peer + 1) * payload_size),
-        )
-        .w()?;
-    }
-    let received = exchange_fixed_chunks(raw, comm, &send_pack, payload_size)?;
+    // Compress all world chunks in a single launch: the chunks are contiguous
+    // in `input`, and each chunk becomes one fixed-capacity packet.
+    let (send_pack, local_sizes) = compress_chunks(raw, input, chunk, world, dtype)?;
+    let all_sizes = exchange_sizes(raw, comm, &local_sizes)?;
+    let packet_capacity = transfer_capacity(chunk, dtype);
+    let (received, recv_offsets, recv_sizes) = exchange_variable_chunks(
+        raw,
+        comm,
+        &send_pack,
+        packet_capacity,
+        &local_sizes,
+        &all_sizes,
+    )?;
 
     let local = offset_ptr::<u16>(input, comm.rank() * chunk);
     let mut accumulator = raw.alloc_zeros::<f32>(chunk).w()?;
     to_f32(raw, local, &mut accumulator, chunk, dtype)?;
-    let mut decoded_raw = raw.alloc::<u16>(chunk).w()?;
-    let mut decoded = raw.alloc::<f32>(chunk).w()?;
-    let mut recv_index = 0;
     for src in 0..world {
         if src == comm.rank() {
             continue;
         }
-        let view = received.slice(recv_index * payload_size..(recv_index + 1) * payload_size);
-        decompress(raw, &view, &mut decoded_raw, chunk, dtype)?;
-        to_f32(raw, decoded_raw.device_ptr(), &mut decoded, chunk, dtype)?;
-        add_f32(raw, &decoded, &mut accumulator, chunk)?;
-        recv_index += 1;
+        let view = received.slice(recv_offsets[src]..recv_offsets[src] + recv_sizes[src]);
+        // Fused decompress + FP32 accumulation in one kernel launch.
+        decompress_add_f32(raw, &view, &mut accumulator, chunk, dtype)?;
     }
 
     let mut reduced = raw.alloc::<O>(chunk).w()?;
     from_f32(raw, &accumulator, &mut reduced, chunk, dtype)?;
-    let (payload, exact) = compress(raw, reduced.device_ptr(), chunk, dtype)?;
-    let received = exchange_fixed_payload(raw, comm, &payload, exact)?;
+    // The reduce-scatter phase is where compression saves the expensive
+    // cross-rank traffic.  Once each rank owns its reduced chunk, do not
+    // launch a second compress -> all-gather -> decompress cycle: that added
+    // nine codec launches per collective and dominated prefill latency.
+    // ECCL can all-gather the native reduced BF16/F16 chunks directly.
     let mut output = raw.alloc::<O>(n).w()?;
-    for rank in 0..world {
-        let view = received.slice(rank * exact..(rank + 1) * exact);
-        let mut out = output.slice_mut(rank * chunk..(rank + 1) * chunk);
-        decompress::<O, _, _>(raw, &view, &mut out, chunk, dtype)?;
-    }
+    comm.all_gather(&reduced, &mut output)
+        .map_err(candle_core::Error::debug)?;
     Ok(output)
 }
 
